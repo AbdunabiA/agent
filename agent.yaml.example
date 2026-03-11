@@ -1,0 +1,129 @@
+# Agent Configuration
+# Copy to agent.yaml and customize
+
+agent:
+  name: "Agent"
+  persona: |
+    You are a helpful autonomous AI assistant running on the user's local machine.
+    You are proactive, concise, and always try to be helpful.
+    When you don't know something, you say so honestly.
+  max_iterations: 10
+  heartbeat_interval: "30m"
+
+models:
+  # Backend: "litellm" (API keys) or "claude-sdk" (local Claude subscription)
+  backend: "litellm"
+  default: "claude-sonnet-4-5-20250929"
+  fallback: "gpt-4o"
+  providers:
+    anthropic:
+      api_key: "${ANTHROPIC_API_KEY}"
+    openai:
+      api_key: "${OPENAI_API_KEY}"
+    ollama:
+      base_url: "http://localhost:11434"
+  # Claude Agent SDK settings (used when backend: "claude-sdk")
+  # Uses your local Claude Max subscription — no API key needed
+  claude_sdk:
+    claude_auth_dir: "~/.claude"  # Path to Claude auth (credentials) directory
+    working_dir: "."              # Default working directory for Claude Code
+    max_turns: 50                 # Maximum agent iterations per task
+    permission_mode: null         # null, "acceptEdits", or "bypassPermissions"
+    model: null                   # Override model (null = use default)
+
+channels:
+  telegram:
+    enabled: false
+    token: "${TELEGRAM_BOT_TOKEN}"
+    allowed_users: []
+  webchat:
+    enabled: false
+    port: 8080
+
+tools:
+  shell:
+    enabled: true
+    sandbox: false
+    allowed_commands: ["*"]
+  browser:
+    enabled: true
+    headless: true
+  filesystem:
+    enabled: true
+    root: "/"                   # Read access root (/ = full filesystem)
+    write_root: "~"             # Write access root (~ = home directory only)
+    max_file_size: 10485760     # 10MB
+    deny_paths:                 # Always blocked
+      - /proc/kcore
+      - /dev/sda
+      - /dev/nvme
+      - /boot/efi
+
+memory:
+  db_path: "./data/agent.db"
+  markdown_dir: "./data/memory/"
+  auto_extract: true
+
+skills:
+  directory: "./skills/"         # Where skill plugins live
+  enabled: []                    # Empty = all discovered skills enabled
+  disabled: []                   # Explicitly disabled skills
+  auto_discover: true            # Auto-discover skills in directory
+
+gateway:
+  host: "127.0.0.1"
+  port: 8765
+  auth_token: "${GATEWAY_TOKEN}"
+  cors_origins:
+    - "http://localhost:5173"
+
+logging:
+  level: "INFO"
+  format: "console"
+
+# Workspaces — isolated agent personas
+workspaces:
+  directory: workspaces      # Where workspace directories live
+  default: default           # Active workspace name
+  auto_create_default: true  # Create 'default' workspace if missing
+
+  # Routing — map channels/users to specific workspaces
+  routing:
+    default: default
+    rules:
+      # Route specific Telegram users to specific workspaces
+      # - channel: telegram
+      #   user_id: "12345"
+      #   workspace: work
+
+      # - channel: telegram
+      #   user_id: "67890"
+      #   workspace: personal
+
+      # All webchat goes to default
+      - channel: webchat
+        workspace: default
+
+# Desktop — screen capture, mouse, keyboard, app control
+desktop:
+  enabled: true
+  screenshot_scale: 0.75     # 0.5 = half resolution (faster, cheaper)
+  vision_model: ""           # Empty = use default model. Set to a vision model if default isn't multimodal.
+  failsafe: true             # Move mouse to corner (0,0) to abort
+  mouse_move_duration: 0.3   # Seconds for mouse movement animation
+  typing_interval: 0.02      # Seconds between keystrokes
+
+# Voice — speech-to-text and text-to-speech
+voice:
+  stt:
+    provider: llm_native        # llm_native, whisper_api, whisper_local, deepgram
+    language: ""                 # Auto-detect, or "en", "uz", "ru"
+  tts:
+    enabled: true
+    provider: edge_tts           # edge_tts, openai
+    edge_voice: en-US-AriaNeural # Microsoft Edge voice name
+    edge_rate: "+0%"
+    output_format: opus
+  auto_voice_reply: true         # Reply with voice to voice messages
+  voice_reply_channels:
+    - telegram
