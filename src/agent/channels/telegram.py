@@ -176,8 +176,16 @@ class TelegramChannel(BaseChannel):
             logger.warning("telegram_disabled", reason="No bot token configured")
             return
 
-        # Delete any stale webhook so polling works
-        await self._bot.delete_webhook(drop_pending_updates=True)
+        # Validate token by deleting any stale webhook
+        try:
+            await self._bot.delete_webhook(drop_pending_updates=True)
+        except Exception as e:
+            logger.error(
+                "telegram_start_failed",
+                error=str(e),
+                hint="Check that TELEGRAM_BOT_TOKEN is valid",
+            )
+            return
 
         # Set bot command menu (the "/" button near the input field)
         await self._set_bot_commands()
