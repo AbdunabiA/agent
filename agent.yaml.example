@@ -127,3 +127,11 @@ voice:
   auto_voice_reply: true         # Reply with voice to voice messages
   voice_reply_channels:
     - telegram
+
+# Prompt shortcuts — used by /run command in Telegram
+prompts:
+  shortcuts:
+    # Add your own shortcuts here. They override built-in defaults.
+    # - alias: deploy
+    #   template: "Run the deployment pipeline and report status"
+    #   description: "Trigger deployment"

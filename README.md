@@ -17,32 +17,33 @@ Agent connects to LLM providers (Claude, OpenAI, Gemini, Ollama), acts on your b
 pip install agent-ai
 ```
 
-### Or with Docker
+### Set Up
 
 ```bash
-docker run -e ANTHROPIC_API_KEY=sk-... ghcr.io/OWNER/agent
+agent init
 ```
 
-### Chat
+Interactive wizard that creates your config and API keys in `~/.config/agent/`. You can also skip this and just set an API key — the agent works with **zero config**:
 
 ```bash
 export ANTHROPIC_API_KEY=sk-...
 agent chat
 ```
 
-The agent works with **zero config** — just set an API key in your environment.
-
 ### Full Agent Mode
 
 ```bash
-# Start gateway + heartbeat + channels
-agent start
+agent start       # Start gateway + heartbeat + channels
+agent stop        # Stop the running agent (from any terminal)
 
-# Check your setup
-agent doctor
+agent doctor      # Check your setup
+agent config show # Show config (secrets masked)
+```
 
-# Show config (secrets masked)
-agent config show
+### Docker
+
+```bash
+docker run -e ANTHROPIC_API_KEY=sk-... ghcr.io/OWNER/agent
 ```
 
 ## Features

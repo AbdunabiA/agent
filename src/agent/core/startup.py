@@ -310,6 +310,8 @@ class Application:
                     voice_pipeline=self.voice_pipeline,
                     sdk_service=self.sdk_service,
                     scheduler=self.scheduler,
+                    audit_log=self.audit,
+                    cost_tracker=self.cost_tracker,
                 )
                 self._channels.append(telegram)
                 self.permissions.set_approval_channel(telegram)

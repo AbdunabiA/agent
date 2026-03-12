@@ -146,8 +146,10 @@ class SoulLoader:
         if self._explicit_path:
             candidates.append(Path(self._explicit_path))
 
+        from agent.config import get_agent_home
+
         candidates.append(Path("soul.md"))
-        candidates.append(Path.home() / ".config" / "agent" / "soul.md")
+        candidates.append(get_agent_home() / "soul.md")
 
         for path in candidates:
             if path.exists() and path.is_file():

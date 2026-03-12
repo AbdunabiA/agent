@@ -15,13 +15,15 @@ The project was built in 7 phases — all phases are now implemented. New work f
 pip install -e ".[dev]"
 
 # Run
+agent init              # Interactive setup wizard
 agent chat              # Interactive terminal chat
 agent start             # Full agent (gateway + channels + heartbeat)
+agent stop              # Stop running agent (from any terminal)
 agent version           # Version info
 agent doctor            # Health check
 agent models            # List available models
 
-# Config
+# Config (stored in ~/.config/agent/ by default)
 agent config show       # Show resolved config (secrets masked)
 
 # Tools

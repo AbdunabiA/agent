@@ -1,5 +1,6 @@
 import { StatusBadge } from "@/components/ui/StatusBadge";
 import { WorkspaceSwitcher } from "@/components/layout/WorkspaceSwitcher";
+import { getToken, clearToken } from "@/lib/api";
 
 interface HeaderProps {
   title: string;
@@ -29,6 +30,15 @@ export function Header({ title, agentStatus }: HeaderProps) {
           variant={statusVariant(agentStatus)}
           label={agentStatus.charAt(0).toUpperCase() + agentStatus.slice(1)}
         />
+        {getToken() && (
+          <button
+            onClick={() => { clearToken(); window.location.reload(); }}
+            className="text-xs text-gray-500 hover:text-gray-300 transition-colors"
+            title="Log out"
+          >
+            Logout
+          </button>
+        )}
       </div>
     </header>
   );

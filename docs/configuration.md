@@ -1,14 +1,42 @@
 # Configuration
 
+## Setup
+
+The easiest way to create your config is the interactive wizard:
+
+```bash
+agent init
+```
+
+This creates `agent.yaml` and `.env` in your agent home directory (`~/.config/agent/`).
+
+## Config Loading Order
+
 Agent loads configuration from multiple sources in priority order:
 
 1. CLI `--config` flag
 2. `AGENT_CONFIG` environment variable
 3. `./agent.yaml` (current directory)
-4. `~/.config/agent/agent.yaml`
+4. `$AGENT_HOME/agent.yaml` (defaults to `~/.config/agent/agent.yaml`)
 5. Built-in defaults
 
-Secrets come from `.env` and are interpolated via `${VAR_NAME}` syntax.
+Secrets come from `.env` files and are interpolated via `${VAR_NAME}` syntax. The `.env` file is loaded from `$AGENT_HOME/.env` first, then the current directory (already-set values are not overridden).
+
+### Agent Home Directory
+
+By default, Agent stores config and runtime files in `~/.config/agent/`. Override with:
+
+```bash
+export AGENT_HOME=/path/to/custom/agent/home
+```
+
+This directory contains:
+
+| File | Purpose |
+|------|---------|
+| `agent.yaml` | Configuration |
+| `.env` | API keys and secrets |
+| `agent.pid` | PID of running agent (for `agent stop`) |
 
 ## Full Reference
 
@@ -122,6 +150,7 @@ Secrets come from `.env` and are interpolated via `${VAR_NAME}` syntax.
 | `TELEGRAM_BOT_TOKEN` | Telegram bot |
 | `GATEWAY_TOKEN` | Gateway authentication |
 | `AGENT_CONFIG` | Config file path override |
+| `AGENT_HOME` | Agent home directory (default: `~/.config/agent`) |
 
 ## Example
 

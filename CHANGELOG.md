@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.1.1] - 2026-03-12
+
+### Added
+
+- `agent init` — interactive setup wizard that creates config in `~/.config/agent/`
+- `agent stop` — stop a running agent from any terminal (via PID file)
+- Agent home directory (`~/.config/agent/`) so the agent works from any path after `pip install`
+- `AGENT_HOME` environment variable to override the default home directory
+- Dashboard login page — enter gateway token in the browser when auth is enabled
+- Logout button in the dashboard header
+
+### Changed
+
+- Config search now checks `$AGENT_HOME/agent.yaml` (in addition to `./agent.yaml`)
+- `.env` is now loaded from `$AGENT_HOME/.env` first, then current directory
+- PID file stored in `$AGENT_HOME/agent.pid` instead of `./data/agent.pid`
+- `agent start` banner now shows `agent stop` hint
+- Gateway token is auto-generated during `agent init`
+- Dashboard reads auth token from localStorage instead of build-time env var only
+
 ## [0.1.0] - 2026-03-05
 
 Initial release.

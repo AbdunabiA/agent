@@ -26,6 +26,21 @@ _config_instance: AgentConfig | None = None
 _config_path: str | None = None
 
 
+def get_agent_home() -> Path:
+    """Return the agent home directory.
+
+    Priority:
+    1. AGENT_HOME environment variable
+    2. ~/.config/agent (default)
+
+    The directory is created if it does not exist.
+    """
+    env_home = os.environ.get("AGENT_HOME")
+    home = Path(env_home) if env_home else Path.home() / ".config" / "agent"
+    home.mkdir(parents=True, exist_ok=True)
+    return home
+
+
 class ModelProviderConfig(BaseModel):
     """Configuration for a single LLM provider."""
 
@@ -196,6 +211,20 @@ class DesktopConfig(BaseModel):
     max_screenshot_size_kb: int = 500  # Max screenshot size to send to LLM
 
 
+class ShortcutConfig(BaseModel):
+    """A single prompt shortcut for /run command."""
+
+    alias: str
+    template: str
+    description: str = ""
+
+
+class PromptsConfig(BaseModel):
+    """Prompt shortcuts configuration."""
+
+    shortcuts: list[ShortcutConfig] = []
+
+
 class AgentConfig(BaseModel):
     """Root configuration model."""
 
@@ -210,6 +239,7 @@ class AgentConfig(BaseModel):
     workspaces: WorkspacesSection = WorkspacesSection()
     voice: VoiceConfig = VoiceConfig()
     desktop: DesktopConfig = DesktopConfig()
+    prompts: PromptsConfig = PromptsConfig()
 
 
 def _resolve_env_vars(data: Any) -> Any:
@@ -236,7 +266,7 @@ def _find_config_path(override: str | None = None) -> Path | None:
     1. Explicit override (CLI --config flag)
     2. AGENT_CONFIG environment variable
     3. ./agent.yaml (current directory)
-    4. ~/.config/agent/agent.yaml
+    4. $AGENT_HOME/agent.yaml (defaults to ~/.config/agent/agent.yaml)
     """
     if override:
         path = Path(override)
@@ -256,7 +286,7 @@ def _find_config_path(override: str | None = None) -> Path | None:
     if local_path.exists():
         return local_path
 
-    home_path = Path.home() / ".config" / "agent" / "agent.yaml"
+    home_path = get_agent_home() / "agent.yaml"
     if home_path.exists():
         return home_path
 
@@ -272,7 +302,10 @@ def load_config(config_path: str | None = None) -> AgentConfig:
     Returns:
         Validated AgentConfig instance.
     """
-    # Load .env file
+    # Load .env file — check agent home first, then current directory
+    # (later load_dotenv calls don't override already-set vars)
+    agent_home = get_agent_home()
+    load_dotenv(agent_home / ".env")
     load_dotenv()
 
     # Find config file
@@ -528,6 +561,7 @@ EDITABLE_SECTIONS: dict[str, type[BaseModel]] = {
     "desktop": DesktopConfig,
     "voice": VoiceConfig,
     "workspaces": WorkspacesSection,
+    "prompts": PromptsConfig,
 }
 
 # Fields that contain secrets and must NOT be overwritten via the API.
@@ -597,11 +631,11 @@ def update_config_section(section: str, data: dict[str, Any]) -> AgentConfig:
 def _save_config_to_disk(config: AgentConfig) -> None:
     """Persist config to the YAML file, preserving env-var references for secrets.
 
-    If no config file was loaded (pure defaults + env), creates ./agent.yaml.
+    If no config file was loaded (pure defaults + env), creates agent.yaml in AGENT_HOME.
     """
     path = _find_config_path(_config_path)
     if path is None:
-        path = Path("agent.yaml")
+        path = get_agent_home() / "agent.yaml"
 
     # Load existing raw YAML to preserve ${ENV_VAR} references
     existing_raw: dict[str, Any] = {}

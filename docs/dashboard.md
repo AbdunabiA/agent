@@ -12,6 +12,24 @@ http://localhost:8765/dashboard
 
 The dashboard requires the gateway to be running. It communicates via the REST API and WebSocket.
 
+## Authentication
+
+If `gateway.auth_token` is configured (recommended), the dashboard will show a **login page** when you first open it.
+
+Enter your gateway token to log in. You can find it in your `.env` file:
+
+```bash
+# On Linux/macOS
+cat ~/.config/agent/.env | grep GATEWAY_TOKEN
+
+# On Windows
+type %USERPROFILE%\.config\agent\.env
+```
+
+The token is stored in your browser's localStorage, so you only need to enter it once per browser. Use the **Logout** button in the dashboard header to clear it.
+
+If no gateway token is configured, the dashboard works without login (open mode).
+
 ## Building
 
 The dashboard is a React + Vite + TypeScript + Tailwind app in the `dashboard/` directory.
@@ -41,10 +59,6 @@ gateway:
     - "http://localhost:5173"
     - "http://your-domain.com"
 ```
-
-## Authentication
-
-If `gateway.auth_token` is configured, the dashboard must include the token in requests. Set it via the dashboard's login page or environment variable.
 
 ## Pages
 

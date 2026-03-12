@@ -64,10 +64,11 @@ Type=simple
 User=agent
 WorkingDirectory=/opt/agent
 ExecStart=/opt/agent/.venv/bin/agent start
+ExecStop=/opt/agent/.venv/bin/agent stop
 Restart=unless-stopped
 RestartSec=5
 
-# Environment
+# Environment — agent also loads ~/.config/agent/.env automatically
 EnvironmentFile=/opt/agent/.env
 
 # Security hardening
@@ -75,6 +76,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ReadWritePaths=/opt/agent/data
+ReadWritePaths=/home/agent/.config/agent
 
 [Install]
 WantedBy=multi-user.target
@@ -106,10 +108,9 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 pip install agent-ai
 
-# Configure
-mkdir -p /opt/agent/data
-cp agent.yaml.example agent.yaml
-# Edit agent.yaml and .env
+# Configure (interactive wizard)
+agent init
+# Or manually create ~/.config/agent/agent.yaml and ~/.config/agent/.env
 ```
 
 ### 2. Reverse Proxy (nginx)

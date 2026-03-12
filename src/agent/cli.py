@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import platform
+import signal
 from pathlib import Path
+from typing import Any
 
 import structlog
 import typer
@@ -23,6 +26,7 @@ from agent import __version__
 from agent.config import (
     AgentConfig,
     config_to_dict_masked,
+    get_agent_home,
     get_available_models,
     get_config,
 )
@@ -97,6 +101,59 @@ def _apply_log_level_flags(
         cfg.logging.level = "DEBUG"
     elif quiet:
         cfg.logging.level = "WARNING"
+
+
+def _pid_file_path() -> Path:
+    """Return the path to the agent PID file."""
+    return get_agent_home() / "agent.pid"
+
+
+def _write_pid_file() -> None:
+    """Write current process PID to the PID file."""
+    pid_path = _pid_file_path()
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text(str(os.getpid()))
+
+
+def _remove_pid_file() -> None:
+    """Remove the PID file if it exists."""
+    pid_path = _pid_file_path()
+    with contextlib.suppress(FileNotFoundError):
+        pid_path.unlink()
+
+
+def _read_pid_file() -> int | None:
+    """Read the PID from the PID file, or None if missing/invalid."""
+    pid_path = _pid_file_path()
+    if not pid_path.exists():
+        return None
+    try:
+        return int(pid_path.read_text().strip())
+    except (ValueError, OSError):
+        return None
+
+
+def _is_process_running(pid: int) -> bool:
+    """Check if a process with the given PID is running."""
+    if platform.system() == "Windows":
+        # On Windows, os.kill(pid, 0) sends CTRL_C_EVENT (== 0) which actually
+        # interrupts the process instead of just checking existence.
+        # Use ctypes OpenProcess to safely check without side effects.
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        synchronize = 0x00100000
+        handle = kernel32.OpenProcess(synchronize, False, pid)
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
 
 
 def _resolve_workspace(cfg: AgentConfig, workspace_name: str | None = None) -> AgentConfig:
@@ -725,6 +782,266 @@ def _print_soul(agent_loop: AgentLoop) -> None:
 
 
 @app.command()
+def init() -> None:
+    """Set up Agent configuration (interactive).
+
+    Creates agent.yaml and .env in the agent home directory
+    (~/.config/agent/) so the agent can be started from anywhere.
+    """
+    import secrets
+
+    agent_home = get_agent_home()
+    config_path = agent_home / "agent.yaml"
+    env_path = agent_home / ".env"
+
+    console.print(
+        Panel(
+            f"This will create configuration files in:\n"
+            f"[cyan]{agent_home}[/cyan]",
+            title="Agent Setup",
+            border_style="cyan",
+        )
+    )
+
+    # Check for existing config
+    if config_path.exists():
+        overwrite = typer.confirm(
+            f"Config already exists at {config_path}. Overwrite?",
+            default=False,
+        )
+        if not overwrite:
+            console.print("[yellow]Keeping existing config.[/yellow]")
+            return
+
+    # --- Gather settings ---
+
+    # 1. LLM Backend
+    console.print("\n[bold]1. LLM Backend[/bold]")
+    console.print(
+        "  [cyan]litellm[/cyan]    — Use API keys (Anthropic, OpenAI, Gemini, Ollama)\n"
+        "  [cyan]claude-sdk[/cyan] — Use your local Claude Max/Pro subscription (no API key needed)"
+    )
+    backend = typer.prompt(
+        "Backend [litellm/claude-sdk]",
+        default="litellm",
+        type=str,
+    ).strip()
+    if backend not in ("litellm", "claude-sdk"):
+        console.print(f"[yellow]Unknown backend '{backend}', using litellm.[/yellow]")
+        backend = "litellm"
+
+    # 2. API keys (for litellm backend)
+    anthropic_key = ""
+    openai_key = ""
+    gemini_key = ""
+    if backend == "litellm":
+        console.print("\n[bold]2. API Keys[/bold]")
+        console.print("  [dim]Paste your keys below. Leave blank to skip a provider.[/dim]")
+        console.print("  [dim]You can always add or change keys later in the .env file.[/dim]")
+        anthropic_key = typer.prompt(
+            "  Anthropic API key", default="", show_default=False,
+        ).strip()
+        openai_key = typer.prompt(
+            "  OpenAI API key", default="", show_default=False,
+        ).strip()
+        gemini_key = typer.prompt(
+            "  Gemini API key", default="", show_default=False,
+        ).strip()
+
+        if not any([anthropic_key, openai_key, gemini_key]):
+            console.print(
+                "\n  [yellow]No API keys provided.[/yellow] "
+                "You can add them later in "
+                f"[cyan]{env_path}[/cyan]"
+            )
+    else:
+        console.print(
+            "\n[dim]2. API Keys — skipped (Claude SDK uses your local subscription)[/dim]"
+        )
+
+    # 3. Telegram
+    console.print("\n[bold]3. Telegram Bot[/bold] [dim](optional — press Enter to skip)[/dim]")
+    console.print(
+        "  [dim]To create a bot: open Telegram, message @BotFather, send /newbot,[/dim]\n"
+        "  [dim]follow the prompts, and copy the token it gives you.[/dim]"
+    )
+    telegram_token = typer.prompt(
+        "  Bot token",
+        default="",
+        show_default=False,
+    ).strip()
+    telegram_enabled = bool(telegram_token)
+
+    telegram_users_str = ""
+    if telegram_enabled:
+        console.print(
+            "\n  [dim]To find your Telegram user ID: message @userinfobot on Telegram.[/dim]\n"
+            "  [dim]This restricts who can use the bot. Use * to allow everyone.[/dim]"
+        )
+        telegram_users_str = typer.prompt(
+            "  Allowed user IDs (comma-separated, or * for all)",
+            default="*",
+        ).strip()
+
+    # 4. Gateway
+    console.print("\n[bold]4. Gateway & Dashboard[/bold]")
+    console.print("  [dim]The gateway serves the API and web dashboard.[/dim]")
+    gateway_port = typer.prompt("  Port", default=8765, type=int)
+    gateway_token = secrets.token_urlsafe(32)
+
+    # --- Build .env ---
+    env_lines = ["# Agent environment variables", ""]
+
+    if anthropic_key:
+        env_lines.append(f"ANTHROPIC_API_KEY={anthropic_key}")
+    else:
+        env_lines.append("# ANTHROPIC_API_KEY=sk-ant-your-key-here")
+
+    if openai_key:
+        env_lines.append(f"OPENAI_API_KEY={openai_key}")
+    else:
+        env_lines.append("# OPENAI_API_KEY=sk-your-key-here")
+
+    if gemini_key:
+        env_lines.append(f"GEMINI_API_KEY={gemini_key}")
+    else:
+        env_lines.append("# GEMINI_API_KEY=your-key-here")
+
+    env_lines.append("")
+
+    if telegram_token:
+        env_lines.append(f"TELEGRAM_BOT_TOKEN={telegram_token}")
+    else:
+        env_lines.append("# TELEGRAM_BOT_TOKEN=your-bot-token")
+
+    env_lines.append("")
+    env_lines.append(f"GATEWAY_TOKEN={gateway_token}")
+    env_lines.append("")
+
+    env_path.write_text("\n".join(env_lines), encoding="utf-8")
+
+    # --- Build agent.yaml ---
+
+    # Parse allowed users
+    allowed_users: list[int] | list[str] = []
+    if telegram_users_str and telegram_users_str != "*":
+        for uid in telegram_users_str.split(","):
+            uid = uid.strip()
+            if uid.isdigit():
+                allowed_users.append(int(uid))
+
+    # Pick default model
+    if backend == "litellm":
+        if anthropic_key:
+            default_model = "claude-sonnet-4-5-20250929"
+        elif openai_key:
+            default_model = "gpt-4o"
+        elif gemini_key:
+            default_model = "gemini/gemini-2.5-flash"
+        else:
+            default_model = "claude-sonnet-4-5-20250929"
+    else:
+        default_model = "claude-sonnet-4-5-20250929"
+
+    config_data: dict[str, Any] = {
+        "agent": {
+            "name": "Agent",
+            "persona": (
+                "You are a helpful autonomous AI assistant running on the user's "
+                "local machine.\nYou are proactive, concise, and always try to be "
+                "helpful.\nWhen you don't know something, you say so honestly.\n"
+            ),
+            "max_iterations": 10,
+            "heartbeat_interval": "30m",
+        },
+        "models": {
+            "backend": backend,
+            "default": default_model,
+            "providers": {
+                "anthropic": {"api_key": "${ANTHROPIC_API_KEY}"},
+                "openai": {"api_key": "${OPENAI_API_KEY}"},
+                "ollama": {"base_url": "http://localhost:11434"},
+            },
+        },
+        "channels": {
+            "telegram": {
+                "enabled": telegram_enabled,
+                "token": "${TELEGRAM_BOT_TOKEN}",
+                "allowed_users": allowed_users if allowed_users else [],
+            },
+            "webchat": {
+                "enabled": True,
+                "port": 8080,
+            },
+        },
+        "gateway": {
+            "host": "127.0.0.1",
+            "port": gateway_port,
+            "auth_token": "${GATEWAY_TOKEN}",
+            "cors_origins": ["http://localhost:5173"],
+        },
+        "tools": {
+            "shell": {"enabled": True, "sandbox": False, "allowed_commands": ["*"]},
+            "browser": {"enabled": True, "headless": True},
+            "filesystem": {
+                "enabled": True,
+                "root": "~/",
+                "write_root": "~",
+                "max_file_size": 10485760,
+            },
+        },
+        "memory": {
+            "db_path": "./data/agent.db",
+            "markdown_dir": "./data/memory/",
+            "auto_extract": True,
+        },
+        "logging": {
+            "level": "INFO",
+            "format": "console",
+        },
+    }
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        yaml.dump(config_data, f, default_flow_style=False, sort_keys=False)
+
+    # --- Done ---
+    console.print()
+
+    next_steps = [
+        f"[green]Config:[/green]  {config_path}",
+        f"[green]Secrets:[/green] {env_path}",
+        "",
+        "[bold]Next steps:[/bold]",
+        "  [cyan]agent start[/cyan]   — Start the agent",
+        "  [cyan]agent stop[/cyan]    — Stop the agent",
+        "  [cyan]agent doctor[/cyan]  — Verify your setup",
+        "  [cyan]agent chat[/cyan]    — Quick terminal chat",
+    ]
+
+    if telegram_enabled:
+        next_steps.append("")
+        next_steps.append(
+            "  Telegram bot is enabled. Start the agent and message your bot!"
+        )
+
+    next_steps.extend([
+        "",
+        f"  Dashboard: [blue]http://127.0.0.1:{gateway_port}/dashboard[/blue]",
+        f"  [dim]Dashboard login token is in {env_path} (GATEWAY_TOKEN)[/dim]",
+        "",
+        f"  [dim]Edit config anytime: {config_path}[/dim]",
+    ])
+
+    console.print(
+        Panel(
+            "\n".join(next_steps),
+            title="Setup Complete",
+            border_style="green",
+        )
+    )
+
+
+@app.command()
 def start(
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
     host: str | None = typer.Option(None, "--host", help="Override bind host"),
@@ -754,13 +1071,15 @@ async def _run_gateway(cfg: AgentConfig) -> None:
     application = Application(cfg)
     try:
         await application.initialize()
+        _write_pid_file()
 
         console.print(
             Panel(
                 f"[bold cyan]{cfg.agent.name}[/bold cyan] Gateway v{__version__}\n"
                 f"Listening on [green]http://{cfg.gateway.host}:{cfg.gateway.port}[/green]\n"
                 f"Auth: {'[green]enabled[/green]' if cfg.gateway.auth_token else '[yellow]open[/yellow]'}\n"  # noqa: E501
-                f"Docs: [blue]http://{cfg.gateway.host}:{cfg.gateway.port}/docs[/blue]",
+                f"Docs: [blue]http://{cfg.gateway.host}:{cfg.gateway.port}/docs[/blue]\n"
+                f"Stop with: [yellow]agent stop[/yellow] or [yellow]Ctrl+C[/yellow]",
                 title="Gateway Started",
                 border_style="cyan",
             )
@@ -770,7 +1089,41 @@ async def _run_gateway(cfg: AgentConfig) -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        _remove_pid_file()
         await application.shutdown()
+
+
+@app.command()
+def stop() -> None:
+    """Stop a running agent process."""
+    pid = _read_pid_file()
+    if pid is None:
+        err_console.print("[yellow]No running agent found[/yellow] (no PID file)")
+        raise typer.Exit(1)
+
+    if not _is_process_running(pid):
+        console.print(f"[yellow]Agent process (PID {pid}) is not running. Cleaning up.[/yellow]")
+        _remove_pid_file()
+        raise typer.Exit(0)
+
+    console.print(f"Stopping agent (PID {pid})...")
+    try:
+        if platform.system() == "Windows":
+            # On Windows, SIGTERM calls TerminateProcess (no cleanup).
+            # Use CTRL_C_EVENT to trigger KeyboardInterrupt for graceful shutdown.
+            # Temporarily ignore SIGINT in this process so the console-wide
+            # CTRL_C_EVENT doesn't kill the `agent stop` process itself.
+            prev_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+            os.kill(pid, signal.CTRL_C_EVENT)
+            signal.signal(signal.SIGINT, prev_handler)
+        else:
+            os.kill(pid, signal.SIGTERM)
+        console.print("[green]Agent stopped.[/green]")
+        # Safety net: remove PID file in case the target process didn't clean up
+        _remove_pid_file()
+    except OSError as e:
+        err_console.print(f"[red]Failed to stop agent:[/red] {e}")
+        raise typer.Exit(1) from e
 
 
 @app.command()
@@ -798,7 +1151,7 @@ def _find_config_display_path() -> str:
     """Find the config file path for display."""
     if Path("agent.yaml").exists():
         return str(Path("agent.yaml").resolve())
-    home_config = Path.home() / ".config" / "agent" / "agent.yaml"
+    home_config = get_agent_home() / "agent.yaml"
     if home_config.exists():
         return str(home_config)
     return "(using defaults)"

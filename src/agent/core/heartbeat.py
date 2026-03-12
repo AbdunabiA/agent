@@ -155,9 +155,11 @@ class HeartbeatDaemon:
         Returns:
             Content of HEARTBEAT.md or a default message.
         """
+        from agent.config import get_agent_home
+
         search_paths = [
             Path("HEARTBEAT.md"),
-            Path.home() / ".config" / "agent" / "HEARTBEAT.md",
+            get_agent_home() / "HEARTBEAT.md",
         ]
 
         for path in search_paths:

@@ -21,6 +21,8 @@ from agent.core.events import Events
 if TYPE_CHECKING:
     from agent.config import TelegramConfig
     from agent.core.agent_loop import AgentLoop
+    from agent.core.audit import AuditLog
+    from agent.core.cost_tracker import CostTracker
     from agent.core.events import EventBus
     from agent.core.heartbeat import HeartbeatDaemon
     from agent.core.scheduler import TaskScheduler
@@ -58,6 +60,53 @@ _APPROVAL_TIMEOUT = 300
 # Upload directory
 _UPLOAD_DIR = Path("data/uploads")
 
+# Default prompt shortcuts for /run command
+_DEFAULT_SHORTCUTS = [
+    {
+        "alias": "review",
+        "template": (
+            "Review the latest git diff and provide feedback on"
+            " code quality, potential bugs, and suggestions."
+        ),
+        "description": "Review latest git diff",
+    },
+    {
+        "alias": "test",
+        "template": (
+            "Run the test suite and summarize the results,"
+            " highlighting any failures or warnings."
+        ),
+        "description": "Run tests and summarize",
+    },
+    {
+        "alias": "explain",
+        "template": "Read and explain the file: {args}",
+        "description": "Explain a file",
+    },
+    {
+        "alias": "commit",
+        "template": (
+            "Look at staged git changes and suggest a clear,"
+            " concise commit message following conventional"
+            " commit format."
+        ),
+        "description": "Suggest commit message",
+    },
+    {
+        "alias": "fix",
+        "template": "Debug and fix this issue: {args}",
+        "description": "Debug an issue",
+    },
+    {
+        "alias": "summarize",
+        "template": (
+            "Summarize our conversation so far, highlighting"
+            " key decisions and action items."
+        ),
+        "description": "Summarize conversation",
+    },
+]
+
 
 class TelegramChannel(BaseChannel):
     """Telegram messaging channel via aiogram 3.x.
@@ -78,6 +127,8 @@ class TelegramChannel(BaseChannel):
         voice_pipeline: VoicePipeline | None = None,
         sdk_service: object | None = None,
         scheduler: TaskScheduler | None = None,
+        audit_log: AuditLog | None = None,
+        cost_tracker: CostTracker | None = None,
     ) -> None:
         super().__init__(config=config, event_bus=event_bus, session_store=session_store)
         self.agent_loop = agent_loop
@@ -86,6 +137,8 @@ class TelegramChannel(BaseChannel):
         self.voice_pipeline = voice_pipeline
         self.sdk_service = sdk_service
         self.scheduler = scheduler
+        self.audit_log = audit_log
+        self.cost_tracker = cost_tracker
         self._workspace_agent_loops: dict[str, AgentLoop] = {}
         self._workspace_session_stores: dict[str, SessionStore] = {}
         self._polling_task: asyncio.Task[Any] | None = None
@@ -154,6 +207,7 @@ class TelegramChannel(BaseChannel):
                 BotCommand(command="workdir", description="View/change working directory"),
                 BotCommand(command="pause", description="Pause message processing"),
                 BotCommand(command="resume", description="Resume processing"),
+                BotCommand(command="run", description="Run a prompt shortcut (/run list)"),
                 BotCommand(command="mute", description="Disable heartbeat"),
                 BotCommand(command="unmute", description="Enable heartbeat"),
             ]
@@ -236,14 +290,15 @@ class TelegramChannel(BaseChannel):
         self._router.message(Command("session"))(self._cmd_session)
         self._router.message(Command("remind"))(self._cmd_remind)
         self._router.message(Command("reminders"))(self._cmd_reminders)
+        self._router.message(Command("run"))(self._cmd_run)
 
         # Media handlers (before catch-all text)
         self._router.message(F.content_type == ContentType.VOICE)(self._handle_voice)
         self._router.message(F.content_type == ContentType.PHOTO)(self._handle_photo)
         self._router.message(F.content_type == ContentType.DOCUMENT)(self._handle_document)
 
-        # Callback query handler for inline approval buttons
-        self._router.callback_query()(self._handle_approval_callback)
+        # Callback query handler for inline buttons (approval + navigation)
+        self._router.callback_query()(self._handle_callback)
 
         # Catch-all text handler (must be registered last)
         self._router.message()(self._handle_text)
@@ -273,6 +328,7 @@ class TelegramChannel(BaseChannel):
             "/tools — List available tools\n"
             "/new — Start a new conversation\n"
             "/session — Show current session info\n"
+            "/run <shortcut> — Run a prompt shortcut (/run list for all)\n"
             "/soul — View/edit agent personality\n"
             "/backend — View/switch LLM backend\n"
             "/workdir — View/change working directory\n"
@@ -289,6 +345,22 @@ class TelegramChannel(BaseChannel):
         if not self._check_message(message):
             return
 
+        text = await self._build_status_text()
+
+        if AIOGRAM_AVAILABLE:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="Costs", callback_data="nav:status:costs"),
+                    InlineKeyboardButton(text="Health", callback_data="nav:status:health"),
+                    InlineKeyboardButton(text="Audit", callback_data="nav:status:audit"),
+                ],
+            ])
+            await message.answer(text, reply_markup=keyboard)
+        else:
+            await message.answer(text)
+
+    async def _build_status_text(self) -> str:
+        """Build the status text with cost and audit data."""
         from agent.tools.registry import registry
 
         heartbeat_status = "not configured"
@@ -301,34 +373,111 @@ class TelegramChannel(BaseChannel):
         tools_count = len(registry.list_tools())
         sessions_count = self.session_store.active_count
 
-        await message.answer(
-            f"Agent Status:\n"
-            f"Heartbeat: {heartbeat_status}\n"
-            f"Last tick: {last_tick}\n"
-            f"Tools: {tools_count}\n"
-            f"Active sessions: {sessions_count}"
-        )
+        lines = [
+            "Agent Status\n",
+            f"Heartbeat: {heartbeat_status}",
+            f"Last tick: {last_tick}\n",
+            f"Tools: {tools_count} registered",
+            f"Sessions: {sessions_count} active",
+        ]
+
+        # Cost summary
+        try:
+            if self.cost_tracker:
+                stats = self.cost_tracker.get_stats("day")
+                total_cost = stats.get("total_cost", 0)
+                total_calls = stats.get("total_calls", 0)
+                tokens = stats.get("total_tokens", {})
+                total_tokens = tokens.get("input", 0) + tokens.get("output", 0)
+                token_display = f"{total_tokens / 1000:.1f}K" if total_tokens else "0"
+                lines.append(
+                    f"\nToday: {total_calls} calls | ${total_cost:.2f} | {token_display} tokens"
+                )
+        except Exception:
+            pass
+
+        # Audit summary
+        try:
+            if self.audit_log:
+                audit_stats = await self.audit_log.get_stats()
+                tool_calls = audit_stats.get("total_calls", 0)
+                success_rate = audit_stats.get("success_rate", 0) * 100
+                avg_ms = audit_stats.get("avg_duration_ms", 0)
+                if tool_calls > 0:
+                    lines.append(
+                        f"Tools: {tool_calls} calls | {success_rate:.1f}% success | avg {avg_ms}ms"
+                    )
+        except Exception:
+            pass
+
+        return "\n".join(lines)
 
     async def _cmd_tools(self, message: Any) -> None:
         """Handle /tools command — list registered tools."""
         if not self._check_message(message):
             return
 
+        text, keyboard = await self._build_tools_text_and_keyboard()
+        if text is None:
+            await message.answer("No tools registered.")
+            return
+
+        if keyboard and AIOGRAM_AVAILABLE:
+            await message.answer(text, reply_markup=keyboard)
+        else:
+            await message.answer(text)
+
+    async def _build_tools_text_and_keyboard(
+        self,
+    ) -> tuple[str | None, Any]:
+        """Build tools list text with usage counts and toggle keyboard."""
         from agent.tools.registry import registry
 
         tools = registry.list_tools()
         if not tools:
-            await message.answer("No tools registered.")
-            return
+            return None, None
+
+        # Get per-tool usage counts from audit log
+        tools_used: dict[str, int] = {}
+        try:
+            if self.audit_log:
+                audit_stats = await self.audit_log.get_stats()
+                tools_used = audit_stats.get("tools_used", {})
+        except Exception:
+            pass
 
         tier_emoji = {"safe": "\U0001f7e2", "moderate": "\U0001f7e1", "dangerous": "\U0001f534"}
         lines: list[str] = ["Available tools:\n"]
         for t in tools:
             emoji = tier_emoji.get(t.tier.value, "\u2753")
             status = "on" if t.enabled else "off"
-            lines.append(f"{emoji} {t.name} [{status}] — {t.description}")
+            count = tools_used.get(t.name, 0)
+            usage = f" ({count}x)" if count > 0 else ""
+            lines.append(f"{emoji} {t.name} [{status}] — {t.description}{usage}")
 
-        await message.answer("\n".join(lines))
+        text = "\n".join(lines)
+
+        # Build toggle buttons for first 8 tools
+        keyboard = None
+        if AIOGRAM_AVAILABLE:
+            buttons: list[list[Any]] = []
+            row: list[Any] = []
+            for t in tools[:8]:
+                label = f"{'Disable' if t.enabled else 'Enable'} {t.name}"
+                row.append(
+                    InlineKeyboardButton(
+                        text=label, callback_data=f"nav:tools:toggle:{t.name}",
+                    )
+                )
+                if len(row) == 2:
+                    buttons.append(row)
+                    row = []
+            if row:
+                buttons.append(row)
+            if buttons:
+                keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+        return text, keyboard
 
     async def _cmd_pause(self, message: Any) -> None:
         """Handle /pause command."""
@@ -530,7 +679,7 @@ class TelegramChannel(BaseChannel):
         status = "active" if sdk_sid else "none"
 
         lines = [
-            f"Session Info:",
+            "Session Info\n",
             f"Backend: {backend}",
             f"Agent session: {session_id}",
             f"SDK session: {sdk_sid or 'none (next message starts new)'}",
@@ -544,7 +693,35 @@ class TelegramChannel(BaseChannel):
             task_status = sdk.get_status(session_id)
             lines.append(f"Task status: {task_status}")
 
-        await message.answer("\n".join(lines))
+        # Add message/token info from session
+        if session:
+            msg_count = getattr(session, "message_count", 0)
+            tokens_in = getattr(session, "tokens_in", 0)
+            tokens_out = getattr(session, "tokens_out", 0)
+            total_tokens = tokens_in + tokens_out
+            if msg_count or total_tokens:
+                lines.append("")
+            if msg_count:
+                lines.append(f"Messages: {msg_count}")
+            if total_tokens:
+                lines.append(
+                    f"Tokens: {total_tokens:,} (in: {tokens_in:,} + out: {tokens_out:,})"
+                )
+
+        if AIOGRAM_AVAILABLE:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Clear Session", callback_data="nav:session:clear",
+                    ),
+                    InlineKeyboardButton(
+                        text="New Session", callback_data="nav:session:new",
+                    ),
+                ],
+            ])
+            await message.answer("\n".join(lines), reply_markup=keyboard)
+        else:
+            await message.answer("\n".join(lines))
 
     async def _cmd_remind(self, message: Any) -> None:
         """Handle /remind command — set a reminder.
@@ -639,6 +816,119 @@ class TelegramChannel(BaseChannel):
             lines.append(f"{icon} [{t.id}] {t.description} @ {time_info}")
 
         await message.answer("\n".join(lines))
+
+    def _get_shortcuts(self) -> list[dict[str, str]]:
+        """Resolve prompt shortcuts — merge defaults with config overrides."""
+        from agent.config import get_config
+
+        try:
+            cfg = get_config()
+            config_shortcuts = [
+                {"alias": s.alias, "template": s.template, "description": s.description}
+                for s in cfg.prompts.shortcuts
+            ]
+        except Exception:
+            config_shortcuts = []
+
+        # Config overrides defaults by alias
+        merged: dict[str, dict[str, str]] = {}
+        for s in _DEFAULT_SHORTCUTS:
+            merged[s["alias"]] = s
+        for s in config_shortcuts:
+            merged[s["alias"]] = s
+        return list(merged.values())
+
+    async def _cmd_run(self, message: Any) -> None:
+        """Handle /run command — run a prompt shortcut.
+
+        Usage:
+            /run list           — show all shortcuts
+            /run <alias> [args] — run a shortcut
+        """
+        if not self._check_message(message):
+            return
+
+        if self._paused:
+            await message.answer("I'm currently paused. Use /resume to re-enable me.")
+            return
+
+        text = (message.text or "").strip()
+        parts = text.split(maxsplit=2)
+
+        shortcuts = self._get_shortcuts()
+
+        # /run (no args) or /run list
+        if len(parts) < 2 or parts[1].lower() == "list":
+            lines = ["Prompt shortcuts:\n"]
+            for s in shortcuts:
+                desc = f" — {s['description']}" if s.get("description") else ""
+                lines.append(f"  /run {s['alias']}{desc}")
+            lines.append("\nUsage: /run <shortcut> [args]")
+            await message.answer("\n".join(lines))
+            return
+
+        alias = parts[1].lower()
+        args = parts[2] if len(parts) > 2 else ""
+
+        # Find matching shortcut
+        shortcut = next((s for s in shortcuts if s["alias"] == alias), None)
+        if not shortcut:
+            await message.answer(
+                f"Unknown shortcut: {alias}\n"
+                "Use /run list to see available shortcuts."
+            )
+            return
+
+        # Interpolate {args}
+        prompt = shortcut["template"]
+        if "{args}" in prompt:
+            if not args:
+                await message.answer(
+                    f"Shortcut '{alias}' requires arguments.\n"
+                    f"Usage: /run {alias} <args>"
+                )
+                return
+            prompt = prompt.replace("{args}", args)
+
+        # Process through agent loop (same pattern as _handle_text)
+        user_id = message.from_user.id
+
+        from agent.tools.builtins.scheduler import set_context
+        set_context(channel="telegram", user_id=str(user_id))
+
+        from agent.tools.builtins.send_file import set_file_send_context
+        set_file_send_context(channel="telegram", user_id=str(user_id))
+
+        await self.send_typing(str(user_id))
+
+        agent_loop, session_store = self._resolve_components(str(user_id))
+        session_id = self._make_session_id(str(user_id))
+        session = await session_store.get_or_create(
+            session_id=session_id, channel="telegram"
+        )
+
+        typing_task = asyncio.create_task(self._keep_typing(str(user_id)))
+        try:
+            response_text = await self._process_via_sdk_or_loop(
+                prompt, session, agent_loop,
+            )
+            typing_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await typing_task
+
+            await self.send_message(
+                OutgoingMessage(
+                    content=response_text,
+                    channel_user_id=str(user_id),
+                    parse_mode="Markdown",
+                )
+            )
+        except Exception as e:
+            typing_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await typing_task
+            logger.error("run_shortcut_error", error=str(e), alias=alias)
+            await message.answer("Sorry, something went wrong running that shortcut.")
 
     # ------------------------------------------------------------------
     # Media handlers
@@ -907,8 +1197,16 @@ class TelegramChannel(BaseChannel):
             await message.answer("Sorry, I couldn't process your document.")
 
     # ------------------------------------------------------------------
-    # Approval callback
+    # Callback dispatcher
     # ------------------------------------------------------------------
+
+    async def _handle_callback(self, callback: Any) -> None:
+        """Route inline button callbacks to the correct handler."""
+        data = callback.data or ""
+        if data.startswith("nav:"):
+            await self._handle_nav_callback(callback)
+        else:
+            await self._handle_approval_callback(callback)
 
     async def _handle_approval_callback(self, callback: Any) -> None:
         """Handle inline button callbacks for tool approval.
@@ -945,6 +1243,206 @@ class TelegramChannel(BaseChannel):
             )
 
         await callback.answer()
+
+    async def _handle_nav_callback(self, callback: Any) -> None:
+        """Handle navigation inline button callbacks.
+
+        Routes by callback data prefix:
+        - nav:status:costs / nav:status:health / nav:status:audit
+        - nav:tools:toggle:<name>
+        - nav:session:clear / nav:session:new
+        """
+        data = callback.data or ""
+
+        try:
+            if data == "nav:status:costs":
+                await self._nav_status_costs(callback)
+            elif data == "nav:status:health":
+                await self._nav_status_health(callback)
+            elif data == "nav:status:audit":
+                await self._nav_status_audit(callback)
+            elif data.startswith("nav:tools:toggle:"):
+                tool_name = data.split(":", 3)[3]
+                await self._nav_tools_toggle(callback, tool_name)
+            elif data == "nav:session:clear":
+                await self._nav_session_clear(callback)
+            elif data == "nav:session:new":
+                await self._nav_session_new(callback)
+            elif data == "nav:back:status":
+                text = await self._build_status_text()
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="Costs", callback_data="nav:status:costs"),
+                        InlineKeyboardButton(text="Health", callback_data="nav:status:health"),
+                        InlineKeyboardButton(text="Audit", callback_data="nav:status:audit"),
+                    ],
+                ])
+                await callback.message.edit_text(text, reply_markup=keyboard)
+            elif data == "nav:back:tools":
+                text, keyboard = await self._build_tools_text_and_keyboard()
+                if text:
+                    await callback.message.edit_text(
+                        text, reply_markup=keyboard,
+                    )
+            elif data == "nav:back:session":
+                await callback.message.edit_text(
+                    "Use /session to view current session info.",
+                )
+        except Exception as e:
+            logger.warning("nav_callback_error", error=str(e), data=data)
+
+        await callback.answer()
+
+    async def _nav_status_costs(self, callback: Any) -> None:
+        """Show cost breakdown detail view."""
+        if not self.cost_tracker:
+            await callback.message.edit_text("Cost tracker not available.")
+            return
+
+        stats = self.cost_tracker.get_stats("day")
+        total_cost = stats.get("total_cost", 0)
+        total_calls = stats.get("total_calls", 0)
+        tokens = stats.get("total_tokens", {})
+
+        lines = [
+            "Cost Details (Today)\n",
+            f"Total cost: ${total_cost:.4f}",
+            f"Total calls: {total_calls}",
+            f"Tokens in: {tokens.get('input', 0):,}",
+            f"Tokens out: {tokens.get('output', 0):,}",
+        ]
+
+        by_model = stats.get("by_model", [])
+        if by_model:
+            lines.append("\nBy model:")
+            for m in by_model:
+                lines.append(
+                    f"  {m['model']}: ${m['cost']:.4f} ({m['percentage']:.0f}%)"
+                )
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Back", callback_data="nav:back:status")],
+        ])
+        await callback.message.edit_text("\n".join(lines), reply_markup=keyboard)
+
+    async def _nav_status_health(self, callback: Any) -> None:
+        """Show health check summary."""
+        from agent.config import get_config
+        from agent.core.doctor import run_all_checks
+
+        config = get_config()
+        checks = await run_all_checks(config)
+
+        status_icon = {"pass": "\u2705", "warn": "\u26a0\ufe0f", "fail": "\u274c"}
+        lines = ["Health Checks\n"]
+        for check in checks:
+            icon = status_icon.get(check.status, "\u2753")
+            lines.append(f"{icon} {check.name}: {check.message}")
+
+        pass_count = sum(1 for c in checks if c.status == "pass")
+        warn_count = sum(1 for c in checks if c.status == "warn")
+        fail_count = sum(1 for c in checks if c.status == "fail")
+        lines.append(f"\n{pass_count} pass | {warn_count} warn | {fail_count} fail")
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Back", callback_data="nav:back:status")],
+        ])
+        # Truncate if too long for Telegram
+        text = "\n".join(lines)
+        if len(text) > _TG_MAX_LENGTH - 100:
+            text = text[:_TG_MAX_LENGTH - 150] + "\n\n... (truncated)"
+        await callback.message.edit_text(text, reply_markup=keyboard)
+
+    async def _nav_status_audit(self, callback: Any) -> None:
+        """Show audit log summary."""
+        if not self.audit_log:
+            await callback.message.edit_text("Audit log not available.")
+            return
+
+        stats = await self.audit_log.get_stats()
+        total = stats.get("total_calls", 0)
+        success = stats.get("success_count", 0)
+        errors = stats.get("error_count", 0)
+        rate = stats.get("success_rate", 0) * 100
+        avg_ms = stats.get("avg_duration_ms", 0)
+
+        lines = [
+            "Audit Summary\n",
+            f"Total tool calls: {total}",
+            f"Success: {success} | Errors: {errors}",
+            f"Success rate: {rate:.1f}%",
+            f"Avg duration: {avg_ms}ms",
+        ]
+
+        tools_used = stats.get("tools_used", {})
+        if tools_used:
+            lines.append("\nPer-tool breakdown:")
+            for name, count in sorted(tools_used.items(), key=lambda x: -x[1]):
+                lines.append(f"  {name}: {count}x")
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Back", callback_data="nav:back:status")],
+        ])
+        text = "\n".join(lines)
+        if len(text) > _TG_MAX_LENGTH - 100:
+            text = text[:_TG_MAX_LENGTH - 150] + "\n\n... (truncated)"
+        await callback.message.edit_text(text, reply_markup=keyboard)
+
+    async def _nav_tools_toggle(self, callback: Any, tool_name: str) -> None:
+        """Toggle a tool on/off and refresh the tools view."""
+        from agent.tools.registry import registry
+
+        try:
+            tool = next(
+                (t for t in registry.list_tools() if t.name == tool_name), None
+            )
+            if not tool:
+                await callback.message.edit_text(f"Tool '{tool_name}' not found.")
+                return
+
+            if tool.enabled:
+                registry.disable_tool(tool_name)
+                action = "disabled"
+            else:
+                registry.enable_tool(tool_name)
+                action = "enabled"
+
+            logger.info("tool_toggled_via_telegram", tool=tool_name, action=action)
+        except Exception as e:
+            logger.warning("tool_toggle_error", tool=tool_name, error=str(e))
+            await callback.message.edit_text(f"Error toggling {tool_name}: {e}")
+            return
+
+        # Refresh tools view
+        text, keyboard = await self._build_tools_text_and_keyboard()
+        if text:
+            await callback.message.edit_text(text, reply_markup=keyboard)
+
+    async def _nav_session_clear(self, callback: Any) -> None:
+        """Clear conversation history in the current session."""
+        user_id = str(callback.from_user.id)
+        session_id = self._make_session_id(user_id)
+
+        session = await self.session_store.get(session_id)
+        if session:
+            session.clear()
+            if hasattr(session, "sdk_session_id"):
+                session.sdk_session_id = None  # type: ignore[attr-defined]
+
+        await callback.message.edit_text("Session cleared. Your next message starts fresh.")
+
+    async def _nav_session_new(self, callback: Any) -> None:
+        """Create a new session."""
+        user_id = str(callback.from_user.id)
+        session_id = self._make_session_id(user_id)
+
+        session = await self.session_store.get(session_id)
+        if session and hasattr(session, "sdk_session_id"):
+            session.sdk_session_id = None  # type: ignore[attr-defined]
+
+        await callback.message.edit_text(
+            "New conversation started. Your next message begins a fresh session."
+        )
 
     # ------------------------------------------------------------------
     # Text message handling

@@ -24,28 +24,35 @@ pip install -e .
 docker run -e ANTHROPIC_API_KEY=sk-... ghcr.io/OWNER/agent
 ```
 
-## Configure
+## Set Up
 
-Set at least one API key:
+The easiest way to configure Agent is the interactive setup wizard:
+
+```bash
+agent init
+```
+
+This walks you through:
+1. **LLM backend** — API keys (Anthropic/OpenAI/Gemini) or Claude SDK (local subscription)
+2. **Telegram bot** — optional, paste your BotFather token
+3. **Gateway** — port and auth token (auto-generated)
+
+Config files are created in `~/.config/agent/`:
+
+| File | Purpose |
+|------|---------|
+| `agent.yaml` | All settings (models, channels, tools, etc.) |
+| `.env` | API keys and secrets |
+
+You can override the config location with the `AGENT_HOME` environment variable.
+
+### Minimal Setup (No Wizard)
+
+If you just want to chat, set one API key and go:
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-```
-
-That's it. Agent works with zero config.
-
-For more options, create `agent.yaml`:
-
-```bash
-cp agent.yaml.example agent.yaml
-# Edit agent.yaml to customize
-```
-
-Or create a `.env` file:
-
-```
-ANTHROPIC_API_KEY=sk-ant-your-key
-OPENAI_API_KEY=sk-your-key
+agent chat
 ```
 
 ## Run
@@ -60,11 +67,29 @@ Chat commands: `/help`, `/exit`, `/model <name>`, `/tools`, `/memory`, `/soul`, 
 
 ### Full Agent Mode
 
-Starts the gateway, heartbeat, and all enabled channels:
+Starts the gateway, heartbeat, and all enabled channels (Telegram, webchat):
 
 ```bash
 agent start
 ```
+
+Stop the agent from any terminal:
+
+```bash
+agent stop
+```
+
+Or press `Ctrl+C` in the terminal where it's running.
+
+### Dashboard
+
+Once the agent is running, open:
+
+```
+http://localhost:8765/dashboard
+```
+
+If a gateway token is configured, the dashboard will ask you to log in. Paste the `GATEWAY_TOKEN` from your `~/.config/agent/.env` file.
 
 ### Health Check
 
@@ -87,9 +112,14 @@ agent memory export    # Export memory to JSON
 
 ## Connect Telegram
 
+If you didn't set up Telegram during `agent init`, you can add it manually:
+
 1. Create a bot via [@BotFather](https://t.me/BotFather)
-2. Add the token to `.env`: `TELEGRAM_BOT_TOKEN=your-token`
-3. Configure in `agent.yaml`:
+2. Add the token to `~/.config/agent/.env`:
+   ```
+   TELEGRAM_BOT_TOKEN=your-token
+   ```
+3. Enable in `~/.config/agent/agent.yaml`:
    ```yaml
    channels:
      telegram:
@@ -97,13 +127,25 @@ agent memory export    # Export memory to JSON
        token: "${TELEGRAM_BOT_TOKEN}"
        allowed_users: [your_telegram_id]
    ```
-4. Run `agent start`
+4. Restart the agent: `agent stop && agent start`
 
 See [Telegram guide](telegram.md) for details.
 
+## Config File Locations
+
+Agent searches for config in this order (first found wins):
+
+1. `--config` flag — explicit path
+2. `AGENT_CONFIG` env var — explicit path
+3. `./agent.yaml` — current directory (useful for development)
+4. `~/.config/agent/agent.yaml` — user home (default for installed agents)
+
+The `.env` file is loaded from both `~/.config/agent/.env` and the current directory.
+
 ## Next Steps
 
-- [Configuration](configuration.md) — Customize everything
+- [Configuration](configuration.md) — Full config reference
 - [Tools](tools.md) — What tools are available
 - [Skills](skills.md) — Extend with plugins
 - [Memory](memory.md) — How memory works
+- [Dashboard](dashboard.md) — Web UI guide
