@@ -221,6 +221,11 @@ class Application:
                         claude_auth_dir=sdk_cfg.claude_auth_dir,
                         tool_registry=registry,
                         soul_loader=self.soul_loader,
+                        fact_store=self.fact_store,
+                        vector_store=self.vector_store,
+                        fact_extractor=self.fact_extractor,
+                        cost_tracker=self.cost_tracker,
+                        event_bus=self.event_bus,
                     )
                     ok, msg = await self.sdk_service.check_available()
                     if ok:

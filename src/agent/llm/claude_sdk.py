@@ -23,7 +23,12 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 if TYPE_CHECKING:
+    from agent.core.cost_tracker import CostTracker
+    from agent.core.events import EventBus
+    from agent.memory.extraction import FactExtractor
     from agent.memory.soul import SoulLoader
+    from agent.memory.store import FactStore
+    from agent.memory.vectors import VectorStore
     from agent.tools.registry import ToolRegistry
 
 logger = structlog.get_logger(__name__)
@@ -108,6 +113,11 @@ class ClaudeSDKService:
         claude_auth_dir: str = "~/.claude",
         tool_registry: ToolRegistry | None = None,
         soul_loader: SoulLoader | None = None,
+        fact_store: FactStore | None = None,
+        vector_store: VectorStore | None = None,
+        fact_extractor: FactExtractor | None = None,
+        cost_tracker: CostTracker | None = None,
+        event_bus: EventBus | None = None,
     ) -> None:
         if not sdk_available():
             raise ImportError(
@@ -121,6 +131,11 @@ class ClaudeSDKService:
         self.claude_auth_dir = str(Path(claude_auth_dir).expanduser())
         self.tool_registry = tool_registry
         self.soul_loader = soul_loader
+        self.fact_store = fact_store
+        self.vector_store = vector_store
+        self.fact_extractor = fact_extractor
+        self.cost_tracker = cost_tracker
+        self.event_bus = event_bus
 
         # Per-task state
         self._clients: dict[str, Any] = {}
@@ -207,6 +222,87 @@ class ClaudeSDKService:
                     yield retry_event
                 return
             yield event
+
+    async def _query_memory(
+        self, user_message: str,
+    ) -> tuple[list[Any] | None, list[Any] | None]:
+        """Query fact store and vector store for relevant context.
+
+        Returns:
+            Tuple of (facts, vector_results), either can be None.
+        """
+        facts = None
+        vectors = None
+
+        async def _get_facts() -> list[Any] | None:
+            if not self.fact_store:
+                return None
+            try:
+                return await self.fact_store.get_relevant(limit=15)
+            except Exception as e:
+                logger.debug("sdk_fact_query_failed", error=str(e))
+                return None
+
+        async def _get_vectors() -> list[Any] | None:
+            if not self.vector_store:
+                return None
+            try:
+                return await self.vector_store.search(user_message, limit=5)
+            except Exception as e:
+                logger.debug("sdk_vector_query_failed", error=str(e))
+                return None
+
+        facts, vectors = await asyncio.gather(_get_facts(), _get_vectors())
+        return facts, vectors
+
+    def _build_system_prompt(
+        self,
+        facts: list[Any] | None = None,
+        vector_results: list[Any] | None = None,
+    ) -> str | None:
+        """Build system prompt from soul.md + memory context.
+
+        Mirrors the format used by agent.core.context.build_messages().
+        """
+        parts: list[str] = []
+
+        # Soul personality
+        if self.soul_loader:
+            soul_content = self.soul_loader.content
+            if soul_content:
+                parts.append(soul_content)
+
+        # Inject known facts
+        if facts:
+            fact_lines = [f"- {f.key}: {f.value}" for f in facts]
+            parts.append(
+                "KNOWN FACTS ABOUT THE USER:\n" + "\n".join(fact_lines)
+            )
+
+        # Inject related past conversations
+        if vector_results:
+            vr_lines = []
+            for vr in vector_results:
+                score_pct = int(vr.score * 100)
+                vr_lines.append(f"[Relevance: {score_pct}%] {vr.text}")
+            parts.append(
+                "RELATED PAST CONVERSATIONS:\n"
+                + "\n---\n".join(vr_lines)
+            )
+
+        return "\n\n".join(parts) if parts else None
+
+    async def _safe_extract_facts(
+        self, user_message: str, assistant_response: str,
+    ) -> None:
+        """Extract facts from a user+assistant exchange (fire-and-forget)."""
+        try:
+            await self.fact_extractor.extract_from_messages([
+                {"role": "user", "content": user_message},
+                {"role": "assistant", "content": assistant_response},
+            ])
+        except Exception as e:
+            logger.debug("sdk_fact_extraction_failed", error=str(e))
 
     def _build_mcp_server(self) -> tuple[Any, list[str]] | None:
         """Build an in-process MCP server exposing agent tools to the SDK.
@@ -415,12 +511,11 @@ class ClaudeSDKService:
                 resume=session_id[:16] + "..." if session_id else None,
             )
 
-            # Build system prompt from soul.md
-            system_prompt: str | None = None
-            if self.soul_loader:
-                soul_content = self.soul_loader.content
-                if soul_content:
-                    system_prompt = soul_content
+            # Query memory for context injection
+            facts, vector_results = await self._query_memory(prompt)
+
+            # Build system prompt from soul.md + memory context
+            system_prompt = self._build_system_prompt(facts, vector_results)
 
             options = ClaudeAgentOptions(
                 cwd=resolved_cwd,
@@ -493,6 +588,41 @@ class ClaudeSDKService:
                             )
                             return
 
+                        in_tokens = usage.get("input_tokens", 0)
+                        out_tokens = usage.get("output_tokens", 0)
+
+                        # Record cost
+                        if self.cost_tracker and (in_tokens or out_tokens):
+                            self.cost_tracker.record(
+                                model=self.model or "claude-sdk",
+                                input_tokens=in_tokens,
+                                output_tokens=out_tokens,
+                                channel="sdk",
+                                session_id=task_id,
+                            )
+
+                        # Fire-and-forget: extract facts from conversation
+                        if self.fact_extractor and result_text:
+                            asyncio.create_task(
+                                self._safe_extract_facts(prompt, result_text)
+                            )
+
+                        # Emit outgoing event
+                        if self.event_bus:
+                            from agent.core.events import Events
+
+                            asyncio.create_task(
+                                self.event_bus.emit(
+                                    Events.MESSAGE_OUTGOING,
+                                    {
+                                        "content": result_text,
+                                        "session_id": task_id,
+                                        "model": self.model or "claude-sdk",
+                                        "num_turns": num_turns,
+                                    },
+                                )
+                            )
+
                         yield SDKStreamEvent(
                             type="result",
                             content=getattr(message, "result", "") or result_text,
@@ -502,8 +632,8 @@ class ClaudeSDKService:
                                     message, "total_cost_usd", 0.0
                                 ),
                                 "num_turns": num_turns,
-                                "input_tokens": usage.get("input_tokens", 0),
-                                "output_tokens": usage.get("output_tokens", 0),
+                                "input_tokens": in_tokens,
+                                "output_tokens": out_tokens,
                             },
                         )
 
