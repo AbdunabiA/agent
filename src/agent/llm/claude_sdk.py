@@ -192,7 +192,8 @@ class ClaudeSDKService:
         Yields:
             SDKStreamEvent objects as they occur.
         """
-        # Try with resume first; on session error retry without resume
+        # Try with resume first; on any error retry once without resume,
+        # since session corruption or stale state can cause various failures.
         async for event in self._run_task_impl(
             prompt,
             task_id=task_id,
@@ -201,16 +202,13 @@ class ClaudeSDKService:
             on_permission=on_permission,
             on_question=on_question,
         ):
-            if (
-                event.type == "error"
-                and session_id is not None
-                and event.content == "Session expired or invalid"
-            ):
-                # Resume failed due to session issue — retry with fresh session
+            if event.type == "error" and session_id is not None:
+                # Resume failed — retry with fresh session
                 logger.warning(
                     "sdk_resume_failed_retrying",
                     task_id=task_id,
                     session_id=session_id[:16] + "...",
+                    error=event.content[:120] if event.content else None,
                 )
                 async for retry_event in self._run_task_impl(
                     prompt,
