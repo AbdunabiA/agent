@@ -13,7 +13,8 @@ Requirements:
 
 from __future__ import annotations
 
-from agent.tools.registry import ToolTier, tool  # noqa: I001
+from agent.tools.executor import ImageContent, MultimodalToolOutput  # noqa: I001
+from agent.tools.registry import ToolTier, tool
 
 # --- Screen ---
 
@@ -22,8 +23,8 @@ from agent.tools.registry import ToolTier, tool  # noqa: I001
     name="screen_capture",
     description=(
         "Take a screenshot of the entire screen or a specific region. "
-        "Use this to SEE what's currently displayed. Returns screenshot metadata. "
-        "Combine with find_on_screen to locate specific UI elements."
+        "Returns the actual screenshot image so you can see what's displayed. "
+        "You can directly describe what you see without needing screen_describe."
     ),
     tier=ToolTier.SAFE,
 )
@@ -34,7 +35,7 @@ async def screen_capture(
     region_height: int | None = None,
     scale: float = 0.75,
 ) -> str:
-    """Capture the screen and return metadata.
+    """Capture the screen and return the screenshot image.
 
     Args:
         region_x: Left edge of capture region (optional).
@@ -51,91 +52,13 @@ async def screen_capture(
 
     screenshot = await capture_screen(region=region, scale=scale)
 
-    return (
-        f"Screenshot captured: {screenshot.width}x{screenshot.height} "
-        f"({len(screenshot.image_bytes) // 1024} KB)\n"
-        f"Use find_on_screen to locate specific UI elements, "
-        f"or screen_describe to get a full description."
+    return MultimodalToolOutput(  # type: ignore[return-value]
+        text=(
+            f"Screenshot captured: {screenshot.width}x{screenshot.height} "
+            f"({len(screenshot.image_bytes) // 1024} KB)"
+        ),
+        images=[ImageContent(base64_data=screenshot.base64)],
     )
-
-
-@tool(
-    name="screen_describe",
-    description=(
-        "Take a screenshot and describe what's on screen using a vision LLM. "
-        "Returns a detailed description of the visible content, applications, "
-        "and UI elements. This is the agent's 'eyes'."
-    ),
-    tier=ToolTier.SAFE,
-)
-async def screen_describe(
-    scale: float = 0.75,
-) -> str:
-    """Capture and describe the screen.
-
-    Args:
-        scale: Scale factor for screenshot (default 0.75).
-    """
-    from agent.config import get_config
-    from agent.desktop.screen import capture_screen
-    from agent.desktop.vision import VisionAnalyzer
-    from agent.llm.provider import LLMProvider
-
-    screenshot = await capture_screen(scale=scale)
-
-    config = get_config()
-    llm = LLMProvider(config.models)
-    vision_model = config.desktop.vision_model or None
-    analyzer = VisionAnalyzer(llm, model=vision_model)
-
-    description = await analyzer.describe_screen(screenshot)
-    return (
-        f"Screen ({screenshot.width}x{screenshot.height}):\n\n"
-        f"{description}"
-    )
-
-
-@tool(
-    name="find_on_screen",
-    description=(
-        "Find a UI element on screen by describing it in natural language. "
-        "Returns the element's coordinates so you can click it. "
-        "Examples: 'the search bar', 'the red Submit button', 'the X close button'."
-    ),
-    tier=ToolTier.SAFE,
-)
-async def find_on_screen(element_description: str, scale: float = 0.75) -> str:
-    """Find a UI element by description.
-
-    Args:
-        element_description: Natural language description of what to find.
-        scale: Scale factor for screenshot (default 0.75).
-    """
-    from agent.config import get_config
-    from agent.desktop.screen import capture_screen
-    from agent.desktop.vision import VisionAnalyzer
-    from agent.llm.provider import LLMProvider
-
-    screenshot = await capture_screen(scale=scale)
-
-    config = get_config()
-    llm = LLMProvider(config.models)
-    vision_model = config.desktop.vision_model or None
-    analyzer = VisionAnalyzer(llm, model=vision_model)
-
-    result = await analyzer.find_element(screenshot, element_description)
-
-    if result and result.get("found"):
-        # Scale coordinates back to actual screen resolution if scaled
-        sx = int(int(result["x"]) / scale) if scale != 1.0 else int(result["x"])  # type: ignore[arg-type]
-        sy = int(int(result["y"]) / scale) if scale != 1.0 else int(result["y"])  # type: ignore[arg-type]
-        return (
-            f"Found: {result.get('description', element_description)}\n"
-            f"Position: ({sx}, {sy})\n"
-            f"Size: ~{result.get('width', '?')}x{result.get('height', '?')}\n"
-            f"To click it: use mouse_click with x={sx}, y={sy}"
-        )
-    return f"Element not found: '{element_description}'"
 
 
 # --- Mouse ---

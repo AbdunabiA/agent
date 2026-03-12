@@ -206,7 +206,6 @@ class DesktopConfig(BaseModel):
     screenshot_scale: float = 0.75  # Scale screenshots to save LLM tokens
     mouse_move_duration: float = 0.3  # Mouse animation speed
     typing_interval: float = 0.02  # Delay between keystrokes
-    vision_model: str = ""  # Override model for vision (empty = use default)
     failsafe: bool = True  # pyautogui failsafe (corner escape)
     max_screenshot_size_kb: int = 500  # Max screenshot size to send to LLM
 

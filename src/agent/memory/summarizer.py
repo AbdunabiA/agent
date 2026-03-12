@@ -63,9 +63,11 @@ class ConversationSummarizer:
         if not session.messages:
             return ""
 
+        from agent.core.session import content_as_text
+
         # Format messages for the prompt
         formatted = "\n".join(
-            f"{msg.role}: {msg.content}"
+            f"{msg.role}: {content_as_text(msg.content)}"
             for msg in session.messages
             if msg.role in ("user", "assistant") and msg.content
         )

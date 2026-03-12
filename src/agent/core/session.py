@@ -53,12 +53,28 @@ class Message:
     """A single message in a conversation."""
 
     role: str  # "user", "assistant", "system", "tool"
-    content: str
+    content: str | list[dict[str, Any]]
     tool_calls: list[ToolCall] | None = None
     tool_call_id: str | None = None
     model: str | None = None
     usage: TokenUsage | None = None
     timestamp: datetime = field(default_factory=datetime.now)
+
+
+def content_as_text(content: str | list[dict[str, Any]]) -> str:
+    """Extract plain text from content (handles both str and multimodal list).
+
+    Args:
+        content: Message content — either a plain string or a list of content blocks.
+
+    Returns:
+        Concatenated text from all text blocks.
+    """
+    if isinstance(content, str):
+        return content
+    return " ".join(
+        block.get("text", "") for block in content if block.get("type") == "text"
+    )
 
 
 class Session:
@@ -273,6 +289,12 @@ class SessionStore:
                 "total_tokens": message.usage.total_tokens,
             })
 
+        content_value = (
+            json.dumps(message.content)
+            if isinstance(message.content, list)
+            else message.content
+        )
+
         await self._db.db.execute(
             """INSERT INTO messages
                (id, conversation_id, role, content, tool_calls, tool_call_id,
@@ -282,7 +304,7 @@ class SessionStore:
                 msg_id,
                 session_id,
                 message.role,
-                message.content,
+                content_value,
                 tool_calls_json,
                 message.tool_call_id,
                 message.model,
@@ -462,9 +484,24 @@ class SessionStore:
                 total_tokens=raw_usage["total_tokens"],
             )
 
+        raw_content = row["content"]
+        content: str | list[dict[str, Any]] = raw_content
+        if raw_content and raw_content.startswith("["):
+            try:
+                parsed = json.loads(raw_content)
+                if (
+                    isinstance(parsed, list)
+                    and parsed
+                    and isinstance(parsed[0], dict)
+                    and "type" in parsed[0]
+                ):
+                    content = parsed
+            except (json.JSONDecodeError, TypeError):
+                pass
+
         return Message(
             role=row["role"],
-            content=row["content"],
+            content=content,
             tool_calls=tool_calls,
             tool_call_id=row["tool_call_id"],
             model=row["model"],

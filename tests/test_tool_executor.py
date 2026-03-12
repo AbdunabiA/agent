@@ -12,7 +12,11 @@ from agent.core.events import EventBus
 from agent.core.guardrails import Guardrails
 from agent.core.permissions import PermissionManager
 from agent.core.session import ToolCall
-from agent.tools.executor import ToolExecutor
+from agent.tools.executor import (
+    ImageContent,
+    MultimodalToolOutput,
+    ToolExecutor,
+)
 from agent.tools.registry import ToolRegistry, ToolTier
 
 
@@ -37,6 +41,13 @@ def test_registry() -> ToolRegistry:
     @reg.tool(name="big_output", description="Produces big output", tier=ToolTier.SAFE)
     async def big_output() -> str:
         return "x" * 100_000  # 100KB
+
+    @reg.tool(name="screenshot", description="Returns image", tier=ToolTier.SAFE)
+    async def screenshot() -> str:
+        return MultimodalToolOutput(  # type: ignore[return-value]
+            text="Screenshot: 1920x1080",
+            images=[ImageContent(base64_data="iVBOR==", media_type="image/png")],
+        )
 
     return reg
 
@@ -149,3 +160,23 @@ class TestToolExecutor:
         result = await executor.execute(tc, session_id="test-session")
 
         assert result.duration_ms >= 0
+
+    async def test_multimodal_tool_output(self, executor: ToolExecutor) -> None:
+        """Tool returning MultimodalToolOutput populates result.images."""
+        tc = ToolCall(id="call_mm", name="screenshot", arguments={})
+        result = await executor.execute(tc, session_id="test-session")
+
+        assert result.success is True
+        assert "1920x1080" in result.output
+        assert result.images is not None
+        assert len(result.images) == 1
+        assert result.images[0].base64_data == "iVBOR=="
+        assert result.images[0].media_type == "image/png"
+
+    async def test_non_multimodal_tool_has_no_images(self, executor: ToolExecutor) -> None:
+        """Regular tools should have images=None."""
+        tc = ToolCall(id="call_no_img", name="echo", arguments={"text": "hi"})
+        result = await executor.execute(tc, session_id="test-session")
+
+        assert result.success is True
+        assert result.images is None

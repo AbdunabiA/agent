@@ -74,7 +74,7 @@ class LLMProvider:
 
     async def completion(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         model: str | None = None,
         tools: list[dict[str, Any]] | None = None,
         temperature: float = 0.7,
@@ -144,7 +144,7 @@ class LLMProvider:
 
     async def stream_completion(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         model: str | None = None,
         tools: list[dict[str, Any]] | None = None,
         temperature: float = 0.7,
@@ -361,8 +361,6 @@ class LLMProvider:
                 args = tc.function.arguments
                 if isinstance(args, str):
                     try:
-                        import json
-
                         args = json.loads(args)
                     except (json.JSONDecodeError, TypeError):
                         args = {}

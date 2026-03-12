@@ -77,6 +77,52 @@ class TestSDKTaskResult:
         assert result.error == "timeout"
 
 
+class TestMultimodalMCPHandler:
+    """Test MCP handler detection of MultimodalToolOutput."""
+
+    def test_multimodal_output_detected(self):
+        from agent.tools.executor import ImageContent, MultimodalToolOutput
+
+        result = MultimodalToolOutput(
+            text="Screenshot: 800x600",
+            images=[ImageContent(base64_data="abc123", media_type="image/png")],
+        )
+        assert isinstance(result, MultimodalToolOutput)
+        assert result.text == "Screenshot: 800x600"
+        assert len(result.images) == 1
+        assert result.images[0].base64_data == "abc123"
+        assert result.images[0].media_type == "image/png"
+
+    def test_multimodal_output_content_blocks(self):
+        """MultimodalToolOutput should produce the right MCP content blocks."""
+        from agent.tools.executor import ImageContent, MultimodalToolOutput
+
+        result = MultimodalToolOutput(
+            text="Captured",
+            images=[
+                ImageContent(base64_data="img1", media_type="image/png"),
+                ImageContent(base64_data="img2", media_type="image/jpeg"),
+            ],
+        )
+        # Simulate what the MCP handler does
+        content_blocks = [{"type": "text", "text": result.text}]
+        for img in result.images:
+            content_blocks.append({
+                "type": "image",
+                "data": img.base64_data,
+                "mimeType": img.media_type,
+            })
+
+        assert len(content_blocks) == 3
+        assert content_blocks[0] == {"type": "text", "text": "Captured"}
+        assert content_blocks[1] == {
+            "type": "image", "data": "img1", "mimeType": "image/png",
+        }
+        assert content_blocks[2] == {
+            "type": "image", "data": "img2", "mimeType": "image/jpeg",
+        }
+
+
 class TestFormatToolDetails:
     """Test _format_tool_details helper."""
 

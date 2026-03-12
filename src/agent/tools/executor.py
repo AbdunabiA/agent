@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import structlog
 
@@ -27,6 +27,22 @@ logger = structlog.get_logger(__name__)
 
 
 @dataclass
+class ImageContent:
+    """An image attachment in a tool result."""
+
+    base64_data: str
+    media_type: str = "image/png"
+
+
+@dataclass
+class MultimodalToolOutput:
+    """Tool output containing text + images. Tools return this instead of str."""
+
+    text: str
+    images: list[ImageContent] = field(default_factory=list)
+
+
+@dataclass
 class ToolResult:
     """Result of a tool execution."""
 
@@ -34,6 +50,7 @@ class ToolResult:
     tool_call_id: str
     success: bool
     output: str  # Tool output (stdout, return value, etc.)
+    images: list[ImageContent] | None = None  # Image attachments (multimodal)
     error: str | None = None  # Error message if failed
     duration_ms: int = 0  # Execution time
     tier: ToolTier = ToolTier.SAFE
@@ -159,17 +176,23 @@ class ToolExecutor:
             timeout = default_timeout
 
         try:
-            output = await self._execute_with_timeout(tool_def, tool_call.arguments, timeout)
+            raw = await self._execute_with_timeout(tool_def, tool_call.arguments, timeout)
             duration_ms = int((time.monotonic() - start_time) * 1000)
 
-            # 6. Validate/truncate output
-            output = self.guardrails.validate_output(output)
+            # 6. Validate/truncate output; split text/images for multimodal
+            images = None
+            if isinstance(raw, MultimodalToolOutput):
+                output = self.guardrails.validate_output(raw.text)
+                images = raw.images
+            else:
+                output = self.guardrails.validate_output(raw)
 
             result = ToolResult(
                 tool_name=tool_call.name,
                 tool_call_id=tool_call.id,
                 success=True,
                 output=output,
+                images=images,
                 duration_ms=duration_ms,
                 tier=tool_def.tier,
                 approved_by=perm_result.method,
@@ -255,7 +278,7 @@ class ToolExecutor:
 
     async def _execute_with_timeout(
         self, tool_def: object, arguments: dict, timeout: int  # noqa: ASYNC109
-    ) -> str:
+    ) -> str | MultimodalToolOutput:
         """Execute a tool function with a timeout.
 
         Args:
@@ -264,7 +287,7 @@ class ToolExecutor:
             timeout: Timeout in seconds.
 
         Returns:
-            String output from the tool.
+            String output or MultimodalToolOutput from the tool.
 
         Raises:
             ToolTimeoutError: If execution exceeds timeout.
@@ -287,7 +310,9 @@ class ToolExecutor:
                 tool_def.function(**valid_args),
                 timeout=timeout,
             )
-            return str(result)
+            if isinstance(result, MultimodalToolOutput):
+                return result
+            return str(result) if result is not None else ""
         except TimeoutError as e:
             raise ToolTimeoutError(
                 f"Tool '{tool_def.name}' timed out after {timeout}s"

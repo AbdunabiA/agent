@@ -192,7 +192,7 @@ class ClaudeSDKService:
         Yields:
             SDKStreamEvent objects as they occur.
         """
-        # Try with resume first; on failure retry without resume
+        # Try with resume first; on session error retry without resume
         async for event in self._run_task_impl(
             prompt,
             task_id=task_id,
@@ -204,8 +204,9 @@ class ClaudeSDKService:
             if (
                 event.type == "error"
                 and session_id is not None
+                and event.content == "Session expired or invalid"
             ):
-                # Resume failed — retry with fresh session
+                # Resume failed due to session issue — retry with fresh session
                 logger.warning(
                     "sdk_resume_failed_retrying",
                     task_id=task_id,
@@ -332,8 +333,21 @@ class ClaudeSDKService:
             # Capture tool_def in closure via default arg
             def _make_handler(td: Any) -> Any:
                 async def handler(args: dict[str, Any]) -> dict[str, Any]:
+                    from agent.tools.executor import MultimodalToolOutput
+
                     try:
                         result = await td.function(**args)
+                        if isinstance(result, MultimodalToolOutput):
+                            content_blocks: list[dict[str, Any]] = [
+                                {"type": "text", "text": result.text},
+                            ]
+                            for img in result.images:
+                                content_blocks.append({
+                                    "type": "image",
+                                    "data": img.base64_data,
+                                    "mimeType": img.media_type,
+                                })
+                            return {"content": content_blocks}
                         text = str(result) if result is not None else ""
                     except Exception as e:
                         text = f"Error: {e}"
@@ -485,15 +499,18 @@ class ClaudeSDKService:
         # Save and remove env vars that interfere with SDK subprocess.
         # The SDK merges os.environ with user env, so we must clear these
         # from os.environ to prevent them leaking into the subprocess.
+        # NOTE: This is not thread-safe; concurrent SDK tasks or LiteLLM
+        # calls may fail if they read these env vars during this window.
         _removed_env: dict[str, str] = {}
-        for key in (
+        _env_keys_to_clear = (
             "ANTHROPIC_API_KEY",
             "ANTHROPIC_AUTH_TOKEN",
             "ANTHROPIC_BASE_URL",
             "CLAUDECODE",
             "CLAUDE_CODE_SSE_PORT",
             "CLAUDE_CODE_ENTRYPOINT",
-        ):
+        )
+        for key in _env_keys_to_clear:
             val = os.environ.pop(key, None)
             if val is not None:
                 _removed_env[key] = val
@@ -603,15 +620,16 @@ class ClaudeSDKService:
 
                         # Fire-and-forget: extract facts from conversation
                         if self.fact_extractor and result_text:
-                            asyncio.create_task(
+                            bg_task = asyncio.create_task(
                                 self._safe_extract_facts(prompt, result_text)
                             )
+                            bg_task.add_done_callback(_log_task_exception)
 
                         # Emit outgoing event
                         if self.event_bus:
                             from agent.core.events import Events
 
-                            asyncio.create_task(
+                            emit_task = asyncio.create_task(
                                 self.event_bus.emit(
                                     Events.MESSAGE_OUTGOING,
                                     {
@@ -622,6 +640,7 @@ class ClaudeSDKService:
                                     },
                                 )
                             )
+                            emit_task.add_done_callback(_log_task_exception)
 
                         yield SDKStreamEvent(
                             type="result",
@@ -692,6 +711,15 @@ class ClaudeSDKService:
     def get_status(self, task_id: str = "default") -> SDKTaskStatus:
         """Get the current status of a task."""
         return self._status.get(task_id, SDKTaskStatus.IDLE)
+
+
+def _log_task_exception(task: asyncio.Task[Any]) -> None:
+    """Callback for fire-and-forget tasks — log exceptions instead of losing them."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc:
+        logger.warning("background_task_failed", error=str(exc), task=task.get_name())
 
 
 def _format_tool_details(tool_name: str, tool_input: dict[str, Any]) -> str:

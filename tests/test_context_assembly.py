@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from agent.core.context import build_messages
+from agent.core.context import _IMAGE_TOKEN_ESTIMATE, build_messages, estimate_tokens
 from agent.core.session import Message, Session
 
 
@@ -192,6 +192,46 @@ class TestContextAssemblyWithMemory:
 
         # With facts, fewer history messages should fit
         assert len(messages_with_facts) <= len(messages_without_facts)
+
+    def test_multimodal_content_token_estimation(self) -> None:
+        """Multimodal messages with images use ~1600 tokens per image."""
+        session = Session()
+        session.add_message(Message(role="user", content="take a screenshot"))
+        # Simulate a tool result with image content
+        multimodal_content: list[dict[str, Any]] = [
+            {"type": "text", "text": "Screenshot captured: 1920x1080"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+        ]
+        session.add_message(
+            Message(role="tool", content=multimodal_content, tool_call_id="tc1")
+        )
+        # Also add matching assistant message with tool_calls so sanitizer keeps it
+        from agent.core.session import ToolCall
+
+        session.add_message(
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=[ToolCall(id="tc1", name="screen_capture", arguments={})],
+            )
+        )
+
+        messages = build_messages(
+            session=session,
+            system_prompt="You are helpful.",
+            model="claude-3-5-sonnet",  # 200k limit, won't trim
+        )
+
+        # The multimodal message should be included
+        tool_msgs = [m for m in messages if m.get("role") == "tool"]
+        assert len(tool_msgs) == 1
+        assert isinstance(tool_msgs[0]["content"], list)
+
+    def test_image_token_constant(self) -> None:
+        """Image token estimate should be a reasonable number."""
+        assert _IMAGE_TOKEN_ESTIMATE == 1600
+        # A text-only message should use regular estimation
+        assert estimate_tokens("hello world") == len("hello world") // 4
 
     def test_facts_with_plan(self) -> None:
         """Facts and plan both appear in system prompt."""

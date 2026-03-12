@@ -26,20 +26,26 @@ MODEL_LIMITS: dict[str, int] = {
     "claude-opus": 200_000,
     "claude-haiku": 200_000,
     "claude": 200_000,
+    "gpt-4.1": 1_000_000,
     "gpt-4o": 128_000,
     "gpt-4-turbo": 128_000,
     "gpt-4": 8_192,
     "gpt-3.5": 16_385,
+    "gemini-2.5": 1_000_000,
     "gemini-1.5-pro": 1_000_000,
     "gemini-1.5-flash": 1_000_000,
     "gemini-pro": 32_000,
     "gemini": 32_000,
     "o1": 128_000,
     "o3": 200_000,
+    "o4": 200_000,
 }
 
 # Default limit for unknown models (e.g. Ollama local models)
 _DEFAULT_LIMIT = 8_000
+
+# Approximate tokens per image (covers most screenshot sizes)
+_IMAGE_TOKEN_ESTIMATE = 1_600
 
 # Tokens reserved for the model's response
 _RESPONSE_RESERVATION = 4_096
@@ -183,7 +189,15 @@ def build_messages(
     msg_tokens: list[int] = []
     for msg in history:
         content = msg.get("content", "")
-        tokens = estimate_tokens(str(content))
+        if isinstance(content, list):
+            tokens = sum(
+                estimate_tokens(block.get("text", ""))
+                if block.get("type") == "text"
+                else _IMAGE_TOKEN_ESTIMATE
+                for block in content
+            )
+        else:
+            tokens = estimate_tokens(str(content))
         # Tool calls add extra tokens
         if msg.get("tool_calls"):
             tokens += estimate_tokens(json.dumps(msg["tool_calls"]))

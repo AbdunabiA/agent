@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from agent.core.session import Message, Session, TokenUsage
+from typing import Any
+
+from agent.core.session import Message, Session, TokenUsage, content_as_text
 
 
 class TestSession:
@@ -99,7 +101,7 @@ class TestSession:
             assert "role" in entry
             assert "content" in entry
             assert isinstance(entry["role"], str)
-            assert isinstance(entry["content"], str)
+            assert isinstance(entry["content"], (str, list))
 
     def test_updated_at_changes(self) -> None:
         session = Session()
@@ -107,6 +109,49 @@ class TestSession:
 
         session.add_message(Message(role="user", content="test"))
         assert session.updated_at >= created
+
+
+class TestMultimodalContent:
+    """Test multimodal (list) content in messages."""
+
+    def test_message_accepts_list_content(self) -> None:
+        content: list[dict[str, Any]] = [
+            {"type": "text", "text": "Screenshot captured"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+        ]
+        msg = Message(role="tool", content=content)
+        assert isinstance(msg.content, list)
+        assert len(msg.content) == 2
+
+    def test_get_history_passes_list_content_through(self) -> None:
+        session = Session()
+        multimodal: list[dict[str, Any]] = [
+            {"type": "text", "text": "Screenshot info"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+        ]
+        session.add_message(Message(role="tool", content=multimodal, tool_call_id="tc1"))
+
+        history = session.get_history()
+        assert len(history) == 1
+        assert isinstance(history[0]["content"], list)
+        assert history[0]["content"][0]["type"] == "text"
+
+    def test_content_as_text_with_string(self) -> None:
+        assert content_as_text("hello world") == "hello world"
+
+    def test_content_as_text_with_multimodal(self) -> None:
+        content: list[dict[str, Any]] = [
+            {"type": "text", "text": "Screenshot captured"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            {"type": "text", "text": "more text"},
+        ]
+        result = content_as_text(content)
+        assert "Screenshot captured" in result
+        assert "more text" in result
+        assert "base64" not in result
+
+    def test_content_as_text_empty_list(self) -> None:
+        assert content_as_text([]) == ""
 
 
 class TestTokenUsage:

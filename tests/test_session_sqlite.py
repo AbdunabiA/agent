@@ -190,6 +190,53 @@ class TestSessionSQLite:
         assert removed is True
         assert await store.get(session.id) is None
 
+    async def test_multimodal_content_round_trip(self, store: SessionStore) -> None:
+        """Multimodal (list) content should round-trip through SQLite."""
+        session = await store.new_session(channel="api")
+        multimodal_content = [
+            {"type": "text", "text": "Screenshot: 1920x1080"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc123"}},
+        ]
+        msg = Message(role="tool", content=multimodal_content, tool_call_id="tc_mm")
+        session.add_message(msg)
+        await store.save_message(session.id, msg)
+
+        history = await store.load_history(session.id)
+        assert len(history) == 1
+        loaded = history[0]
+        assert isinstance(loaded.content, list)
+        assert len(loaded.content) == 2
+        assert loaded.content[0]["type"] == "text"
+        assert loaded.content[0]["text"] == "Screenshot: 1920x1080"
+        assert loaded.content[1]["type"] == "image_url"
+
+    async def test_plain_string_content_still_works(self, store: SessionStore) -> None:
+        """Plain string content should still load as string (not parsed as JSON)."""
+        session = await store.new_session(channel="api")
+        msg = Message(role="user", content="Hello world!")
+        session.add_message(msg)
+        await store.save_message(session.id, msg)
+
+        history = await store.load_history(session.id)
+        assert len(history) == 1
+        assert isinstance(history[0].content, str)
+        assert history[0].content == "Hello world!"
+
+    async def test_json_like_string_not_parsed_as_multimodal(
+        self, store: SessionStore,
+    ) -> None:
+        """A string that looks like JSON array should stay as string."""
+        session = await store.new_session(channel="api")
+        # User sends text that happens to be valid JSON array
+        msg = Message(role="user", content='["hello", "world"]')
+        session.add_message(msg)
+        await store.save_message(session.id, msg)
+
+        history = await store.load_history(session.id)
+        assert len(history) == 1
+        assert isinstance(history[0].content, str)
+        assert history[0].content == '["hello", "world"]'
+
     async def test_message_count_updated(
         self, store: SessionStore, db: Database
     ) -> None:

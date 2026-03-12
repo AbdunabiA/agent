@@ -108,7 +108,6 @@ workspaces:
 desktop:
   enabled: true
   screenshot_scale: 0.75     # 0.5 = half resolution (faster, cheaper)
-  vision_model: ""           # Empty = use default model. Set to a vision model if default isn't multimodal.
   failsafe: true             # Move mouse to corner (0,0) to abort
   mouse_move_duration: 0.3   # Seconds for mouse movement animation
   typing_interval: 0.02      # Seconds between keystrokes

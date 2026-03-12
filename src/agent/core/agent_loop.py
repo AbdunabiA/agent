@@ -262,10 +262,10 @@ class AgentLoop:
                     tool_call, session, trigger, plan
                 )
 
-                # Add tool result to session
+                # Add tool result to session (multimodal if images present)
                 await self._add_and_persist(session, Message(
                     role="tool",
-                    content=result.output,
+                    content=self._build_tool_content(result),
                     tool_call_id=tool_call.id,
                 ))
 
@@ -384,6 +384,31 @@ class AgentLoop:
                 output=f"Error: {e}",
                 error=str(e),
             )
+
+    def _build_tool_content(
+        self, result: ToolResult,
+    ) -> str | list[dict[str, Any]]:
+        """Build tool message content, with image blocks if present.
+
+        Args:
+            result: The tool execution result.
+
+        Returns:
+            Plain string or list of content blocks with images.
+        """
+        if not result.images:
+            return result.output
+        blocks: list[dict[str, Any]] = []
+        if result.output:
+            blocks.append({"type": "text", "text": result.output})
+        for img in result.images:
+            blocks.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{img.media_type};base64,{img.base64_data}",
+                },
+            })
+        return blocks
 
     def _build_messages(
         self,
@@ -675,7 +700,7 @@ class AgentLoop:
                     session,
                     Message(
                         role="tool",
-                        content=result.output,
+                        content=self._build_tool_content(result),
                         tool_call_id=tool_call.id,
                     ),
                 )

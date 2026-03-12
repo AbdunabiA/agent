@@ -149,8 +149,10 @@ class FactExtractor:
         if not recent:
             return []
 
+        from agent.core.session import content_as_text
+
         messages = [
-            {"role": msg.role, "content": msg.content}
+            {"role": msg.role, "content": content_as_text(msg.content)}
             for msg in recent
             if msg.role in ("user", "assistant")
         ]

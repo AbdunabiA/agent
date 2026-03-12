@@ -337,28 +337,12 @@ Requires the `desktop` extra (`pip install agent-ai[desktop]`). Needs a display 
 
 - **Tier**: Safe
 
-Takes a screenshot of the entire screen or a specific region.
+Takes a screenshot of the entire screen or a specific region. Returns the actual
+screenshot image so the LLM can see and describe what's on screen directly.
 
 ```
 Parameters:
   region (str, optional): "x,y,width,height" to capture a region
-```
-
-### `screen_describe` — Describe Screen
-
-- **Tier**: Safe
-
-Takes a screenshot and describes what's on screen using a vision LLM.
-
-### `find_on_screen` — Find UI Element
-
-- **Tier**: Safe
-
-Finds a UI element on screen by natural language description. Returns coordinates for clicking.
-
-```
-Parameters:
-  description (str, required): What to look for (e.g. "the Save button")
 ```
 
 ### `mouse_click` — Click
