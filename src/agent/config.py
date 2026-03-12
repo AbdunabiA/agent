@@ -302,11 +302,12 @@ def load_config(config_path: str | None = None) -> AgentConfig:
     Returns:
         Validated AgentConfig instance.
     """
-    # Load .env file — check agent home first, then current directory
-    # (later load_dotenv calls don't override already-set vars)
+    # Load .env files — local first, then agent home for fallback values.
+    # load_dotenv does NOT override already-set vars, so first call wins.
+    # This matches config priority: ./agent.yaml > $AGENT_HOME/agent.yaml.
+    load_dotenv()
     agent_home = get_agent_home()
     load_dotenv(agent_home / ".env")
-    load_dotenv()
 
     # Find config file
     path = _find_config_path(config_path)
