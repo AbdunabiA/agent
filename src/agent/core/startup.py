@@ -219,6 +219,8 @@ class Application:
                         permission_mode=sdk_cfg.permission_mode,
                         model=sdk_cfg.model,
                         claude_auth_dir=sdk_cfg.claude_auth_dir,
+                        tool_registry=registry,
+                        soul_loader=self.soul_loader,
                     )
                     ok, msg = await self.sdk_service.check_available()
                     if ok:

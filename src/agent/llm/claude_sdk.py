@@ -18,9 +18,13 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
+
+if TYPE_CHECKING:
+    from agent.memory.soul import SoulLoader
+    from agent.tools.registry import ToolRegistry
 
 logger = structlog.get_logger(__name__)
 
@@ -102,6 +106,8 @@ class ClaudeSDKService:
         permission_mode: str | None = None,
         model: str | None = None,
         claude_auth_dir: str = "~/.claude",
+        tool_registry: ToolRegistry | None = None,
+        soul_loader: SoulLoader | None = None,
     ) -> None:
         if not sdk_available():
             raise ImportError(
@@ -113,6 +119,8 @@ class ClaudeSDKService:
         self.permission_mode = permission_mode
         self.model = model
         self.claude_auth_dir = str(Path(claude_auth_dir).expanduser())
+        self.tool_registry = tool_registry
+        self.soul_loader = soul_loader
 
         # Per-task state
         self._clients: dict[str, Any] = {}
@@ -200,6 +208,62 @@ class ClaudeSDKService:
                 return
             yield event
 
+    def _build_mcp_server(self) -> tuple[Any, list[str]] | None:
+        """Build an in-process MCP server exposing agent tools to the SDK.
+
+        Creates SDK-compatible tool wrappers for each enabled tool in the
+        registry, bundles them into an MCP server, and returns the server
+        config + list of tool names.
+
+        Returns:
+            Tuple of (McpSdkServerConfig, tool_name_list) or None if no tools.
+        """
+        if not self.tool_registry:
+            return None
+
+        from claude_agent_sdk import create_sdk_mcp_server
+        from claude_agent_sdk import tool as sdk_tool
+
+        tools = self.tool_registry.list_tools()
+        enabled_tools = [t for t in tools if t.enabled]
+        if not enabled_tools:
+            return None
+
+        sdk_tools = []
+        tool_names = []
+
+        for tool_def in enabled_tools:
+            # Capture tool_def in closure via default arg
+            def _make_handler(td: Any) -> Any:
+                async def handler(args: dict[str, Any]) -> dict[str, Any]:
+                    try:
+                        result = await td.function(**args)
+                        text = str(result) if result is not None else ""
+                    except Exception as e:
+                        text = f"Error: {e}"
+                    return {
+                        "content": [{"type": "text", "text": text}],
+                    }
+                return handler
+
+            wrapped = sdk_tool(
+                tool_def.name,
+                tool_def.description,
+                tool_def.parameters,
+            )(_make_handler(tool_def))
+
+            sdk_tools.append(wrapped)
+            tool_names.append(tool_def.name)
+
+        server = create_sdk_mcp_server(
+            name="agent-tools",
+            version="1.0.0",
+            tools=sdk_tools,
+        )
+
+        logger.info("sdk_mcp_server_built", tool_count=len(sdk_tools))
+        return server, tool_names
+
     async def _run_task_impl(
         self,
         prompt: str,
@@ -236,7 +300,23 @@ class ClaudeSDKService:
 
         work_dir = working_dir or self.working_dir
 
-        # --- Permission callback for Claude Code tools ---
+        # --- Build MCP server for agent tools ---
+        mcp_result = self._build_mcp_server()
+        mcp_servers: dict[str, Any] = {}
+        if mcp_result:
+            server_config, _ = mcp_result
+            mcp_servers["agent-tools"] = server_config
+
+        # --- Resolve agent tool tiers for permission decisions ---
+        from agent.tools.registry import ToolTier
+
+        agent_safe_tools: set[str] = set()
+        if self.tool_registry:
+            for td in self.tool_registry.list_tools():
+                if td.enabled and td.tier == ToolTier.SAFE:
+                    agent_safe_tools.add(td.name)
+
+        # --- Permission callback for Claude Code + agent tools ---
         async def can_use_tool(
             tool_name: str,
             tool_input: dict[str, Any],
@@ -247,13 +327,17 @@ class ClaudeSDKService:
                     message="Task cancelled by user", interrupt=True
                 )
 
-            # Auto-allow safe read-only tools
+            # Auto-allow safe read-only Claude Code tools
             safe_tools = {
                 "Read", "Glob", "Grep", "WebFetch", "WebSearch",
                 "LS", "Agent", "Explore", "TaskGet", "TaskList",
                 "TaskOutput", "ToolSearch",
             }
             if tool_name in safe_tools:
+                return PermissionResultAllow(updated_input=tool_input)
+
+            # Auto-allow agent tools with safe tier
+            if tool_name in agent_safe_tools:
                 return PermissionResultAllow(updated_input=tool_input)
 
             # Handle AskUserQuestion
@@ -277,7 +361,7 @@ class ClaudeSDKService:
 
                 return PermissionResultAllow(updated_input=tool_input)
 
-            # Dangerous tools — ask permission
+            # Moderate/dangerous tools — ask permission if callback provided
             if on_permission:
                 self._status[task_id] = SDKTaskStatus.WAITING_PERMISSION
                 details = _format_tool_details(tool_name, tool_input)
@@ -331,6 +415,13 @@ class ClaudeSDKService:
                 resume=session_id[:16] + "..." if session_id else None,
             )
 
+            # Build system prompt from soul.md
+            system_prompt: str | None = None
+            if self.soul_loader:
+                soul_content = self.soul_loader.content
+                if soul_content:
+                    system_prompt = soul_content
+
             options = ClaudeAgentOptions(
                 cwd=resolved_cwd,
                 max_turns=self.max_turns,
@@ -344,6 +435,8 @@ class ClaudeSDKService:
                     "PYTHONIOENCODING": "utf-8",
                 },
                 stderr=_capture_stderr,
+                **({"mcp_servers": mcp_servers} if mcp_servers else {}),
+                **({"system_prompt": system_prompt} if system_prompt else {}),
             )
 
             async with ClaudeSDKClient(options=options) as client:
