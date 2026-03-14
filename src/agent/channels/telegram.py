@@ -412,6 +412,7 @@ class TelegramChannel(BaseChannel):
         self._router.message(Command("reminders"))(self._cmd_reminders)
         self._router.message(Command("run"))(self._cmd_run)
         self._router.message(Command("tasks"))(self._cmd_tasks)
+        self._router.message(Command("stop"))(self._cmd_stop)
 
         # Media handlers (before catch-all text)
         self._router.message(F.content_type == ContentType.VOICE)(self._handle_voice)
@@ -456,6 +457,7 @@ class TelegramChannel(BaseChannel):
             "/remind <delay> <text> — Set a reminder\n"
             "/reminders — List pending reminders\n"
             "/tasks — Show running background tasks\n"
+            "/stop — Cancel all running tasks\n"
             "/pause — Pause message processing\n"
             "/resume — Resume message processing\n"
             "/mute — Disable heartbeat\n"
@@ -1063,7 +1065,65 @@ class TelegramChannel(BaseChannel):
         lines = [f"\u2699\ufe0f <b>Running tasks ({len(active)}):</b>\n"]
         for uid, desc in active:
             lines.append(f"\u2022 {desc}")
+        lines.append("\nUse /stop to cancel all running tasks.")
         await message.answer("\n".join(lines), parse_mode="HTML")
+
+    async def _cmd_stop(self, message: Any) -> None:
+        """Handle /stop — cancel all running background tasks for this user."""
+        if not self._check_message(message):
+            return
+
+        user_id = str(message.from_user.id)
+        cancelled = await self._cancel_user_tasks(user_id)
+
+        if cancelled == 0:
+            await message.answer("No tasks running to cancel.")
+        else:
+            await message.answer(
+                f"\u26d4 Cancelled {cancelled} task(s)."
+            )
+
+    async def _cancel_user_tasks(self, user_id: str) -> int:
+        """Cancel all running tasks for a user.
+
+        Cancels both the asyncio background tasks and the underlying
+        SDK sessions so the AI stops working immediately.
+
+        Returns the number of tasks cancelled.
+        """
+        tasks = list(self._background_tasks.get(user_id, []))
+        if not tasks:
+            return 0
+
+        cancelled = 0
+        for task, _desc in tasks:
+            if not task.done():
+                task.cancel()
+                cancelled += 1
+
+        # Also interrupt the SDK session so the AI stops mid-stream
+        if self.sdk_service is not None:
+            from agent.llm.claude_sdk import ClaudeSDKService
+
+            sdk: ClaudeSDKService = self.sdk_service  # type: ignore[assignment]
+            # The SDK task_id is the session ID — look it up
+            session_id = self._make_session_id(user_id)
+            session = await self.session_store.get(session_id)
+            if session:
+                sdk_task_id = session.id
+                with contextlib.suppress(Exception):
+                    await sdk.cancel_task(sdk_task_id)
+
+        # Wait briefly for tasks to handle cancellation
+        for task, _desc in tasks:
+            if not task.done():
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+
+        # Clean up
+        self._background_tasks.pop(user_id, None)
+
+        return cancelled
 
     # ------------------------------------------------------------------
     # Media handlers
@@ -1925,6 +1985,15 @@ class TelegramChannel(BaseChannel):
         user_text = message.text
 
         if not user_text:
+            return
+
+        # Natural language stop: cancel running tasks if user says "stop"
+        lower = user_text.strip().lower()
+        if lower in ("stop", "cancel", "стоп", "отмена") and self._get_active_tasks(
+            str(user_id),
+        ):
+            cancelled = await self._cancel_user_tasks(str(user_id))
+            await message.answer(f"\u26d4 Cancelled {cancelled} task(s).")
             return
 
         # Check if paused

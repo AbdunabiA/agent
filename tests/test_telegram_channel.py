@@ -882,6 +882,294 @@ class TestCmdTasks:
         await channel._cmd_tasks(msg)
         msg.answer.assert_not_called()
 
+    async def test_tasks_shows_stop_hint(self, channel: TelegramChannel) -> None:
+        """When tasks are running, show /stop hint."""
+        gate = asyncio.Event()
+
+        async def blocked() -> None:
+            await gate.wait()
+
+        task = asyncio.create_task(blocked())
+        channel._register_background_task("111", task, "working")
+
+        msg = _make_tg_message()
+        await channel._cmd_tasks(msg)
+
+        text = msg.answer.call_args[0][0]
+        assert "/stop" in text
+
+        gate.set()
+        await task
+
+
+# =====================================================================
+# /stop command and task cancellation
+# =====================================================================
+
+class TestCmdStop:
+    """Tests for /stop command and _cancel_user_tasks."""
+
+    async def test_stop_no_tasks(self, channel: TelegramChannel) -> None:
+        """/stop with no running tasks should say so."""
+        msg = _make_tg_message()
+        await channel._cmd_stop(msg)
+
+        text = msg.answer.call_args[0][0]
+        assert "no tasks" in text.lower()
+
+    async def test_stop_cancels_running_tasks(
+        self, channel: TelegramChannel,
+    ) -> None:
+        """/stop should cancel all running background tasks."""
+        gate = asyncio.Event()
+
+        async def blocked() -> None:
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                pass
+
+        t1 = asyncio.create_task(blocked())
+        t2 = asyncio.create_task(blocked())
+        channel._register_background_task("111", t1, "task A")
+        channel._register_background_task("111", t2, "task B")
+
+        msg = _make_tg_message()
+        await channel._cmd_stop(msg)
+
+        text = msg.answer.call_args[0][0]
+        assert "2" in text  # cancelled 2 tasks
+        assert t1.done()
+        assert t2.done()
+
+    async def test_stop_requires_auth(self, channel: TelegramChannel) -> None:
+        msg = _make_tg_message()
+        msg.from_user = None
+        await channel._cmd_stop(msg)
+        msg.answer.assert_not_called()
+
+    async def test_stop_only_cancels_own_tasks(
+        self, channel: TelegramChannel,
+    ) -> None:
+        """User A's /stop should not cancel user B's tasks."""
+        gate = asyncio.Event()
+
+        async def blocked() -> None:
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                pass
+
+        task_a = asyncio.create_task(blocked())
+        task_b = asyncio.create_task(blocked())
+        channel._register_background_task("111", task_a, "user A")
+        channel._register_background_task("222", task_b, "user B")
+
+        # User 111 stops
+        msg = _make_tg_message(user_id=111)
+        await channel._cmd_stop(msg)
+
+        assert task_a.done()  # cancelled
+        assert not task_b.done()  # still running
+
+        gate.set()
+        await task_b
+
+    async def test_cancel_user_tasks_returns_count(
+        self, channel: TelegramChannel,
+    ) -> None:
+        gate = asyncio.Event()
+
+        async def blocked() -> None:
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                pass
+
+        t1 = asyncio.create_task(blocked())
+        t2 = asyncio.create_task(blocked())
+        channel._register_background_task("42", t1, "a")
+        channel._register_background_task("42", t2, "b")
+
+        count = await channel._cancel_user_tasks("42")
+        assert count == 2
+
+    async def test_cancel_user_tasks_with_sdk(
+        self, channel: TelegramChannel,
+        session_store: SessionStore,
+    ) -> None:
+        """Should also call sdk.cancel_task when SDK is available."""
+        gate = asyncio.Event()
+
+        async def blocked() -> None:
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                pass
+
+        task = asyncio.create_task(blocked())
+        channel._register_background_task("111", task, "sdk task")
+
+        # Set up mock SDK
+        mock_sdk = AsyncMock()
+        channel.sdk_service = mock_sdk
+
+        # Create a session so the cancel can find the task_id
+        session = await session_store.get_or_create(
+            session_id="telegram:111", channel="telegram",
+        )
+
+        await channel._cancel_user_tasks("111")
+
+        mock_sdk.cancel_task.assert_called_once()
+
+    async def test_cancel_cleans_up_task_registry(
+        self, channel: TelegramChannel,
+    ) -> None:
+        gate = asyncio.Event()
+
+        async def blocked() -> None:
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                pass
+
+        task = asyncio.create_task(blocked())
+        channel._register_background_task("42", task, "will cancel")
+
+        await channel._cancel_user_tasks("42")
+
+        assert "42" not in channel._background_tasks
+
+    async def test_cancel_no_tasks_returns_zero(
+        self, channel: TelegramChannel,
+    ) -> None:
+        assert await channel._cancel_user_tasks("nonexistent") == 0
+
+
+# =====================================================================
+# Natural language stop
+# =====================================================================
+
+class TestNaturalLanguageStop:
+    """Typing 'stop' should cancel tasks instead of being sent to the AI."""
+
+    async def test_stop_keyword_cancels_tasks(
+        self,
+        channel: TelegramChannel,
+        mock_agent_loop: AsyncMock,
+    ) -> None:
+        gate = asyncio.Event()
+
+        async def blocked() -> None:
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                pass
+
+        task = asyncio.create_task(blocked())
+        channel._register_background_task("111", task, "running task")
+
+        msg = _make_tg_message(text="stop")
+        await channel._handle_text(msg)
+
+        # Should cancel, not process as a message
+        mock_agent_loop.process_message.assert_not_called()
+        text = msg.answer.call_args[0][0]
+        assert "cancelled" in text.lower()
+
+    async def test_cancel_keyword_cancels_tasks(
+        self,
+        channel: TelegramChannel,
+        mock_agent_loop: AsyncMock,
+    ) -> None:
+        gate = asyncio.Event()
+
+        async def blocked() -> None:
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                pass
+
+        task = asyncio.create_task(blocked())
+        channel._register_background_task("111", task, "task")
+
+        msg = _make_tg_message(text="cancel")
+        await channel._handle_text(msg)
+
+        mock_agent_loop.process_message.assert_not_called()
+        assert task.done()
+
+    async def test_russian_stop_keyword(
+        self,
+        channel: TelegramChannel,
+        mock_agent_loop: AsyncMock,
+    ) -> None:
+        gate = asyncio.Event()
+
+        async def blocked() -> None:
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                pass
+
+        task = asyncio.create_task(blocked())
+        channel._register_background_task("111", task, "task")
+
+        msg = _make_tg_message(text="\u0441\u0442\u043e\u043f")  # "стоп"
+        await channel._handle_text(msg)
+
+        mock_agent_loop.process_message.assert_not_called()
+        assert task.done()
+
+    async def test_stop_without_tasks_goes_to_agent(
+        self,
+        channel: TelegramChannel,
+        mock_agent_loop: AsyncMock,
+    ) -> None:
+        """'stop' with no running tasks should be sent to the AI normally."""
+        msg = _make_tg_message(text="stop")
+        await channel._handle_text(msg)
+        await _drain_background_tasks(channel)
+
+        # Should be processed as a regular message
+        mock_agent_loop.process_message.assert_called_once()
+
+    async def test_stop_case_insensitive(
+        self,
+        channel: TelegramChannel,
+        mock_agent_loop: AsyncMock,
+    ) -> None:
+        gate = asyncio.Event()
+
+        async def blocked() -> None:
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                pass
+
+        task = asyncio.create_task(blocked())
+        channel._register_background_task("111", task, "task")
+
+        msg = _make_tg_message(text="STOP")
+        await channel._handle_text(msg)
+
+        mock_agent_loop.process_message.assert_not_called()
+        assert task.done()
+
+    async def test_stop_with_extra_words_goes_to_agent(
+        self,
+        channel: TelegramChannel,
+        mock_agent_loop: AsyncMock,
+    ) -> None:
+        """'stop doing that' should NOT trigger cancel — only bare 'stop'."""
+        # No background tasks: "stop doing that" should go to agent
+        msg = _make_tg_message(text="stop doing that")
+        await channel._handle_text(msg)
+        await _drain_background_tasks(channel)
+
+        mock_agent_loop.process_message.assert_called_once()
+
 
 # =====================================================================
 # Commands
