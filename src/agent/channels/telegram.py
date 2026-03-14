@@ -656,16 +656,17 @@ class TelegramChannel(BaseChannel):
         user_id = str(message.from_user.id)
         session_id = self._make_session_id(user_id)
 
-        # Clear the SDK session from the agent session
+        # Disconnect persistent SDK client and clear session
+        if self.sdk_service is not None:
+            from agent.llm.claude_sdk import ClaudeSDKService
+            sdk: ClaudeSDKService = self.sdk_service  # type: ignore[assignment]
+            await sdk.disconnect_client(session_id)
+
         session = await self.session_store.get(session_id)
-        if session and hasattr(session, "sdk_session_id"):
-            old_sid = getattr(session, "sdk_session_id", None)
-            session.sdk_session_id = None  # type: ignore[attr-defined]
-            logger.info(
-                "session_cleared",
-                user_id=user_id,
-                old_session=old_sid[:16] + "..." if old_sid else None,
-            )
+        if session:
+            session.metadata.pop("sdk_session_id", None)
+            session.clear()
+            logger.info("session_cleared", user_id=user_id)
 
         await message.answer(
             "New conversation started. "
@@ -681,7 +682,7 @@ class TelegramChannel(BaseChannel):
         session_id = self._make_session_id(user_id)
 
         session = await self.session_store.get(session_id)
-        sdk_sid = getattr(session, "sdk_session_id", None) if session else None
+        sdk_sid = session.metadata.get("sdk_session_id") if session else None
 
         backend = "claude-sdk" if self.sdk_service else "litellm"
         status = "active" if sdk_sid else "none"
@@ -1434,8 +1435,7 @@ class TelegramChannel(BaseChannel):
         session = await self.session_store.get(session_id)
         if session:
             session.clear()
-            if hasattr(session, "sdk_session_id"):
-                session.sdk_session_id = None  # type: ignore[attr-defined]
+            session.metadata.pop("sdk_session_id", None)
 
         await callback.message.edit_text("Session cleared. Your next message starts fresh.")
 
@@ -1445,8 +1445,8 @@ class TelegramChannel(BaseChannel):
         session_id = self._make_session_id(user_id)
 
         session = await self.session_store.get(session_id)
-        if session and hasattr(session, "sdk_session_id"):
-            session.sdk_session_id = None  # type: ignore[attr-defined]
+        if session:
+            session.metadata.pop("sdk_session_id", None)
 
         await callback.message.edit_text(
             "New conversation started. Your next message begins a fresh session."
@@ -1645,17 +1645,18 @@ class TelegramChannel(BaseChannel):
 
             sdk: ClaudeSDKService = self.sdk_service  # type: ignore[assignment]
             accumulated = ""
+            sdk_session_id = session.metadata.get("sdk_session_id")
             async for event in sdk.run_task_stream(
                 prompt=text,
                 task_id=session.id,
-                session_id=getattr(session, "sdk_session_id", None),
+                session_id=sdk_session_id,
             ):
                 if event.type == "text":
                     accumulated += event.content
                 elif event.type == "result":
                     sdk_sid = event.data.get("session_id")
                     if sdk_sid:
-                        session.sdk_session_id = sdk_sid
+                        session.metadata["sdk_session_id"] = sdk_sid
                 elif event.type == "error":
                     raise RuntimeError(event.content)
             return accumulated or "[No response]"

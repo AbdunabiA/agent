@@ -18,7 +18,7 @@ from agent.tools.registry import ToolTier, tool
         "Use this for calculations, data processing, quick scripts, "
         "and testing code ideas. Print statements are captured as output."
     ),
-    tier=ToolTier.MODERATE,
+    tier=ToolTier.DANGEROUS,
 )
 async def python_exec(code: str, timeout: int = 30) -> str:  # noqa: ASYNC109
     """Execute Python code.

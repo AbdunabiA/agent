@@ -21,7 +21,7 @@ from agent.tools.registry import ToolTier, tool
         "'start https://youtube.com' opens YouTube in the user's browser, "
         "'start notepad' opens Notepad, 'start calc' opens Calculator."
     ),
-    tier=ToolTier.MODERATE,
+    tier=ToolTier.DANGEROUS,
 )
 async def shell_exec(
     command: str,

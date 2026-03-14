@@ -56,6 +56,7 @@ class ClaudeSDKConfig(BaseModel):
     max_turns: int = 50
     permission_mode: str | None = None
     model: str | None = None
+    idle_timeout: int = 1800  # seconds before idle clients are disconnected
 
 
 class ModelsConfig(BaseModel):
@@ -392,6 +393,12 @@ def _apply_env_api_keys(config: AgentConfig) -> None:
             provider = config.models.providers[provider_name]
             if not provider.api_key:
                 provider.api_key = env_value
+
+    # Telegram from environment
+    telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if telegram_token and not config.channels.telegram.token:
+        config.channels.telegram.token = telegram_token
+        config.channels.telegram.enabled = True
 
     # Claude SDK settings from environment
     sdk = config.models.claude_sdk

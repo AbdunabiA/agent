@@ -90,6 +90,7 @@ class ToolExecutor:
         tool_call: ToolCall,
         session_id: str,
         trigger: str = "user_message",
+        channel_user_id: str | None = None,
     ) -> ToolResult:
         """Execute a single tool call.
 
@@ -140,7 +141,9 @@ class ToolExecutor:
             return result
 
         # 3. Check permissions
-        perm_result = await self.permissions.check_permission(tool_def, tool_call.arguments)
+        perm_result = await self.permissions.check_permission(
+            tool_def, tool_call.arguments, channel_user_id=channel_user_id,
+        )
         if not perm_result.approved:
             result = ToolResult(
                 tool_name=tool_call.name,
@@ -239,6 +242,7 @@ class ToolExecutor:
         tool_calls: list[ToolCall],
         session_id: str,
         trigger: str = "user_message",
+        channel_user_id: str | None = None,
     ) -> list[ToolResult]:
         """Execute multiple independent tool calls concurrently.
 
@@ -254,7 +258,7 @@ class ToolExecutor:
             List of ToolResult objects in the same order as input.
         """
         tasks = [
-            self.execute(tc, session_id, trigger)
+            self.execute(tc, session_id, trigger, channel_user_id=channel_user_id)
             for tc in tool_calls
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)

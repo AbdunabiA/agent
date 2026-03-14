@@ -298,7 +298,7 @@ async def file_read(path: str, max_lines: int | None = None) -> str:
         "Writes are restricted to the configured write root (home directory by default). "
         "Use this to create scripts, config files, documents, or modify existing files."
     ),
-    tier=ToolTier.MODERATE,
+    tier=ToolTier.DANGEROUS,
 )
 async def file_write(path: str, content: str, append: bool = False) -> str:
     """Write content to a file.

@@ -155,6 +155,10 @@ class Application:
         self.recovery = ErrorRecovery()
         self.cost_tracker = CostTracker()
 
+        # 2.5. Auto-install missing optional dependencies
+        from agent.core.deps import ensure_dependencies
+        ensure_dependencies()
+
         # 3. Register built-in tools
         import agent.tools.builtins  # noqa: F401
 
@@ -274,6 +278,7 @@ class Application:
                         cost_tracker=self.cost_tracker,
                         event_bus=self.event_bus,
                     )
+                    self.sdk_service._idle_timeout = sdk_cfg.idle_timeout
                     ok, msg = await self.sdk_service.check_available()
                     if ok:
                         logger.info("claude_sdk_ready", working_dir=sdk_cfg.working_dir)
@@ -533,6 +538,13 @@ class Application:
         if self.skill_manager:
             await self.skill_manager.start_watcher()
 
+        # Start SDK idle reaper
+        if self.sdk_service:
+            await self.sdk_service.start_reaper()
+
+        # Send startup greeting to all channels
+        await self._send_startup_greeting()
+
         # Run uvicorn (blocking)
         server_config = uvicorn.Config(
             self.app,
@@ -542,6 +554,53 @@ class Application:
         )
         server = uvicorn.Server(server_config)
         await server.serve()
+
+    async def _send_startup_greeting(self) -> None:
+        """Send a greeting message through all available channels on startup."""
+        from agent.channels.base import OutgoingMessage
+
+        if not self._channels:
+            return
+
+        agent_name = self.config.agent.name
+        gateway_url = f"http://{self.config.gateway.host}:{self.config.gateway.port}"
+        skills_count = len(self.skill_manager.list_skills()) if self.skill_manager else 0
+
+        greeting = (
+            f"**{agent_name} is online!** 🟢\n\n"
+            f"Gateway: {gateway_url}\n"
+            f"Skills loaded: {skills_count}\n"
+            f"Channels: {', '.join(ch.name for ch in self._channels)}\n\n"
+            f"Send me a message to get started."
+        )
+
+        for channel in self._channels:
+            try:
+                # Telegram: send to all allowed users
+                if channel.name == "telegram":
+                    allowed = getattr(channel.config, "allowed_users", [])
+                    if allowed:
+                        for user_id in allowed:
+                            await channel.send_message(OutgoingMessage(
+                                content=greeting,
+                                channel_user_id=str(user_id),
+                                parse_mode="Markdown",
+                            ))
+                    else:
+                        # No allowed_users filter — greeting sent on first interaction
+                        logger.info(
+                            "greeting_skipped_no_users",
+                            channel=channel.name,
+                            hint="Set allowed_users to receive startup greetings",
+                        )
+                else:
+                    logger.info("greeting_ready", channel=channel.name)
+            except Exception as e:
+                logger.warning(
+                    "startup_greeting_failed",
+                    channel=channel.name,
+                    error=str(e),
+                )
 
     def _setup_reminder_delivery(self) -> None:
         """Wire scheduled task delivery to messaging channels.
@@ -607,6 +666,17 @@ class Application:
 
         if self.skill_manager:
             await self.skill_manager.shutdown()
+
+        # Stop SDK reaper and disconnect persistent clients
+        if self.sdk_service:
+            try:
+                from agent.llm.claude_sdk import ClaudeSDKService
+                sdk: ClaudeSDKService = self.sdk_service  # type: ignore[assignment]
+                await sdk.stop_reaper()
+                for task_id in list(sdk._clients.keys()):
+                    await sdk.disconnect_client(task_id)
+            except Exception:
+                pass
 
         # Cleanup browser resources
         try:

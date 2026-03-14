@@ -193,6 +193,7 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._tools: dict[str, ToolDefinition] = {}
+        self._generation: int = 0
 
     def tool(
         self,
@@ -245,6 +246,7 @@ class ToolRegistry:
 
             # Store in registry
             self._tools[name] = tool_def
+            self._generation += 1
             logger.debug("tool_registered", name=name, tier=tier.value, category=category)
 
             return func
@@ -299,6 +301,7 @@ class ToolRegistry:
         if not tool_def:
             raise ToolNotFoundError(f"Tool '{name}' not found")
         tool_def.enabled = True
+        self._generation += 1
 
     def disable_tool(self, name: str) -> None:
         """Disable a tool.
@@ -313,6 +316,7 @@ class ToolRegistry:
         if not tool_def:
             raise ToolNotFoundError(f"Tool '{name}' not found")
         tool_def.enabled = False
+        self._generation += 1
 
     def unregister_tool(self, name: str) -> None:
         """Remove a tool from the registry.
@@ -320,7 +324,9 @@ class ToolRegistry:
         Args:
             name: Tool name to remove. Silently ignored if not found.
         """
-        self._tools.pop(name, None)
+        if name in self._tools:
+            del self._tools[name]
+            self._generation += 1
 
 
 # Global registry instance

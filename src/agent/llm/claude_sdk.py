@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import os
+import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -42,7 +44,7 @@ def sdk_available() -> bool:
     global _SDK_AVAILABLE
     if _SDK_AVAILABLE is None:
         try:
-            import claude_agent_sdk  # noqa: F401
+            import claude_code_sdk  # noqa: F401
 
             _SDK_AVAILABLE = True
         except ImportError:
@@ -146,6 +148,20 @@ class ClaudeSDKService:
         self._question_responses: dict[str, str] = {}
         self._status: dict[str, SDKTaskStatus] = {}
 
+        # Issue 3: Idle timeout tracking
+        self._last_activity: dict[str, float] = {}
+        self._idle_timeout: int = 1800  # overridden by config in startup
+        self._reaper_task: asyncio.Task[None] | None = None
+
+        # Issue 4: Resume on crash — last known session_id per task
+        self._last_session_ids: dict[str, str] = {}
+
+        # Issue 2: MCP tool generation tracking
+        self._tool_generations: dict[str, int] = {}
+
+        # Issue 1: System prompt fingerprint tracking
+        self._prompt_fingerprints: dict[str, str] = {}
+
     def check_available_sync(self) -> tuple[bool, str]:
         """Check if SDK is installed and Claude Code is authenticated (sync)."""
         if not sdk_available():
@@ -163,6 +179,58 @@ class ClaudeSDKService:
     async def check_available(self) -> tuple[bool, str]:
         """Check if SDK is installed and Claude Code is authenticated."""
         return self.check_available_sync()
+
+    # ------------------------------------------------------------------
+    # Issue 3: Idle timeout reaper
+    # ------------------------------------------------------------------
+
+    async def start_reaper(self) -> None:
+        """Start background task that disconnects idle SDK clients."""
+        if self._reaper_task is not None:
+            return
+        self._reaper_task = asyncio.create_task(self._reap_idle_clients())
+        logger.info("sdk_reaper_started", idle_timeout=self._idle_timeout)
+
+    async def stop_reaper(self) -> None:
+        """Stop the idle-client reaper."""
+        if self._reaper_task is not None:
+            self._reaper_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._reaper_task
+            self._reaper_task = None
+            logger.info("sdk_reaper_stopped")
+
+    async def _reap_idle_clients(self) -> None:
+        """Periodically disconnect clients that have been idle too long."""
+        while True:
+            await asyncio.sleep(60)
+            now = time.monotonic()
+            idle_ids = [
+                tid for tid, last in self._last_activity.items()
+                if (now - last) > self._idle_timeout and tid in self._clients
+            ]
+            for tid in idle_ids:
+                logger.info("sdk_reaping_idle_client", task_id=tid,
+                            idle_secs=int(now - self._last_activity[tid]))
+                await self.disconnect_client(tid)
+
+    # ------------------------------------------------------------------
+    # Issue 1: System prompt fingerprint
+    # ------------------------------------------------------------------
+
+    def _compute_prompt_fingerprint(
+        self,
+        facts: list[Any] | None = None,
+        vector_results: list[Any] | None = None,
+    ) -> str:
+        """Hash soul + facts into a fingerprint for drift detection."""
+        parts: list[str] = []
+        if self.soul_loader:
+            parts.append(self.soul_loader.content or "")
+        if facts:
+            parts.extend(f"{f.key}={f.value}" for f in facts)
+        raw = "\n".join(parts)
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
     async def run_task_stream(
         self,
@@ -291,6 +359,22 @@ class ClaudeSDKService:
 
         return "\n\n".join(parts) if parts else None
 
+    @staticmethod
+    async def _safe_receive(client: Any) -> AsyncGenerator[Any, None]:
+        """Wrap client.receive_response() to skip unknown message types."""
+        response_iter = client.receive_response()
+        while True:
+            try:
+                message = await response_iter.__anext__()
+                yield message
+            except StopAsyncIteration:
+                break
+            except Exception as e:
+                if "Unknown message type" in str(e):
+                    logger.debug("sdk_unknown_message_skipped", error=str(e))
+                    continue
+                raise
+
     async def _safe_extract_facts(
         self, user_message: str, assistant_response: str,
     ) -> None:
@@ -316,8 +400,8 @@ class ClaudeSDKService:
         if not self.tool_registry:
             return None
 
-        from claude_agent_sdk import create_sdk_mcp_server
-        from claude_agent_sdk import tool as sdk_tool
+        from claude_code_sdk import create_sdk_mcp_server
+        from claude_code_sdk import tool as sdk_tool
 
         tools = self.tool_registry.list_tools()
         enabled_tools = [t for t in tools if t.enabled]
@@ -372,50 +456,58 @@ class ClaudeSDKService:
         logger.info("sdk_mcp_server_built", tool_count=len(sdk_tools))
         return server, tool_names
 
-    async def _run_task_impl(
+    async def _ensure_client(
         self,
-        prompt: str,
-        *,
-        task_id: str = "default",
-        session_id: str | None = None,
-        working_dir: str | None = None,
+        task_id: str,
         on_permission: PermissionCallback | None = None,
         on_question: QuestionCallback | None = None,
-    ) -> AsyncGenerator[SDKStreamEvent, None]:
-        """Internal implementation of run_task_stream."""
-        from claude_agent_sdk import (
-            AssistantMessage,
-            ClaudeAgentOptions,
+        session_id: str | None = None,
+    ) -> Any:
+        """Get or create a persistent SDK client for a task/user.
+
+        The client stays connected across messages — no subprocess restart.
+        Reconnects if tool generation or system prompt has drifted.
+        """
+        # Issue 2: Check if tool generation changed → reconnect
+        if task_id in self._clients and self.tool_registry:
+            current_gen = self.tool_registry._generation
+            if self._tool_generations.get(task_id) != current_gen:
+                logger.info("sdk_reconnect_tool_change", task_id=task_id,
+                            old_gen=self._tool_generations.get(task_id), new_gen=current_gen)
+                await self.disconnect_client(task_id)
+
+        # Issue 1: Check if system prompt drifted → reconnect
+        if task_id in self._clients:
+            facts, _ = await self._query_memory("")
+            new_fp = self._compute_prompt_fingerprint(facts)
+            old_fp = self._prompt_fingerprints.get(task_id)
+            if old_fp and old_fp != new_fp:
+                logger.info("sdk_reconnect_prompt_drift", task_id=task_id)
+                await self.disconnect_client(task_id)
+
+        if task_id in self._clients:
+            return self._clients[task_id]
+
+        from claude_code_sdk import (
+            ClaudeCodeOptions,
             ClaudeSDKClient,
-            ResultMessage,
-            TextBlock,
-            ThinkingBlock,
-            ToolUseBlock,
         )
-        from claude_agent_sdk.types import (
+        from claude_code_sdk.types import (
             PermissionResultAllow,
             PermissionResultDeny,
         )
 
-        cancel_event = asyncio.Event()
-        permission_event = asyncio.Event()
-        question_event = asyncio.Event()
+        work_dir = self.working_dir
+        resolved_cwd = str(Path(os.path.expanduser(work_dir)).resolve())  # noqa: ASYNC240
 
-        self._cancel_events[task_id] = cancel_event
-        self._permission_events[task_id] = permission_event
-        self._question_events[task_id] = question_event
-        self._status[task_id] = SDKTaskStatus.RUNNING
-
-        work_dir = working_dir or self.working_dir
-
-        # --- Build MCP server for agent tools ---
+        # Build MCP server for agent tools
         mcp_result = self._build_mcp_server()
         mcp_servers: dict[str, Any] = {}
         if mcp_result:
             server_config, _ = mcp_result
             mcp_servers["agent-tools"] = server_config
 
-        # --- Resolve agent tool tiers for permission decisions ---
+        # Resolve agent tool tiers for permission decisions
         from agent.tools.registry import ToolTier
 
         agent_safe_tools: set[str] = set()
@@ -424,7 +516,10 @@ class ClaudeSDKService:
                 if td.enabled and td.tier == ToolTier.SAFE:
                     agent_safe_tools.add(td.name)
 
-        # --- Permission callback for Claude Code + agent tools ---
+        # Permission callback for Claude Code + agent tools
+        cancel_event = self._cancel_events.get(task_id, asyncio.Event())
+        self._cancel_events[task_id] = cancel_event
+
         async def can_use_tool(
             tool_name: str,
             tool_input: dict[str, Any],
@@ -435,7 +530,6 @@ class ClaudeSDKService:
                     message="Task cancelled by user", interrupt=True
                 )
 
-            # Auto-allow safe read-only Claude Code tools
             safe_tools = {
                 "Read", "Glob", "Grep", "WebFetch", "WebSearch",
                 "LS", "Agent", "Explore", "TaskGet", "TaskList",
@@ -444,11 +538,9 @@ class ClaudeSDKService:
             if tool_name in safe_tools:
                 return PermissionResultAllow(updated_input=tool_input)
 
-            # Auto-allow agent tools with safe tier
             if tool_name in agent_safe_tools:
                 return PermissionResultAllow(updated_input=tool_input)
 
-            # Handle AskUserQuestion
             if tool_name == "AskUserQuestion":
                 if on_question:
                     self._status[task_id] = SDKTaskStatus.WAITING_ANSWER
@@ -459,225 +551,260 @@ class ClaudeSDKService:
                         if questions
                         else []
                     )
-
                     answer = await on_question(q_text, options)
                     self._status[task_id] = SDKTaskStatus.RUNNING
-
                     if questions:
                         questions[0]["answer"] = answer
                     return PermissionResultAllow(updated_input=tool_input)
-
                 return PermissionResultAllow(updated_input=tool_input)
 
-            # Moderate/dangerous tools — ask permission if callback provided
             if on_permission:
                 self._status[task_id] = SDKTaskStatus.WAITING_PERMISSION
                 details = _format_tool_details(tool_name, tool_input)
                 approved = await on_permission(tool_name, details, tool_input)
                 self._status[task_id] = SDKTaskStatus.RUNNING
-
                 if approved:
                     return PermissionResultAllow(updated_input=tool_input)
                 return PermissionResultDeny(
                     message="User denied permission", interrupt=False
                 )
 
-            # No callback — auto-allow
             return PermissionResultAllow(updated_input=tool_input)
 
-        # --- Execute ---
-        stderr_lines: list[str] = []
+        # Stderr capture
+        import io
 
-        def _capture_stderr(line: str) -> None:
-            # Sanitize non-ASCII to avoid cp1251 UnicodeEncodeError on Windows
-            safe_line = line.rstrip().encode("ascii", errors="replace").decode("ascii")
-            stderr_lines.append(safe_line)
-            logger.warning("sdk_stderr", line=safe_line, task_id=task_id)
+        class _StderrCapture(io.TextIOBase):
+            def write(self, s: str) -> int:
+                for line in s.splitlines():
+                    safe = line.rstrip().encode("ascii", errors="replace").decode("ascii")
+                    if safe:
+                        logger.debug("sdk_stderr", line=safe, task_id=task_id)
+                return len(s)
 
-        # Save and remove env vars that interfere with SDK subprocess.
-        # The SDK merges os.environ with user env, so we must clear these
-        # from os.environ to prevent them leaking into the subprocess.
-        # NOTE: This is not thread-safe; concurrent SDK tasks or LiteLLM
-        # calls may fail if they read these env vars during this window.
+        # Query memory for system prompt
+        facts, vector_results = await self._query_memory("")
+        system_prompt = self._build_system_prompt(facts, vector_results)
+
+        # Issue 4: Use stored session_id for resume if not explicitly provided
+        resume_id = session_id or self._last_session_ids.get(task_id)
+
+        options_kwargs: dict[str, Any] = {
+            "cwd": resolved_cwd,
+            "max_turns": self.max_turns,
+            "model": self.model,
+            "permission_mode": self.permission_mode,
+            "can_use_tool": can_use_tool,
+            "env": {
+                "GIT_TERMINAL_PROMPT": "0",
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8",
+            },
+            "debug_stderr": _StderrCapture(),
+        }
+        if mcp_servers:
+            options_kwargs["mcp_servers"] = mcp_servers
+        if system_prompt:
+            options_kwargs["system_prompt"] = system_prompt
+        if resume_id:
+            options_kwargs["resume"] = resume_id
+
+        options = ClaudeCodeOptions(**options_kwargs)
+
+        # Clear env vars that interfere with SDK subprocess
         _removed_env: dict[str, str] = {}
-        _env_keys_to_clear = (
-            "ANTHROPIC_API_KEY",
-            "ANTHROPIC_AUTH_TOKEN",
-            "ANTHROPIC_BASE_URL",
-            "CLAUDECODE",
-            "CLAUDE_CODE_SSE_PORT",
-            "CLAUDE_CODE_ENTRYPOINT",
-        )
-        for key in _env_keys_to_clear:
+        for key in (
+            "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+            "CLAUDECODE", "CLAUDE_CODE_SSE_PORT", "CLAUDE_CODE_ENTRYPOINT",
+        ):
             val = os.environ.pop(key, None)
             if val is not None:
                 _removed_env[key] = val
 
         try:
-            # Resolve working directory to absolute path
-            resolved_cwd = str(Path(work_dir).resolve())  # noqa: ASYNC240
+            client = ClaudeSDKClient(options=options)
+            await client.connect()
+            self._clients[task_id] = client
+            self._last_activity[task_id] = time.monotonic()
+
+            # Store fingerprint + tool generation at connect time
+            self._prompt_fingerprints[task_id] = self._compute_prompt_fingerprint(facts)
+            if self.tool_registry:
+                self._tool_generations[task_id] = self.tool_registry._generation
 
             logger.info(
-                "sdk_launching",
+                "sdk_client_connected",
                 task_id=task_id,
                 cwd=resolved_cwd,
                 model=self.model,
-                permission_mode=self.permission_mode,
-                resume=session_id[:16] + "..." if session_id else None,
+                resume=resume_id[:16] + "..." if resume_id else None,
+            )
+        finally:
+            os.environ.update(_removed_env)
+
+        return client
+
+    async def disconnect_client(self, task_id: str) -> None:
+        """Disconnect and remove a persistent client (e.g. on /new command)."""
+        client = self._clients.pop(task_id, None)
+        if client:
+            with contextlib.suppress(Exception):
+                await client.disconnect()
+            logger.info("sdk_client_disconnected", task_id=task_id)
+        self._cancel_events.pop(task_id, None)
+        self._status.pop(task_id, None)
+        self._last_activity.pop(task_id, None)
+        self._tool_generations.pop(task_id, None)
+        self._prompt_fingerprints.pop(task_id, None)
+        # Keep _last_session_ids — needed for resume on next connect
+
+    async def _run_task_impl(
+        self,
+        prompt: str,
+        *,
+        task_id: str = "default",
+        session_id: str | None = None,
+        working_dir: str | None = None,
+        on_permission: PermissionCallback | None = None,
+        on_question: QuestionCallback | None = None,
+    ) -> AsyncGenerator[SDKStreamEvent, None]:
+        """Send a message to a persistent SDK client and stream the response."""
+        from claude_code_sdk import (
+            AssistantMessage,
+            ResultMessage,
+            TextBlock,
+            ThinkingBlock,
+            ToolUseBlock,
+        )
+
+        self._status[task_id] = SDKTaskStatus.RUNNING
+
+        try:
+            client = await self._ensure_client(
+                task_id,
+                on_permission=on_permission,
+                on_question=on_question,
+                session_id=session_id,
             )
 
-            # Query memory for context injection
-            facts, vector_results = await self._query_memory(prompt)
+            # Issue 3: Record activity
+            self._last_activity[task_id] = time.monotonic()
 
-            # Build system prompt from soul.md + memory context
-            system_prompt = self._build_system_prompt(facts, vector_results)
-
-            options = ClaudeAgentOptions(
-                cwd=resolved_cwd,
-                max_turns=self.max_turns,
-                model=self.model,
-                permission_mode=self.permission_mode,
-                can_use_tool=can_use_tool,
-                resume=session_id,
-                env={
-                    "GIT_TERMINAL_PROMPT": "0",
-                    "PYTHONUTF8": "1",
-                    "PYTHONIOENCODING": "utf-8",
-                },
-                stderr=_capture_stderr,
-                **({"mcp_servers": mcp_servers} if mcp_servers else {}),
-                **({"system_prompt": system_prompt} if system_prompt else {}),
+            logger.info(
+                "sdk_query",
+                task_id=task_id,
+                prompt_len=len(prompt),
             )
 
-            async with ClaudeSDKClient(options=options) as client:
-                self._clients[task_id] = client
-                logger.info("sdk_task_started", task_id=task_id, work_dir=resolved_cwd)
+            await client.query(prompt)
 
-                await client.query(prompt)
+            result_text = ""
+            num_turns = 0
 
-                result_text = ""
-                num_turns = 0
+            async for message in self._safe_receive(client):
+                cancel_event = self._cancel_events.get(task_id)
+                if cancel_event and cancel_event.is_set():
+                    with contextlib.suppress(Exception):
+                        await client.interrupt()
+                    break
 
-                async for message in client.receive_response():
-                    if cancel_event.is_set():
-                        with contextlib.suppress(Exception):
-                            await client.interrupt()
-                        break
+                if message is None:
+                    continue
 
-                    if isinstance(message, AssistantMessage):
-                        for block in message.content:
-                            if isinstance(block, TextBlock):
-                                result_text += block.text
-                                yield SDKStreamEvent(
-                                    type="text", content=block.text
-                                )
-                            elif isinstance(block, ThinkingBlock):
-                                yield SDKStreamEvent(
-                                    type="thinking", content=block.thinking
-                                )
-                            elif isinstance(block, ToolUseBlock):
-                                yield SDKStreamEvent(
-                                    type="tool_use",
-                                    content=f"Using {block.name}",
-                                    data={
-                                        "tool": block.name,
-                                        "input": block.input,
-                                        "id": block.id,
-                                    },
-                                )
-
-                    elif isinstance(message, ResultMessage):
-                        num_turns = getattr(message, "num_turns", 0)
-                        usage = getattr(message, "usage", {}) or {}
-
-                        # Detect invalid session (0 turns with resume)
-                        if num_turns == 0 and session_id:
-                            logger.warning(
-                                "sdk_session_invalid",
-                                session_id=session_id[:16] + "...",
-                                task_id=task_id,
-                            )
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            result_text += block.text
                             yield SDKStreamEvent(
-                                type="error",
-                                content="Session expired or invalid",
+                                type="text", content=block.text
                             )
-                            return
-
-                        in_tokens = usage.get("input_tokens", 0)
-                        out_tokens = usage.get("output_tokens", 0)
-
-                        # Record cost
-                        if self.cost_tracker and (in_tokens or out_tokens):
-                            self.cost_tracker.record(
-                                model=self.model or "claude-sdk",
-                                input_tokens=in_tokens,
-                                output_tokens=out_tokens,
-                                channel="sdk",
-                                session_id=task_id,
+                        elif isinstance(block, ThinkingBlock):
+                            yield SDKStreamEvent(
+                                type="thinking", content=block.thinking
+                            )
+                        elif isinstance(block, ToolUseBlock):
+                            yield SDKStreamEvent(
+                                type="tool_use",
+                                content=f"Using {block.name}",
+                                data={
+                                    "tool": block.name,
+                                    "input": block.input,
+                                    "id": block.id,
+                                },
                             )
 
-                        # Fire-and-forget: extract facts from conversation
-                        if self.fact_extractor and result_text:
-                            bg_task = asyncio.create_task(
-                                self._safe_extract_facts(prompt, result_text)
-                            )
-                            bg_task.add_done_callback(_log_task_exception)
+                elif isinstance(message, ResultMessage):
+                    # Issue 3: Record activity
+                    self._last_activity[task_id] = time.monotonic()
 
-                        # Emit outgoing event
-                        if self.event_bus:
-                            from agent.core.events import Events
+                    # Issue 4: Store session_id for future resume
+                    if message.session_id:
+                        self._last_session_ids[task_id] = message.session_id
 
-                            emit_task = asyncio.create_task(
-                                self.event_bus.emit(
-                                    Events.MESSAGE_OUTGOING,
-                                    {
-                                        "content": result_text,
-                                        "session_id": task_id,
-                                        "model": self.model or "claude-sdk",
-                                        "num_turns": num_turns,
-                                    },
-                                )
-                            )
-                            emit_task.add_done_callback(_log_task_exception)
+                    num_turns = getattr(message, "num_turns", 0)
+                    usage = getattr(message, "usage", {}) or {}
 
-                        yield SDKStreamEvent(
-                            type="result",
-                            content=getattr(message, "result", "") or result_text,
-                            data={
-                                "session_id": message.session_id,
-                                "cost_usd": getattr(
-                                    message, "total_cost_usd", 0.0
-                                ),
-                                "num_turns": num_turns,
-                                "input_tokens": in_tokens,
-                                "output_tokens": out_tokens,
-                            },
+                    in_tokens = usage.get("input_tokens", 0)
+                    out_tokens = usage.get("output_tokens", 0)
+
+                    # Record cost
+                    if self.cost_tracker and (in_tokens or out_tokens):
+                        self.cost_tracker.record(
+                            model=self.model or "claude-sdk",
+                            input_tokens=in_tokens,
+                            output_tokens=out_tokens,
+                            channel="sdk",
+                            session_id=task_id,
                         )
+
+                    # Fire-and-forget: extract facts
+                    if self.fact_extractor and result_text:
+                        bg_task = asyncio.create_task(
+                            self._safe_extract_facts(prompt, result_text)
+                        )
+                        bg_task.add_done_callback(_log_task_exception)
+
+                    # Emit outgoing event
+                    if self.event_bus:
+                        from agent.core.events import Events
+
+                        emit_task = asyncio.create_task(
+                            self.event_bus.emit(
+                                Events.MESSAGE_OUTGOING,
+                                {
+                                    "content": result_text,
+                                    "session_id": task_id,
+                                    "model": self.model or "claude-sdk",
+                                    "num_turns": num_turns,
+                                },
+                            )
+                        )
+                        emit_task.add_done_callback(_log_task_exception)
+
+                    yield SDKStreamEvent(
+                        type="result",
+                        content=getattr(message, "result", "") or result_text,
+                        data={
+                            "session_id": message.session_id,
+                            "cost_usd": getattr(
+                                message, "total_cost_usd", 0.0
+                            ),
+                            "num_turns": num_turns,
+                            "input_tokens": in_tokens,
+                            "output_tokens": out_tokens,
+                        },
+                    )
 
             self._status[task_id] = SDKTaskStatus.COMPLETED
 
         except Exception as e:
             self._status[task_id] = SDKTaskStatus.FAILED
-            # Include captured stderr in the error log for debugging
-            stderr_text = "\n".join(stderr_lines).strip()
-            logger.error(
-                "sdk_task_failed",
-                error=str(e),
-                task_id=task_id,
-                stderr=stderr_text or "(no stderr captured)",
-            )
-            error_msg = str(e)
-            if stderr_text:
-                error_msg = f"{error_msg}\nStderr: {stderr_text}"
-            yield SDKStreamEvent(type="error", content=error_msg)
+            logger.error("sdk_task_failed", error=str(e), task_id=task_id)
 
-        finally:
-            # Restore removed env vars
-            os.environ.update(_removed_env)
-            self._clients.pop(task_id, None)
-            self._cancel_events.pop(task_id, None)
-            self._permission_events.pop(task_id, None)
-            self._question_events.pop(task_id, None)
+            # Client is dead — remove it so next message reconnects
+            await self.disconnect_client(task_id)
+
+            yield SDKStreamEvent(type="error", content=str(e))
 
     async def cancel_task(self, task_id: str = "default") -> None:
         """Cancel a running task."""

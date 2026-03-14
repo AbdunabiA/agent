@@ -1,0 +1,698 @@
+"""Tests for persistent SDK client features: idle timeout, resume, tool drift, prompt drift.
+
+Covers the 4 issues implemented in the persistent client architecture:
+- Issue 1: System prompt fingerprint drift detection
+- Issue 2: MCP tool generation tracking and reconnect
+- Issue 3: Idle timeout reaper
+- Issue 4: Resume on crash via session_id storage
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from agent.llm.claude_sdk import ClaudeSDKService, SDKTaskStatus
+from agent.tools.registry import ToolTier
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def service() -> ClaudeSDKService:
+    """Create a minimal ClaudeSDKService for testing."""
+    return ClaudeSDKService(working_dir="/tmp", max_turns=10)
+
+
+@pytest.fixture
+def registry():
+    """Create a fresh ToolRegistry."""
+    from agent.tools.registry import ToolRegistry
+
+    return ToolRegistry()
+
+
+@pytest.fixture
+def service_with_registry(registry):
+    """ClaudeSDKService wired to a ToolRegistry."""
+    return ClaudeSDKService(
+        working_dir="/tmp",
+        max_turns=10,
+        tool_registry=registry,
+    )
+
+
+@pytest.fixture
+def service_with_soul():
+    """ClaudeSDKService wired to a mock SoulLoader."""
+    soul = MagicMock()
+    soul.content = "You are a helpful assistant."
+    return ClaudeSDKService(
+        working_dir="/tmp",
+        max_turns=10,
+        soul_loader=soul,
+    )
+
+
+# ===================================================================
+# Issue 3: Idle Timeout
+# ===================================================================
+
+
+class TestIdleTimeoutInit:
+    """Test idle timeout state initialization."""
+
+    def test_last_activity_starts_empty(self, service: ClaudeSDKService):
+        assert service._last_activity == {}
+
+    def test_idle_timeout_default(self, service: ClaudeSDKService):
+        assert service._idle_timeout == 1800
+
+    def test_idle_timeout_configurable(self):
+        svc = ClaudeSDKService(working_dir="/tmp")
+        svc._idle_timeout = 300
+        assert svc._idle_timeout == 300
+
+    def test_reaper_task_starts_none(self, service: ClaudeSDKService):
+        assert service._reaper_task is None
+
+
+class TestIdleTimeoutConfig:
+    """Test idle_timeout in ClaudeSDKConfig."""
+
+    def test_default_value(self):
+        from agent.config import ClaudeSDKConfig
+
+        cfg = ClaudeSDKConfig()
+        assert cfg.idle_timeout == 1800
+
+    def test_custom_value(self):
+        from agent.config import ClaudeSDKConfig
+
+        cfg = ClaudeSDKConfig(idle_timeout=600)
+        assert cfg.idle_timeout == 600
+
+
+class TestReaperLifecycle:
+    """Test start_reaper / stop_reaper lifecycle."""
+
+    @pytest.mark.asyncio
+    async def test_start_reaper_creates_task(self, service: ClaudeSDKService):
+        await service.start_reaper()
+        assert service._reaper_task is not None
+        assert not service._reaper_task.done()
+        # Cleanup
+        await service.stop_reaper()
+
+    @pytest.mark.asyncio
+    async def test_stop_reaper_cancels_task(self, service: ClaudeSDKService):
+        await service.start_reaper()
+        task = service._reaper_task
+        await service.stop_reaper()
+        assert service._reaper_task is None
+        assert task.cancelled() or task.done()
+
+    @pytest.mark.asyncio
+    async def test_double_start_is_noop(self, service: ClaudeSDKService):
+        await service.start_reaper()
+        first_task = service._reaper_task
+        await service.start_reaper()
+        assert service._reaper_task is first_task
+        await service.stop_reaper()
+
+    @pytest.mark.asyncio
+    async def test_double_stop_is_noop(self, service: ClaudeSDKService):
+        await service.stop_reaper()  # No task to stop — should not raise
+        assert service._reaper_task is None
+
+    @pytest.mark.asyncio
+    async def test_stop_after_stop_is_safe(self, service: ClaudeSDKService):
+        await service.start_reaper()
+        await service.stop_reaper()
+        await service.stop_reaper()  # Should not raise
+
+
+class TestReapIdleClients:
+    """Test the reaper logic for disconnecting idle clients."""
+
+    @pytest.mark.asyncio
+    async def test_reaps_idle_client(self, service: ClaudeSDKService):
+        """Client idle beyond timeout should be disconnected."""
+        # Simulate a connected client that went idle 2000s ago
+        mock_client = AsyncMock()
+        service._clients["user1"] = mock_client
+        service._last_activity["user1"] = time.monotonic() - 2000
+        service._idle_timeout = 100  # 100s timeout
+
+        # Manually call the reap logic (not the loop)
+        now = time.monotonic()
+        idle_ids = [
+            tid for tid, last in service._last_activity.items()
+            if (now - last) > service._idle_timeout and tid in service._clients
+        ]
+        for tid in idle_ids:
+            await service.disconnect_client(tid)
+
+        assert "user1" not in service._clients
+        assert "user1" not in service._last_activity
+
+    @pytest.mark.asyncio
+    async def test_does_not_reap_active_client(self, service: ClaudeSDKService):
+        """Client that was recently active should not be reaped."""
+        mock_client = AsyncMock()
+        service._clients["user1"] = mock_client
+        service._last_activity["user1"] = time.monotonic()  # just now
+        service._idle_timeout = 100
+
+        now = time.monotonic()
+        idle_ids = [
+            tid for tid, last in service._last_activity.items()
+            if (now - last) > service._idle_timeout and tid in service._clients
+        ]
+        assert len(idle_ids) == 0
+        assert "user1" in service._clients
+
+    @pytest.mark.asyncio
+    async def test_reaps_only_idle_not_active(self, service: ClaudeSDKService):
+        """Only idle clients should be reaped, active ones kept."""
+        service._clients["idle_user"] = AsyncMock()
+        service._clients["active_user"] = AsyncMock()
+        service._last_activity["idle_user"] = time.monotonic() - 500
+        service._last_activity["active_user"] = time.monotonic()
+        service._idle_timeout = 100
+
+        now = time.monotonic()
+        idle_ids = [
+            tid for tid, last in service._last_activity.items()
+            if (now - last) > service._idle_timeout and tid in service._clients
+        ]
+        for tid in idle_ids:
+            await service.disconnect_client(tid)
+
+        assert "idle_user" not in service._clients
+        assert "active_user" in service._clients
+
+
+# ===================================================================
+# Issue 4: Resume on Crash
+# ===================================================================
+
+
+class TestResumeSessionTracking:
+    """Test session_id storage and resume behavior."""
+
+    def test_last_session_ids_starts_empty(self, service: ClaudeSDKService):
+        assert service._last_session_ids == {}
+
+    def test_session_id_stored_manually(self, service: ClaudeSDKService):
+        """Simulates what happens when ResultMessage arrives with session_id."""
+        service._last_session_ids["user1"] = "sess-abc-123"
+        assert service._last_session_ids["user1"] == "sess-abc-123"
+
+    @pytest.mark.asyncio
+    async def test_disconnect_preserves_session_id(self, service: ClaudeSDKService):
+        """disconnect_client should keep _last_session_ids for resume."""
+        service._clients["user1"] = AsyncMock()
+        service._last_activity["user1"] = time.monotonic()
+        service._last_session_ids["user1"] = "sess-abc-123"
+        service._status["user1"] = SDKTaskStatus.COMPLETED
+
+        await service.disconnect_client("user1")
+
+        # Client gone, but session_id preserved
+        assert "user1" not in service._clients
+        assert "user1" not in service._last_activity
+        assert service._last_session_ids["user1"] == "sess-abc-123"
+
+    @pytest.mark.asyncio
+    async def test_run_task_stream_retry_on_resume_failure(
+        self, service: ClaudeSDKService
+    ):
+        """If resume fails, should retry without resume (fresh session)."""
+        call_count = 0
+
+        async def fake_impl(
+            prompt, *, task_id, session_id, working_dir, on_permission, on_question
+        ):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1 and session_id is not None:
+                from agent.llm.claude_sdk import SDKStreamEvent
+
+                yield SDKStreamEvent(type="error", content="Resume failed")
+            else:
+                from agent.llm.claude_sdk import SDKStreamEvent
+
+                yield SDKStreamEvent(type="result", content="Success")
+
+        service._run_task_impl = fake_impl  # type: ignore[assignment]
+
+        events = []
+        async for event in service.run_task_stream(
+            "hello", task_id="t1", session_id="old-session"
+        ):
+            events.append(event)
+
+        # Should have retried: got "Success" from retry
+        assert any(e.type == "result" and "Success" in e.content for e in events)
+        assert call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_run_task_stream_no_retry_without_session(
+        self, service: ClaudeSDKService
+    ):
+        """If no session_id and error occurs, should NOT retry."""
+
+        async def fake_impl(
+            prompt, *, task_id, session_id, working_dir, on_permission, on_question
+        ):
+            from agent.llm.claude_sdk import SDKStreamEvent
+
+            yield SDKStreamEvent(type="error", content="Some error")
+
+        service._run_task_impl = fake_impl  # type: ignore[assignment]
+
+        events = []
+        async for event in service.run_task_stream("hello", task_id="t1"):
+            events.append(event)
+
+        # Error should pass through, no retry
+        assert len(events) == 1
+        assert events[0].type == "error"
+
+
+# ===================================================================
+# Issue 2: MCP Tool Generation Tracking
+# ===================================================================
+
+
+class TestToolGenerationCounter:
+    """Test ToolRegistry generation counter."""
+
+    def test_generation_starts_at_zero(self, registry):
+        assert registry._generation == 0
+
+    def test_register_increments(self, registry):
+        @registry.tool(name="t1", description="test", tier=ToolTier.SAFE)
+        async def t1() -> str:
+            return ""
+
+        assert registry._generation == 1
+
+    def test_multiple_registers_increment(self, registry):
+        @registry.tool(name="t1", description="test", tier=ToolTier.SAFE)
+        async def t1() -> str:
+            return ""
+
+        @registry.tool(name="t2", description="test2", tier=ToolTier.SAFE)
+        async def t2() -> str:
+            return ""
+
+        assert registry._generation == 2
+
+    def test_enable_increments(self, registry):
+        @registry.tool(name="t1", description="test", tier=ToolTier.SAFE)
+        async def t1() -> str:
+            return ""
+
+        gen_before = registry._generation
+        registry.enable_tool("t1")
+        assert registry._generation == gen_before + 1
+
+    def test_disable_increments(self, registry):
+        @registry.tool(name="t1", description="test", tier=ToolTier.SAFE)
+        async def t1() -> str:
+            return ""
+
+        gen_before = registry._generation
+        registry.disable_tool("t1")
+        assert registry._generation == gen_before + 1
+
+    def test_unregister_increments(self, registry):
+        @registry.tool(name="t1", description="test", tier=ToolTier.SAFE)
+        async def t1() -> str:
+            return ""
+
+        gen_before = registry._generation
+        registry.unregister_tool("t1")
+        assert registry._generation == gen_before + 1
+
+    def test_unregister_nonexistent_no_increment(self, registry):
+        gen_before = registry._generation
+        registry.unregister_tool("nonexistent")
+        assert registry._generation == gen_before
+
+    def test_enable_disable_cycle(self, registry):
+        @registry.tool(name="t1", description="test", tier=ToolTier.SAFE)
+        async def t1() -> str:
+            return ""
+
+        # register=1, disable=2, enable=3
+        registry.disable_tool("t1")
+        registry.enable_tool("t1")
+        assert registry._generation == 3
+
+
+class TestToolGenerationDriftDetection:
+    """Test that SDK service detects tool generation changes."""
+
+    def test_tool_generations_starts_empty(self, service_with_registry):
+        assert service_with_registry._tool_generations == {}
+
+    @pytest.mark.asyncio
+    async def test_tool_change_triggers_reconnect(self, service_with_registry):
+        """When tool generation changes, _ensure_client should disconnect old client."""
+        svc = service_with_registry
+        reg = svc.tool_registry
+
+        # Simulate an existing connected client with gen=0
+        mock_client = AsyncMock()
+        svc._clients["user1"] = mock_client
+        svc._tool_generations["user1"] = 0
+
+        # Register a tool → gen becomes 1
+        @reg.tool(name="new_tool", description="test", tier=ToolTier.SAFE)
+        async def new_tool() -> str:
+            return ""
+
+        assert reg._generation == 1
+
+        # _ensure_client should detect the drift and disconnect, then reconnect
+        disconnect_called = False
+        original_disconnect = svc.disconnect_client
+
+        async def tracking_disconnect(task_id):
+            nonlocal disconnect_called
+            disconnect_called = True
+            await original_disconnect(task_id)
+
+        with patch.object(svc, "_query_memory", new_callable=AsyncMock, return_value=(None, None)):
+            with patch.object(svc, "disconnect_client", side_effect=tracking_disconnect):
+                with patch("claude_code_sdk.ClaudeCodeOptions") as MockOpts:
+                    MockOpts.return_value = MagicMock()
+                    with patch("claude_code_sdk.ClaudeSDKClient") as MockClient:
+                        MockClient.return_value = AsyncMock()
+                        await svc._ensure_client("user1")
+
+        assert disconnect_called
+
+
+# ===================================================================
+# Issue 1: System Prompt Fingerprint
+# ===================================================================
+
+
+class TestPromptFingerprint:
+    """Test system prompt fingerprint computation and drift detection."""
+
+    def test_fingerprints_start_empty(self, service: ClaudeSDKService):
+        assert service._prompt_fingerprints == {}
+
+    def test_fingerprint_deterministic(self, service_with_soul):
+        """Same inputs produce same fingerprint."""
+        fp1 = service_with_soul._compute_prompt_fingerprint()
+        fp2 = service_with_soul._compute_prompt_fingerprint()
+        assert fp1 == fp2
+
+    def test_fingerprint_changes_with_soul(self):
+        """Different soul content produces different fingerprint."""
+        soul1 = MagicMock()
+        soul1.content = "You are helpful."
+        svc1 = ClaudeSDKService(working_dir="/tmp", soul_loader=soul1)
+
+        soul2 = MagicMock()
+        soul2.content = "You are a pirate."
+        svc2 = ClaudeSDKService(working_dir="/tmp", soul_loader=soul2)
+
+        fp1 = svc1._compute_prompt_fingerprint()
+        fp2 = svc2._compute_prompt_fingerprint()
+        assert fp1 != fp2
+
+    def test_fingerprint_changes_with_facts(self, service_with_soul):
+        """Different facts produce different fingerprint."""
+        fact_a = SimpleNamespace(key="user.name", value="Alice")
+        fact_b = SimpleNamespace(key="user.name", value="Bob")
+
+        fp1 = service_with_soul._compute_prompt_fingerprint(facts=[fact_a])
+        fp2 = service_with_soul._compute_prompt_fingerprint(facts=[fact_b])
+        assert fp1 != fp2
+
+    def test_fingerprint_same_facts_same_hash(self, service_with_soul):
+        """Same facts produce same fingerprint."""
+        facts = [SimpleNamespace(key="user.name", value="Alice")]
+        fp1 = service_with_soul._compute_prompt_fingerprint(facts=facts)
+        fp2 = service_with_soul._compute_prompt_fingerprint(facts=facts)
+        assert fp1 == fp2
+
+    def test_fingerprint_no_soul_no_facts(self, service: ClaudeSDKService):
+        """Service with no soul or facts should still produce a fingerprint."""
+        fp = service._compute_prompt_fingerprint()
+        assert isinstance(fp, str)
+        assert len(fp) == 16  # sha256[:16]
+
+    def test_fingerprint_length(self, service_with_soul):
+        """Fingerprint should be a 16-char hex string."""
+        fp = service_with_soul._compute_prompt_fingerprint()
+        assert len(fp) == 16
+        # Should be valid hex
+        int(fp, 16)
+
+    @pytest.mark.asyncio
+    async def test_prompt_drift_triggers_reconnect(self, service_with_soul):
+        """When prompt fingerprint changes, _ensure_client should reconnect."""
+        svc = service_with_soul
+
+        # Simulate an existing connected client with old fingerprint
+        mock_client = AsyncMock()
+        svc._clients["user1"] = mock_client
+        svc._prompt_fingerprints["user1"] = "old_fingerprint_00"
+
+        disconnect_called = False
+        original_disconnect = svc.disconnect_client
+
+        async def tracking_disconnect(task_id):
+            nonlocal disconnect_called
+            disconnect_called = True
+            await original_disconnect(task_id)
+
+        with patch.object(svc, "_query_memory", new_callable=AsyncMock, return_value=(None, None)):
+            with patch.object(svc, "disconnect_client", side_effect=tracking_disconnect):
+                with patch("claude_code_sdk.ClaudeCodeOptions") as MockOpts:
+                    MockOpts.return_value = MagicMock()
+                    with patch("claude_code_sdk.ClaudeSDKClient") as MockClient:
+                        MockClient.return_value = AsyncMock()
+                        await svc._ensure_client("user1")
+
+        assert disconnect_called
+
+    @pytest.mark.asyncio
+    async def test_no_reconnect_when_fingerprint_unchanged(self, service_with_soul):
+        """When prompt fingerprint matches, should reuse existing client."""
+        svc = service_with_soul
+
+        # Compute the real fingerprint
+        real_fp = svc._compute_prompt_fingerprint()
+
+        mock_client = AsyncMock()
+        svc._clients["user1"] = mock_client
+        svc._prompt_fingerprints["user1"] = real_fp
+
+        with patch.object(svc, "_query_memory", new_callable=AsyncMock, return_value=(None, None)):
+            result = await svc._ensure_client("user1")
+
+        # Should return existing client without disconnect
+        assert result is mock_client
+
+
+# ===================================================================
+# disconnect_client cleanup
+# ===================================================================
+
+
+class TestDisconnectClientCleanup:
+    """Test that disconnect_client cleans up all per-client state."""
+
+    @pytest.mark.asyncio
+    async def test_cleans_up_all_state(self, service: ClaudeSDKService):
+        """disconnect_client should remove all per-client state except session_ids."""
+        mock_client = AsyncMock()
+        task_id = "user1"
+
+        service._clients[task_id] = mock_client
+        service._cancel_events[task_id] = asyncio.Event()
+        service._status[task_id] = SDKTaskStatus.COMPLETED
+        service._last_activity[task_id] = time.monotonic()
+        service._tool_generations[task_id] = 5
+        service._prompt_fingerprints[task_id] = "abc123"
+        service._last_session_ids[task_id] = "sess-xyz"
+
+        await service.disconnect_client(task_id)
+
+        assert task_id not in service._clients
+        assert task_id not in service._cancel_events
+        assert task_id not in service._status
+        assert task_id not in service._last_activity
+        assert task_id not in service._tool_generations
+        assert task_id not in service._prompt_fingerprints
+        # Session ID preserved for resume
+        assert service._last_session_ids[task_id] == "sess-xyz"
+
+    @pytest.mark.asyncio
+    async def test_disconnect_nonexistent_is_safe(self, service: ClaudeSDKService):
+        """Disconnecting a non-existent client should not raise."""
+        await service.disconnect_client("nonexistent")
+
+    @pytest.mark.asyncio
+    async def test_disconnect_calls_client_disconnect(self, service: ClaudeSDKService):
+        """Should call client.disconnect() on the SDK client."""
+        mock_client = AsyncMock()
+        service._clients["user1"] = mock_client
+
+        await service.disconnect_client("user1")
+
+        mock_client.disconnect.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_handles_client_error(self, service: ClaudeSDKService):
+        """Should suppress errors from client.disconnect()."""
+        mock_client = AsyncMock()
+        mock_client.disconnect.side_effect = RuntimeError("connection lost")
+        service._clients["user1"] = mock_client
+
+        # Should not raise
+        await service.disconnect_client("user1")
+        assert "user1" not in service._clients
+
+
+# ===================================================================
+# Integration: _ensure_client with resume
+# ===================================================================
+
+
+class TestEnsureClientResume:
+    """Test _ensure_client session_id / resume integration."""
+
+    @pytest.mark.asyncio
+    async def test_uses_explicit_session_id(self, service: ClaudeSDKService):
+        """Explicit session_id should be passed as resume to options."""
+        captured_options = {}
+
+        class FakeClient:
+            def __init__(self, options):
+                captured_options["resume"] = getattr(options, "resume", None)
+
+            async def connect(self):
+                pass
+
+        with patch.object(service, "_query_memory", new_callable=AsyncMock, return_value=(None, None)):
+            with patch("claude_code_sdk.ClaudeSDKClient", FakeClient):
+                with patch("claude_code_sdk.ClaudeCodeOptions") as MockOptions:
+                    mock_opts = MagicMock()
+                    MockOptions.return_value = mock_opts
+                    await service._ensure_client("user1", session_id="explicit-sess")
+
+                    # Check that resume was passed to ClaudeCodeOptions
+                    call_kwargs = MockOptions.call_args[1]
+                    assert call_kwargs.get("resume") == "explicit-sess"
+
+        # Cleanup
+        await service.disconnect_client("user1")
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_stored_session_id(self, service: ClaudeSDKService):
+        """Without explicit session_id, should use _last_session_ids."""
+        service._last_session_ids["user1"] = "stored-sess-456"
+
+        with patch.object(service, "_query_memory", new_callable=AsyncMock, return_value=(None, None)):
+            with patch("claude_code_sdk.ClaudeCodeOptions") as MockOptions:
+                mock_opts = MagicMock()
+                MockOptions.return_value = mock_opts
+                with patch("claude_code_sdk.ClaudeSDKClient") as MockClient:
+                    mock_client = AsyncMock()
+                    MockClient.return_value = mock_client
+                    await service._ensure_client("user1")
+
+                    call_kwargs = MockOptions.call_args[1]
+                    assert call_kwargs.get("resume") == "stored-sess-456"
+
+        await service.disconnect_client("user1")
+
+    @pytest.mark.asyncio
+    async def test_no_resume_when_no_session(self, service: ClaudeSDKService):
+        """When no session_id exists, resume should not be in options."""
+        with patch.object(service, "_query_memory", new_callable=AsyncMock, return_value=(None, None)):
+            with patch("claude_code_sdk.ClaudeCodeOptions") as MockOptions:
+                mock_opts = MagicMock()
+                MockOptions.return_value = mock_opts
+                with patch("claude_code_sdk.ClaudeSDKClient") as MockClient:
+                    mock_client = AsyncMock()
+                    MockClient.return_value = mock_client
+                    await service._ensure_client("user1")
+
+                    call_kwargs = MockOptions.call_args[1]
+                    assert "resume" not in call_kwargs
+
+        await service.disconnect_client("user1")
+
+
+# ===================================================================
+# Integration: _ensure_client stores fingerprint and generation
+# ===================================================================
+
+
+class TestEnsureClientStoresState:
+    """Test that _ensure_client records fingerprint and generation on connect."""
+
+    @pytest.mark.asyncio
+    async def test_stores_prompt_fingerprint(self, service_with_soul):
+        svc = service_with_soul
+
+        with patch.object(svc, "_query_memory", new_callable=AsyncMock, return_value=(None, None)):
+            with patch("claude_code_sdk.ClaudeCodeOptions") as MockOptions:
+                MockOptions.return_value = MagicMock()
+                with patch("claude_code_sdk.ClaudeSDKClient") as MockClient:
+                    MockClient.return_value = AsyncMock()
+                    await svc._ensure_client("user1")
+
+        assert "user1" in svc._prompt_fingerprints
+        assert len(svc._prompt_fingerprints["user1"]) == 16
+        await svc.disconnect_client("user1")
+
+    @pytest.mark.asyncio
+    async def test_stores_tool_generation(self, service_with_registry):
+        svc = service_with_registry
+        reg = svc.tool_registry
+
+        @reg.tool(name="t1", description="test", tier=ToolTier.SAFE)
+        async def t1() -> str:
+            return ""
+
+        with patch.object(svc, "_query_memory", new_callable=AsyncMock, return_value=(None, None)):
+            with patch("claude_code_sdk.ClaudeCodeOptions") as MockOptions:
+                MockOptions.return_value = MagicMock()
+                with patch("claude_code_sdk.ClaudeSDKClient") as MockClient:
+                    MockClient.return_value = AsyncMock()
+                    await svc._ensure_client("user1")
+
+        assert svc._tool_generations["user1"] == reg._generation
+        await svc.disconnect_client("user1")
+
+    @pytest.mark.asyncio
+    async def test_stores_last_activity(self, service: ClaudeSDKService):
+        with patch.object(service, "_query_memory", new_callable=AsyncMock, return_value=(None, None)):
+            with patch("claude_code_sdk.ClaudeCodeOptions") as MockOptions:
+                MockOptions.return_value = MagicMock()
+                with patch("claude_code_sdk.ClaudeSDKClient") as MockClient:
+                    MockClient.return_value = AsyncMock()
+                    await service._ensure_client("user1")
+
+        assert "user1" in service._last_activity
+        assert service._last_activity["user1"] > 0
+        await service.disconnect_client("user1")

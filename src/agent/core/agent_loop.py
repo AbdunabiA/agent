@@ -368,11 +368,17 @@ class AgentLoop:
                 error="No tool executor configured",
             )
 
+        # Extract channel_user_id from session ID (format: "channel:user_id")
+        channel_user_id = None
+        if ":" in session.id:
+            channel_user_id = session.id.split(":", 1)[1]
+
         try:
             return await self.tool_executor.execute(
                 tool_call=tool_call,
                 session_id=session.id,
                 trigger=trigger,
+                channel_user_id=channel_user_id,
             )
         except Exception as e:
             # Error recovery
