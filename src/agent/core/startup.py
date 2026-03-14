@@ -6,6 +6,7 @@ into a single Application class used by ``agent start``.
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -48,6 +49,11 @@ class Application:
 
         # Components — populated by initialize()
         self.voice_pipeline: Any = None
+        self.skill_builder: Any = None
+        self.orchestrator: Any = None
+        self.proactive: Any = None
+        self.trigger_matcher: Any = None
+        self.monitor_manager: Any = None
         self.database: Database | None = None
         self.event_bus: EventBus | None = None
         self.llm: LLMProvider | None = None
@@ -75,6 +81,7 @@ class Application:
         self.summarizer: Any = None
 
         self._channels: list[BaseChannel] = []
+        self._background_tasks: set[asyncio.Task[None]] = set()
 
     async def initialize(self) -> None:
         """Wire all components in dependency order.
@@ -124,7 +131,21 @@ class Application:
 
         # 1. Core infrastructure
         self.event_bus = EventBus()
-        self.llm = LLMProvider(self.config.models)
+
+        # Check if any LiteLLM-compatible API keys exist
+        from agent.config import has_litellm_keys
+
+        _llm_available = has_litellm_keys(self.config)
+        if _llm_available:
+            self.llm = LLMProvider(self.config.models)
+        else:
+            self.llm = None
+            logger.info(
+                "litellm_skipped",
+                reason="no API keys configured",
+                backend=self.config.models.backend,
+            )
+
         self.session_store = SessionStore(db=self.database)
 
         # 2. Safety components
@@ -147,8 +168,12 @@ class Application:
             guardrails=self.guardrails,
         )
 
-        # 5. Planner
-        self.planner = Planner(llm=self.llm, config=self.config.agent)
+        # 5. Planner (requires LLM for planning via LiteLLM)
+        self.planner = (
+            Planner(llm=self.llm, config=self.config.agent)
+            if _llm_available and self.llm
+            else None
+        )
 
         # 5.5. Phase 4: Memory components
         from agent.memory.extraction import FactExtractor
@@ -175,13 +200,24 @@ class Application:
             logger.warning("vector_store_init_failed", error=str(e))
             self.vector_store = None
 
+        # Pre-warm embedding model in background to avoid cold-start delay
+        if self.vector_store:
+            try:
+                from agent.memory.embeddings import get_embedding_model
+
+                task = asyncio.create_task(self._warmup_embeddings(get_embedding_model()))
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+            except Exception:
+                pass
+
         self.fact_extractor = FactExtractor(
             llm=self.llm,
             fact_store=self.fact_store,
             enabled=self.config.memory.auto_extract and self.fact_store is not None,
-        ) if self.fact_store else None
+        ) if self.fact_store and _llm_available and self.llm else None
 
-        if self.vector_store:
+        if self.vector_store and _llm_available and self.llm:
             from agent.memory.summarizer import ConversationSummarizer
 
             self.summarizer = ConversationSummarizer(
@@ -189,6 +225,14 @@ class Application:
             )
 
         # 6. Agent loop
+        # Get platform capabilities for system prompt injection
+        platform_capabilities = None
+        try:
+            from agent.desktop.platform_utils import get_capabilities_summary
+            platform_capabilities = get_capabilities_summary()
+        except Exception:
+            pass
+
         self.agent_loop = AgentLoop(
             llm=self.llm,
             config=self.config.agent,
@@ -204,6 +248,9 @@ class Application:
             summarizer=self.summarizer,
             cost_tracker=self.cost_tracker,
             session_store=self.session_store,
+            skill_builder_enabled=self.config.skills.builder.enabled,
+            orchestration_enabled=self.config.orchestration.enabled,
+            platform_capabilities=platform_capabilities,
         )
 
         # 6.5. Claude SDK service (when backend=claude-sdk)
@@ -242,17 +289,38 @@ class Application:
                 logger.warning("claude_sdk_init_failed", error=str(e))
                 self.sdk_service = None
 
-        # 7. Scheduler & heartbeat
-        self.scheduler = TaskScheduler(self.event_bus)
+        # 7. Scheduler & heartbeat (with persistence and proactive support)
+        self.scheduler = TaskScheduler(self.event_bus, database=self.database)
+
+        # Proactive messenger (for heartbeat notifications)
+        from agent.core.proactive import ProactiveMessenger
+        self.proactive = ProactiveMessenger(event_bus=self.event_bus)
+
         self.heartbeat = HeartbeatDaemon(
             agent_loop=self.agent_loop,
             config=self.config.agent,
             event_bus=self.event_bus,
+            fact_store=self.fact_store,
+            scheduler=self.scheduler,
+            proactive=self.proactive,
         )
 
         # Wire scheduler into tools so the LLM can set reminders
         from agent.tools.builtins.scheduler import set_scheduler
         set_scheduler(self.scheduler)
+
+        # Monitor manager
+        from agent.core.monitors import MonitorManager
+        self.monitor_manager = MonitorManager(
+            event_bus=self.event_bus,
+            proactive=self.proactive,
+        )
+        from agent.tools.builtins.monitor import set_monitor_manager
+        set_monitor_manager(self.monitor_manager)
+
+        # Trigger matcher for skill hints
+        from agent.skills.triggers import TriggerMatcher
+        self.trigger_matcher = TriggerMatcher()
 
         # Wire event bus into send_file tool so the LLM can send files
         from agent.tools.builtins.send_file import set_file_send_bus
@@ -270,7 +338,75 @@ class Application:
         except Exception as e:
             logger.warning("skill_manager_init_failed", error=str(e))
 
-        # 7.6. Voice pipeline
+        # 7.6. Register skill triggers
+        if self.trigger_matcher and self.skill_manager:
+            for skill_info in self.skill_manager.list_skills():
+                if skill_info.get("loaded"):
+                    loaded = self.skill_manager._loaded.get(skill_info["name"])
+                    if loaded and loaded.metadata.triggers:
+                        self.trigger_matcher.register_skill(loaded.metadata)
+
+        # 7.7. Skill builder (self-building skills)
+        if self.config.skills.builder.enabled and _llm_available:
+            try:
+                from agent.skills.builder import SkillBuilder
+                from agent.tools.builtins.skill_builder import set_skill_builder
+
+                assert self.llm is not None
+                self.skill_builder = SkillBuilder(
+                    llm=self.llm,
+                    config=self.config.skills.builder,
+                    event_bus=self.event_bus,
+                    skill_manager=self.skill_manager,
+                )
+                set_skill_builder(self.skill_builder)
+                logger.info("skill_builder_ready")
+            except Exception as e:
+                logger.warning("skill_builder_init_failed", error=str(e))
+
+        # 7.8. Sub-agent orchestrator
+        if self.config.orchestration.enabled:
+            try:
+                from agent.core.orchestrator import SubAgentOrchestrator
+                from agent.core.subagent import AgentTeam, SubAgentRole
+                from agent.tools.builtins.orchestration import set_orchestrator
+
+                # Build teams from config
+                teams: list[AgentTeam] = []
+                for team_cfg in self.config.orchestration.teams:
+                    roles = [
+                        SubAgentRole(
+                            name=r.name,
+                            persona=r.persona,
+                            allowed_tools=r.allowed_tools,
+                            denied_tools=r.denied_tools,
+                            max_iterations=r.max_iterations,
+                        )
+                        for r in team_cfg.roles
+                    ]
+                    teams.append(AgentTeam(
+                        name=team_cfg.name,
+                        description=team_cfg.description,
+                        roles=roles,
+                    ))
+
+                self.orchestrator = SubAgentOrchestrator(
+                    agent_loop=self.agent_loop,
+                    config=self.config.orchestration,
+                    event_bus=self.event_bus,
+                    tool_registry=registry,
+                    teams=teams,
+                )
+                set_orchestrator(self.orchestrator)
+                logger.info(
+                    "orchestrator_ready",
+                    teams=len(teams),
+                    max_concurrent=self.config.orchestration.max_concurrent_agents,
+                )
+            except Exception as e:
+                logger.warning("orchestrator_init_failed", error=str(e))
+
+        # 8. Voice pipeline
         try:
             from agent.voice.pipeline import VoicePipeline
 
@@ -352,6 +488,15 @@ class Application:
             channels=len(self._channels),
         )
 
+    @staticmethod
+    async def _warmup_embeddings(model: Any) -> None:
+        """Pre-load the embedding model so the first vector query is fast."""
+        try:
+            await model.warmup()
+            logger.info("embedding_model_prewarmed")
+        except Exception as e:
+            logger.debug("embedding_warmup_failed", error=str(e))
+
     async def start(self) -> None:
         """Start all channels, heartbeat, scheduler, and the gateway server.
 
@@ -363,15 +508,26 @@ class Application:
         for channel in self._channels:
             await channel.start()
 
+        # Register channels with proactive messenger
+        if self.proactive:
+            for channel in self._channels:
+                self.proactive.add_channel(channel)
+
         # Wire up reminder delivery to channels
         if self.scheduler and self._channels:
             self._setup_reminder_delivery()
 
-        # Start heartbeat & scheduler
+        # Load persisted scheduled tasks
+        if self.scheduler:
+            await self.scheduler.load_persisted_tasks()
+
+        # Start heartbeat, scheduler & monitors
         if self.heartbeat:
             await self.heartbeat.start()
         if self.scheduler:
             self.scheduler.start()
+        if self.monitor_manager:
+            self.monitor_manager.start()
 
         # Start skill watcher for hot-reload
         if self.skill_manager:
@@ -428,6 +584,7 @@ class Application:
                 )
             )
 
+        assert self.scheduler is not None
         self.scheduler.set_delivery_callback(deliver_reminder)
         logger.info("reminder_delivery_configured", channels=list(channels_by_name.keys()))
 
@@ -438,6 +595,9 @@ class Application:
 
         if self.scheduler:
             self.scheduler.stop()
+
+        if self.monitor_manager:
+            self.monitor_manager.stop()
 
         for channel in self._channels:
             try:

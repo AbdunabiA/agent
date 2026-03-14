@@ -159,6 +159,7 @@ async def list_installed_apps() -> str:
                         apps.append(f.stem)
 
     elif info.os_type == OSType.WINDOWS:
+        # Scan Program Files
         for prog_dir in [
             Path(r"C:\Program Files"),
             Path(r"C:\Program Files (x86)"),
@@ -169,6 +170,30 @@ async def list_installed_apps() -> str:
                         if f.is_dir():
                             apps.append(f.name)
                 except PermissionError:
+                    pass
+
+        # Scan Start Menu for .lnk shortcuts
+        import os
+
+        start_menu_dirs = []
+        appdata = os.environ.get("APPDATA", "")
+        if appdata:
+            start_menu_dirs.append(
+                Path(appdata) / "Microsoft/Windows/Start Menu/Programs"
+            )
+        programdata = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
+        start_menu_dirs.append(
+            Path(programdata) / "Microsoft/Windows/Start Menu/Programs"
+        )
+
+        for sm_dir in start_menu_dirs:
+            if sm_dir.exists():
+                try:
+                    for f in sm_dir.rglob("*.lnk"):
+                        name = f.stem
+                        if name and not name.startswith("Uninstall"):
+                            apps.append(name)
+                except (PermissionError, OSError):
                     pass
 
     apps = sorted(set(apps))

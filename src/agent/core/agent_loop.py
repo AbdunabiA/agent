@@ -57,7 +57,7 @@ class AgentLoop:
 
     def __init__(
         self,
-        llm: LLMProvider,
+        llm: LLMProvider | None,
         config: AgentPersonaConfig,
         event_bus: EventBus,
         tool_executor: ToolExecutor | None = None,
@@ -71,6 +71,9 @@ class AgentLoop:
         summarizer: ConversationSummarizer | None = None,
         cost_tracker: CostTracker | None = None,
         session_store: SessionStore | None = None,
+        skill_builder_enabled: bool = False,
+        orchestration_enabled: bool = False,
+        platform_capabilities: str | None = None,
     ) -> None:
         self.llm = llm
         self.config = config
@@ -86,11 +89,20 @@ class AgentLoop:
         self.summarizer = summarizer
         self.cost_tracker = cost_tracker
         self.session_store = session_store
+        self._skill_builder_enabled = skill_builder_enabled
+        self._orchestration_enabled = orchestration_enabled
+        self._platform_capabilities = platform_capabilities
         self._background_tasks: set[asyncio.Task[None]] = set()
 
         # Build system prompt with soul.md content if available
         soul_content = soul_loader.load() if soul_loader else None
-        self.system_prompt = build_system_prompt(config, soul_content=soul_content)
+        self.system_prompt = build_system_prompt(
+            config,
+            soul_content=soul_content,
+            skill_builder_enabled=skill_builder_enabled,
+            orchestration_enabled=orchestration_enabled,
+            platform_capabilities=platform_capabilities,
+        )
 
     async def _add_and_persist(self, session: Session, message: Message) -> None:
         """Add message to session and persist to database if available."""
@@ -131,6 +143,12 @@ class AgentLoop:
         Raises:
             Exception: If LLM call fails (after failover attempt).
         """
+        if self.llm is None:
+            raise RuntimeError(
+                "AgentLoop.process_message() requires an LLM provider. "
+                "Configure an API key or use the Claude SDK backend."
+            )
+
         # Add user message to session
         await self._add_and_persist(session, Message(role="user", content=user_message))
 
@@ -438,7 +456,11 @@ class AgentLoop:
         # Check if soul.md changed on disk
         if self.soul_loader and self.soul_loader.reload_if_changed():
             self.system_prompt = build_system_prompt(
-                self.config, soul_content=self.soul_loader.content
+                self.config,
+                soul_content=self.soul_loader.content,
+                skill_builder_enabled=self._skill_builder_enabled,
+                orchestration_enabled=self._orchestration_enabled,
+                platform_capabilities=self._platform_capabilities,
             )
 
         from agent.core.context import build_messages
@@ -533,6 +555,12 @@ class AgentLoop:
         Yields:
             StreamEvent with type "chunk", "tool.execute", "tool.result", or "done".
         """
+        if self.llm is None:
+            raise RuntimeError(
+                "AgentLoop.process_message_stream() requires an LLM provider. "
+                "Configure an API key or use the Claude SDK backend."
+            )
+
         # Add user message to session
         await self._add_and_persist(
             session, Message(role="user", content=user_message)

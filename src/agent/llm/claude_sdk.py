@@ -515,7 +515,7 @@ class ClaudeSDKService:
 
         try:
             # Resolve working directory to absolute path
-            resolved_cwd = str(Path(work_dir).resolve())
+            resolved_cwd = str(Path(work_dir).resolve())  # noqa: ASYNC240
 
             logger.info(
                 "sdk_launching",

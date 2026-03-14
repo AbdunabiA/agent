@@ -33,53 +33,45 @@ class Screenshot:
 async def capture_screen(
     region: tuple[int, int, int, int] | None = None,
     scale: float = 1.0,
+    monitor: int | None = None,
 ) -> Screenshot:
     """Capture the screen or a region.
 
     Args:
         region: Optional (x, y, width, height) for partial capture.
         scale: Scale factor for output (0.5 = half resolution, saves LLM tokens).
+        monitor: Optional monitor index for multi-monitor setups.
 
     Returns:
         Screenshot with PNG bytes, base64 string, and dimensions.
 
     Raises:
         RuntimeError: If no display is available.
-        ImportError: If pyautogui is not installed.
+        ImportError: If no screenshot tool is available.
     """
     info = get_platform()
 
     if not info.has_display:
         raise RuntimeError("No display available. Desktop tools require a GUI environment.")
 
-    if not info.has_pyautogui:
-        raise ImportError(
-            "pyautogui is required for screen capture. "
-            "Install with: pip install 'agent-ai[desktop]'"
+    # Auto-scale for HiDPI to save tokens (apply before capture)
+    if info.scale_factor > 1.0 and scale == 1.0:
+        scale = 1.0 / info.scale_factor
+
+    # Use Wayland-native tools if available
+    if info.display_server == "wayland" and info.has_grim:
+        png_bytes, width, height = await _capture_wayland(region, scale, monitor)
+    elif info.has_pyautogui:
+        loop = asyncio.get_event_loop()
+        png_bytes, width, height = await loop.run_in_executor(
+            None, _capture_pyautogui, region, scale
         )
-
-    loop = asyncio.get_event_loop()
-
-    def _capture() -> tuple[bytes, int, int]:
-        import pyautogui
-        from PIL import Image
-
-        img = pyautogui.screenshot(region=region) if region else pyautogui.screenshot()
-
-        # Scale down if requested
-        if scale != 1.0 and scale > 0:
-            new_w = max(1, int(img.width * scale))
-            new_h = max(1, int(img.height * scale))
-            img = img.resize((new_w, new_h), Image.LANCZOS)
-
-        # Convert to PNG bytes
-        buf = io.BytesIO()
-        img.save(buf, format="PNG", optimize=True)
-        png_bytes = buf.getvalue()
-
-        return png_bytes, img.width, img.height
-
-    png_bytes, width, height = await loop.run_in_executor(None, _capture)
+    else:
+        raise ImportError(
+            "No screenshot tool available. "
+            "Install pyautogui (pip install 'agent-ai[desktop]') "
+            "or grim (Wayland)."
+        )
 
     b64 = base64.b64encode(png_bytes).decode()
 
@@ -123,3 +115,111 @@ async def save_screenshot(
 
     logger.info("screenshot_saved", path=str(output_path))
     return str(output_path)
+
+
+def _capture_pyautogui(
+    region: tuple[int, int, int, int] | None,
+    scale: float,
+) -> tuple[bytes, int, int]:
+    """Capture using pyautogui (blocking, run in executor)."""
+    import pyautogui
+    from PIL import Image
+
+    img = pyautogui.screenshot(region=region) if region else pyautogui.screenshot()
+
+    # Scale down if requested
+    if scale != 1.0 and scale > 0:
+        new_w = max(1, int(img.width * scale))
+        new_h = max(1, int(img.height * scale))
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    png_bytes = buf.getvalue()
+
+    return png_bytes, img.width, img.height
+
+
+async def _get_wayland_outputs() -> list[str]:
+    """Get list of Wayland output names via grim or wlr-randr."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "wlr-randr", "--json",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0:
+            import json
+
+            data = json.loads(stdout.decode())
+            return [o["name"] for o in data if "name" in o]
+    except FileNotFoundError:
+        pass
+
+    # Fallback: parse grim error output which lists outputs
+    return []
+
+
+async def _capture_wayland(
+    region: tuple[int, int, int, int] | None,
+    scale: float,
+    monitor: int | None = None,
+) -> tuple[bytes, int, int]:
+    """Capture using grim (Wayland-native screenshot tool)."""
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp_path = tmp.name
+
+    cmd = ["grim"]
+
+    # Region selection
+    if region:
+        x, y, w, h = region
+        cmd.extend(["-g", f"{x},{y} {w}x{h}"])
+
+    # Monitor selection — grim expects output names like "eDP-1", not indices
+    if monitor is not None:
+        outputs = await _get_wayland_outputs()
+        if 0 <= monitor < len(outputs):
+            cmd.extend(["-o", outputs[monitor]])
+        else:
+            logger.warning(
+                "wayland_monitor_not_found",
+                index=monitor,
+                available=outputs,
+            )
+
+    # Scale
+    if scale != 1.0 and scale > 0:
+        cmd.extend(["-s", str(scale)])
+
+    cmd.append(tmp_path)
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+
+    if proc.returncode != 0:
+        error = stderr.decode(errors="ignore")
+        raise RuntimeError(f"grim failed: {error}")
+
+    import contextlib
+    import os
+
+    from PIL import Image
+
+    with Image.open(tmp_path) as img:
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        png_bytes = buf.getvalue()
+        width, height = img.width, img.height
+
+    with contextlib.suppress(OSError):
+        os.unlink(tmp_path)
+
+    return png_bytes, width, height

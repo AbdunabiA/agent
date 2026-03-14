@@ -16,6 +16,9 @@ def build_system_prompt(
     config: AgentPersonaConfig,
     soul_content: str | None = None,
     skill_extensions: list[str] | None = None,
+    skill_builder_enabled: bool = False,
+    orchestration_enabled: bool = False,
+    platform_capabilities: str | None = None,
 ) -> str:
     """Build the system prompt for the agent.
 
@@ -83,6 +86,33 @@ def build_system_prompt(
             "- Open a file: `xdg-open /path/to/file.txt`\n"
             "Only use the browser tool (Playwright) for headless web scraping."
         )
+
+    # Self-building skills
+    if skill_builder_enabled:
+        parts.append(
+            "## Self-Building Skills\n"
+            "You can create new skills on the fly using the build_skill tool. "
+            "When you detect a capability gap or the user asks for something "
+            "that would be better served by a persistent skill, generate one. "
+            "Built skills go through validation and sandbox testing, then require "
+            "user approval before activation."
+        )
+
+    # Multi-agent orchestration
+    if orchestration_enabled:
+        parts.append(
+            "## Sub-Agent Orchestration\n"
+            "You can delegate tasks to sub-agents using spawn_subagent, "
+            "spawn_parallel_agents, or spawn_team. Sub-agents run independently "
+            "with their own sessions and scoped tools. Use them for:\n"
+            "- Research tasks that can run in parallel\n"
+            "- Code review alongside implementation\n"
+            "- Breaking complex tasks into specialized roles"
+        )
+
+    # Platform capabilities
+    if platform_capabilities:
+        parts.append(f"## Desktop Capabilities\n{platform_capabilities}")
 
     # Skill extensions
     if skill_extensions:

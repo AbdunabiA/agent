@@ -140,6 +140,16 @@ class MemoryConfig(BaseModel):
     soul_path: str | None = None
 
 
+class SkillBuilderConfig(BaseModel):
+    """Configuration for the self-building skills system."""
+
+    enabled: bool = False
+    staging_dir: str = "skills/_staging"
+    max_retries: int = 3
+    auto_approve: bool = False
+    max_permissions: list[str] = ["safe", "moderate"]
+
+
 class SkillsConfig(BaseModel):
     """Skills/plugin configuration."""
 
@@ -147,6 +157,37 @@ class SkillsConfig(BaseModel):
     enabled: list[str] = []  # Empty = all discovered
     disabled: list[str] = []
     auto_discover: bool = True
+    builder: SkillBuilderConfig = SkillBuilderConfig()
+
+
+class AgentTeamRoleConfig(BaseModel):
+    """A role within an agent team."""
+
+    name: str = "agent"
+    persona: str = "You are a helpful assistant."
+    allowed_tools: list[str] = []
+    denied_tools: list[str] = []
+    max_iterations: int = 5
+
+
+class AgentTeamConfig(BaseModel):
+    """A pre-defined team of sub-agent roles."""
+
+    name: str = "default"
+    description: str = ""
+    roles: list[AgentTeamRoleConfig] = []
+
+
+class OrchestrationConfig(BaseModel):
+    """Multi-agent orchestration configuration."""
+
+    enabled: bool = False
+    max_concurrent_agents: int = 5
+    max_depth: int = 1
+    default_max_iterations: int = 5
+    subagent_timeout: int = 300
+    teams: list[AgentTeamConfig] = []
+    default_subagent_tier: str = "moderate"
 
 
 class GatewayConfig(BaseModel):
@@ -233,6 +274,7 @@ class AgentConfig(BaseModel):
     tools: ToolsConfig = ToolsConfig()
     memory: MemoryConfig = MemoryConfig()
     skills: SkillsConfig = SkillsConfig()
+    orchestration: OrchestrationConfig = OrchestrationConfig()
     gateway: GatewayConfig = GatewayConfig()
     logging: LoggingConfig = LoggingConfig()
     workspaces: WorkspacesSection = WorkspacesSection()
@@ -461,6 +503,15 @@ def get_available_models(config: AgentConfig) -> dict[str, list[str]]:
     return available
 
 
+def has_litellm_keys(config: AgentConfig) -> bool:
+    """Check if any LiteLLM-compatible provider has an API key configured.
+
+    Returns:
+        True if at least one provider has an API key set.
+    """
+    return any(prov.api_key for prov in config.models.providers.values())
+
+
 def _auto_select_models(config: AgentConfig) -> None:
     """Auto-select default/fallback models based on available API keys.
 
@@ -474,6 +525,16 @@ def _auto_select_models(config: AgentConfig) -> None:
     }
 
     if not available:
+        # No LiteLLM API keys — auto-switch to claude-sdk if auth exists
+        if config.models.backend == "litellm":
+            claude_dir = Path(config.models.claude_sdk.claude_auth_dir).expanduser()
+            if claude_dir.exists():
+                config.models.backend = "claude-sdk"
+                logger.info(
+                    "auto_selected_backend",
+                    backend="claude-sdk",
+                    reason="no LLM API keys found, Claude SDK auth detected",
+                )
         return
 
     default_provider = _provider_for_model(config.models.default)
@@ -556,6 +617,7 @@ EDITABLE_SECTIONS: dict[str, type[BaseModel]] = {
     "tools": ToolsConfig,
     "memory": MemoryConfig,
     "skills": SkillsConfig,
+    "orchestration": OrchestrationConfig,
     "gateway": GatewayConfig,
     "logging": LoggingConfig,
     "desktop": DesktopConfig,

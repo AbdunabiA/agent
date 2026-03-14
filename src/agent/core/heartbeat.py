@@ -20,6 +20,9 @@ from agent.core.session import Session
 if TYPE_CHECKING:
     from agent.config import AgentPersonaConfig
     from agent.core.agent_loop import AgentLoop
+    from agent.core.proactive import ProactiveMessenger
+    from agent.core.scheduler import TaskScheduler
+    from agent.memory.store import FactStore
 
 logger = structlog.get_logger(__name__)
 
@@ -36,10 +39,16 @@ class HeartbeatDaemon:
         agent_loop: AgentLoop,
         config: AgentPersonaConfig,
         event_bus: EventBus,
+        fact_store: FactStore | None = None,
+        scheduler: TaskScheduler | None = None,
+        proactive: ProactiveMessenger | None = None,
     ) -> None:
         self.agent_loop = agent_loop
         self.config = config
         self.event_bus = event_bus
+        self.fact_store = fact_store
+        self.scheduler = scheduler
+        self.proactive = proactive
         self._scheduler = None
         self._consecutive_failures: int = 0
         self._max_failures: int = 3
@@ -53,7 +62,9 @@ class HeartbeatDaemon:
         Parses config.heartbeat_interval and schedules the heartbeat job.
         """
         try:
-            from apscheduler.schedulers.asyncio import AsyncIOScheduler
+            from apscheduler.schedulers.asyncio import (  # type: ignore[import-untyped]
+                AsyncIOScheduler,
+            )
         except ImportError:
             logger.warning(
                 "heartbeat_disabled",
@@ -62,15 +73,16 @@ class HeartbeatDaemon:
             return
 
         interval = self._parse_interval(self.config.heartbeat_interval)
-        self._scheduler = AsyncIOScheduler()
-        self._scheduler.add_job(
+        scheduler = AsyncIOScheduler()
+        scheduler.add_job(
             self._tick,
             "interval",
             seconds=interval,
             id="heartbeat",
             replace_existing=True,
         )
-        self._scheduler.start()
+        scheduler.start()
+        self._scheduler = scheduler
         logger.info("heartbeat_started", interval_seconds=interval)
 
     async def stop(self) -> None:
@@ -101,12 +113,41 @@ class HeartbeatDaemon:
         try:
             checklist = await asyncio.to_thread(self._read_heartbeat_md)
 
-            heartbeat_message = (
+            # Build dynamic context
+            context_parts = [
                 f"[HEARTBEAT] The time is {datetime.now().strftime('%Y-%m-%d %H:%M')}.\n"
                 f"Check the following items and take action ONLY if needed. "
-                f"If nothing needs to be done, respond with exactly 'HEARTBEAT_OK'.\n\n"
-                f"Checklist:\n{checklist}"
-            )
+                f"If nothing needs to be done, respond with exactly 'HEARTBEAT_OK'.\n"
+                f"If you need to notify the user, prefix your response with [NOTIFY].\n",
+                f"Checklist:\n{checklist}",
+            ]
+
+            # Add pending scheduled tasks
+            if self.scheduler:
+                pending = [t for t in self.scheduler.list_tasks() if t.status == "pending"]
+                if pending:
+                    task_lines = [
+                        f"  - {t.description} ({t.type}: {t.schedule})"
+                        for t in pending[:10]
+                    ]
+                    context_parts.append(
+                        "\nPending Scheduled Tasks:\n"
+                        + "\n".join(task_lines)
+                    )
+
+            # Add recent memory facts
+            if self.fact_store:
+                try:
+                    facts = await self.fact_store.get_relevant(limit=5)
+                    if facts:
+                        context_parts.append(
+                            "\nRecent Memory Facts:\n"
+                            + "\n".join(f"  - {f.key}: {f.value}" for f in facts)
+                        )
+                except Exception:
+                    pass
+
+            heartbeat_message = "\n".join(context_parts)
 
             # Use a dedicated heartbeat session
             if self._heartbeat_session is None:
@@ -123,6 +164,13 @@ class HeartbeatDaemon:
                     "action": response.content,
                 })
                 logger.info("heartbeat_action", action=response.content[:200])
+
+                # Check for [NOTIFY] prefix — send proactive notification
+                if "[NOTIFY]" in response.content and self.proactive:
+                    notify_content = response.content.replace("[NOTIFY]", "").strip()
+                    await self.proactive.send_to_all_known_users(
+                        f"📋 **Agent Update**: {notify_content}"
+                    )
 
             self._consecutive_failures = 0
 

@@ -6,6 +6,7 @@ integrated with stdlib logging for third-party library compatibility.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import sys
 from collections.abc import MutableMapping
@@ -110,10 +111,8 @@ def setup_logging(config: LoggingConfig) -> None:
     # with non-ASCII characters (emojis, CJK, etc.)
     stderr = sys.stderr
     if hasattr(stderr, "reconfigure"):
-        try:
+        with contextlib.suppress(Exception):
             stderr.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
 
     handler = logging.StreamHandler(stderr)
     handler.setFormatter(formatter)

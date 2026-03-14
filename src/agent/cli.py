@@ -1548,6 +1548,132 @@ def skills_create(
     console.print(f"  - {skill_path / 'main.py'}")
 
 
+@skills_app.command("staged")
+def skills_staged(
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+) -> None:
+    """List staged (pending approval) skills."""
+    cfg = _load_config(config)
+    staging_dir = Path(cfg.skills.builder.staging_dir)
+
+    if not staging_dir.is_dir():
+        console.print("[dim]No staged skills.[/dim]")
+        return
+
+    found = False
+    for entry in sorted(staging_dir.iterdir()):
+        if entry.is_dir() and not entry.name.startswith("."):
+            found = True
+            marker = entry / ".auto_generated"
+            desc = ""
+            if marker.is_file():
+                import json
+
+                try:
+                    data = json.loads(marker.read_text(encoding="utf-8"))
+                    desc = data.get("description", "")
+                except Exception:
+                    pass
+            console.print(f"  [bold]{entry.name}[/bold]  {desc}")
+
+    if not found:
+        console.print("[dim]No staged skills.[/dim]")
+
+
+@skills_app.command("approve")
+def skills_approve(
+    name: str = typer.Argument(help="Name of staged skill to approve"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+) -> None:
+    """Approve a staged skill and activate it."""
+    import shutil
+
+    cfg = _load_config(config)
+    staging_path = Path(cfg.skills.builder.staging_dir) / name
+    if not staging_path.is_dir():
+        console.print(f"[red]No staged skill: {name}[/red]")
+        raise typer.Exit(1)
+
+    target = Path(cfg.skills.directory) / name
+    if target.exists():
+        console.print(f"[red]Skill '{name}' already exists at {target}[/red]")
+        raise typer.Exit(1)
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(staging_path), str(target))
+    console.print(f"[green]Skill '{name}' approved and moved to {target}[/green]")
+
+
+@skills_app.command("reject")
+def skills_reject(
+    name: str = typer.Argument(help="Name of staged skill to reject"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+) -> None:
+    """Reject and delete a staged skill."""
+    import shutil
+
+    cfg = _load_config(config)
+    staging_path = Path(cfg.skills.builder.staging_dir) / name
+    if not staging_path.is_dir():
+        console.print(f"[red]No staged skill: {name}[/red]")
+        raise typer.Exit(1)
+
+    shutil.rmtree(staging_path)
+    console.print(f"[yellow]Staged skill '{name}' deleted.[/yellow]")
+
+
+# --- Teams subcommands ---
+
+
+teams_app = typer.Typer(help="Sub-agent team commands.")
+app.add_typer(teams_app, name="teams")
+
+
+@teams_app.command("list")
+def teams_list(
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+) -> None:
+    """List configured sub-agent teams."""
+    cfg = _load_config(config)
+
+    if not cfg.orchestration.teams:
+        console.print("[dim]No teams configured. Add teams in agent.yaml.[/dim]")
+        return
+
+    table = Table(title="Agent Teams")
+    table.add_column("Name", style="cyan")
+    table.add_column("Description")
+    table.add_column("Roles")
+
+    for team in cfg.orchestration.teams:
+        roles = ", ".join(r.name for r in team.roles)
+        table.add_row(team.name, team.description, roles)
+
+    console.print(table)
+
+
+@teams_app.command("info")
+def teams_info(
+    name: str = typer.Argument(help="Team name"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+) -> None:
+    """Show details about a sub-agent team."""
+    cfg = _load_config(config)
+
+    team = next((t for t in cfg.orchestration.teams if t.name == name), None)
+    if not team:
+        console.print(f"[red]Team '{name}' not found[/red]")
+        raise typer.Exit(1)
+
+    console.print(Panel(f"[bold]{team.name}[/bold]\n{team.description}", title="Team"))
+    for role in team.roles:
+        tools = ", ".join(role.allowed_tools) if role.allowed_tools else "all safe+moderate"
+        console.print(
+            f"  [cyan]{role.name}[/cyan]: {role.persona}\n"
+            f"    Tools: {tools} | Max iterations: {role.max_iterations}"
+        )
+
+
 # --- Memory subcommands ---
 
 

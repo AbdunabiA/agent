@@ -14,7 +14,7 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_SQL = """
 -- Facts table: structured key-value memory
@@ -143,8 +143,17 @@ class Database:
         except aiosqlite.OperationalError:
             current = 0
 
-        if current < SCHEMA_VERSION:
+        starting_version = current
+
+        if current < 1:
             await self._db.executescript(SCHEMA_SQL)
+            current = 1
+
+        if current < 2:
+            await self._migrate_v2()
+            current = 2
+
+        if starting_version < SCHEMA_VERSION:
             await self._db.execute(
                 "INSERT OR REPLACE INTO schema_version (version) VALUES (?)",
                 (SCHEMA_VERSION,),
@@ -152,9 +161,26 @@ class Database:
             await self._db.commit()
             logger.info(
                 "database_migrated",
-                from_version=current,
+                from_version=starting_version,
                 to_version=SCHEMA_VERSION,
             )
+
+    async def _migrate_v2(self) -> None:
+        """Migration v1 -> v2: Add user_id and next_run to scheduled_tasks."""
+        # Check existing columns
+        async with self._db.execute("PRAGMA table_info(scheduled_tasks)") as cursor:
+            columns = {row[1] for row in await cursor.fetchall()}
+
+        if "user_id" not in columns:
+            await self._db.execute(
+                "ALTER TABLE scheduled_tasks ADD COLUMN user_id TEXT"
+            )
+        if "next_run" not in columns:
+            await self._db.execute(
+                "ALTER TABLE scheduled_tasks ADD COLUMN next_run TEXT"
+            )
+        await self._db.commit()
+        logger.info("database_migrated_v2")
 
     async def close(self) -> None:
         """Close the database connection."""

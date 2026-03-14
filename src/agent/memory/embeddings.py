@@ -76,6 +76,18 @@ class EmbeddingModel:
         """
         return self.embed([text])[0]
 
+    async def warmup(self) -> None:
+        """Pre-load the model in a background thread.
+
+        Call during startup so the first ``embed()`` call doesn't block
+        the event loop with a synchronous ~6s model load.
+        """
+        if self._model is not None:
+            return
+        import asyncio
+
+        await asyncio.to_thread(self._load_model)
+
     @property
     def dimension(self) -> int:
         """Embedding vector dimension."""

@@ -65,7 +65,8 @@ def config_with_both(tmp_path: object) -> AgentConfig:
 class TestApplicationInitialize:
     """Test Application.initialize() wires components correctly."""
 
-    async def test_all_components_initialized(self, config: AgentConfig) -> None:
+    @patch("agent.config.has_litellm_keys", return_value=True)
+    async def test_all_components_initialized(self, _mock_keys, config: AgentConfig) -> None:
         """All core components should be non-None after initialize."""
         app = Application(config)
         await app.initialize()

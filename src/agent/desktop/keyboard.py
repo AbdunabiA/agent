@@ -10,6 +10,7 @@ import asyncio
 
 import structlog
 
+from agent.desktop.errors import desktop_op
 from agent.desktop.platform_utils import OSType, get_hotkey_modifier, get_platform
 
 logger = structlog.get_logger(__name__)
@@ -43,16 +44,18 @@ def _build_shortcut_map() -> dict[str, list[str]]:
     }
 
 
-def _require_pyautogui() -> None:
-    """Raise ImportError if pyautogui is not available."""
+def _require_keyboard() -> None:
+    """Raise ImportError if no keyboard tool is available."""
     info = get_platform()
-    if not info.has_pyautogui:
+    if not info.has_pyautogui and not info.has_wtype:
         raise ImportError(
-            "pyautogui is required for keyboard control. "
-            "Install with: pip install 'agent-ai[desktop]'"
+            "No keyboard tool available. "
+            "Install pyautogui (pip install 'agent-ai[desktop]') "
+            "or wtype (Wayland)."
         )
 
 
+@desktop_op("keyboard_type")
 async def type_text(text: str, interval: float = 0.02) -> str:
     """Type text as if from keyboard.
 
@@ -66,41 +69,52 @@ async def type_text(text: str, interval: float = 0.02) -> str:
     Returns:
         Description of what was typed.
     """
-    _require_pyautogui()
+    _require_keyboard()
+    info = get_platform()
 
-    loop = asyncio.get_event_loop()
-
-    # Check if text is ASCII-safe
-    try:
-        text.encode("ascii")
-        is_ascii = True
-    except UnicodeEncodeError:
-        is_ascii = False
-
-    if is_ascii:
-
-        def _type_ascii() -> None:
-            import pyautogui
-
-            pyautogui.typewrite(text, interval=interval)
-
-        await loop.run_in_executor(None, _type_ascii)
+    # Use wtype on Wayland if available
+    if info.display_server == "wayland" and info.has_wtype and not info.has_pyautogui:
+        proc = await asyncio.create_subprocess_exec(
+            "wtype", text,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
     else:
-        # Unicode: copy to clipboard and paste
-        def _type_unicode() -> None:
-            import pyautogui
-            import pyperclip
+        loop = asyncio.get_event_loop()
 
-            pyperclip.copy(text)
-            mod = get_hotkey_modifier()
-            pyautogui.hotkey(mod, "v")
+        # Check if text is ASCII-safe
+        try:
+            text.encode("ascii")
+            is_ascii = True
+        except UnicodeEncodeError:
+            is_ascii = False
 
-        await loop.run_in_executor(None, _type_unicode)
+        if is_ascii:
+
+            def _type_ascii() -> None:
+                import pyautogui
+
+                pyautogui.typewrite(text, interval=interval)
+
+            await loop.run_in_executor(None, _type_ascii)
+        else:
+            # Unicode: copy to clipboard and paste
+            def _type_unicode() -> None:
+                import pyautogui
+                import pyperclip
+
+                pyperclip.copy(text)
+                mod = get_hotkey_modifier()
+                pyautogui.hotkey(mod, "v")
+
+            await loop.run_in_executor(None, _type_unicode)
 
     logger.info("keyboard_typed", length=len(text))
     return f"Typed {len(text)} characters"
 
 
+@desktop_op("keyboard_press")
 async def press_key(key: str) -> str:
     """Press a single key.
 
@@ -112,21 +126,31 @@ async def press_key(key: str) -> str:
     Returns:
         Description of the key press.
     """
-    _require_pyautogui()
+    _require_keyboard()
+    info = get_platform()
 
-    loop = asyncio.get_event_loop()
+    if info.display_server == "wayland" and info.has_wtype and not info.has_pyautogui:
+        proc = await asyncio.create_subprocess_exec(
+            "wtype", "-k", key,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+    else:
+        loop = asyncio.get_event_loop()
 
-    def _press() -> None:
-        import pyautogui
+        def _press() -> None:
+            import pyautogui
 
-        pyautogui.press(key)
+            pyautogui.press(key)
 
-    await loop.run_in_executor(None, _press)
+        await loop.run_in_executor(None, _press)
 
     logger.info("key_pressed", key=key)
     return f"Pressed {key}"
 
 
+@desktop_op("keyboard_hotkey")
 async def hotkey(*keys: str) -> str:
     """Press a key combination.
 
@@ -146,7 +170,8 @@ async def hotkey(*keys: str) -> str:
     Returns:
         Description of the key combination.
     """
-    _require_pyautogui()
+    _require_keyboard()
+    info = get_platform()
 
     resolved_keys = keys
 
@@ -157,20 +182,44 @@ async def hotkey(*keys: str) -> str:
         if shortcut_name in shortcut_map:
             resolved_keys = tuple(shortcut_map[shortcut_name])
 
-    loop = asyncio.get_event_loop()
+    if info.display_server == "wayland" and info.has_wtype and not info.has_pyautogui:
+        # wtype -M holds modifier, -m releases; -k presses a key
+        for key in resolved_keys[:-1]:
+            proc = await asyncio.create_subprocess_exec(
+                "wtype", "-M", key,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+        proc = await asyncio.create_subprocess_exec(
+            "wtype", "-k", resolved_keys[-1],
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        for key in reversed(resolved_keys[:-1]):
+            proc = await asyncio.create_subprocess_exec(
+                "wtype", "-m", key,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+    else:
+        loop = asyncio.get_event_loop()
 
-    def _hotkey() -> None:
-        import pyautogui
+        def _hotkey() -> None:
+            import pyautogui
 
-        pyautogui.hotkey(*resolved_keys)
+            pyautogui.hotkey(*resolved_keys)
 
-    await loop.run_in_executor(None, _hotkey)
+        await loop.run_in_executor(None, _hotkey)
 
     combo = "+".join(resolved_keys)
     logger.info("hotkey_pressed", combo=combo)
     return f"Pressed {combo}"
 
 
+@desktop_op("keyboard_hold")
 async def hold_key(key: str, duration: float = 0.5) -> str:
     """Hold a key for a duration.
 
@@ -181,20 +230,36 @@ async def hold_key(key: str, duration: float = 0.5) -> str:
     Returns:
         Description of the action.
     """
-    _require_pyautogui()
+    _require_keyboard()
+    info = get_platform()
 
-    import time
+    if info.display_server == "wayland" and info.has_wtype and not info.has_pyautogui:
+        proc = await asyncio.create_subprocess_exec(
+            "wtype", "-M", key,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        await asyncio.sleep(duration)
+        proc = await asyncio.create_subprocess_exec(
+            "wtype", "-m", key,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+    else:
+        import time
 
-    loop = asyncio.get_event_loop()
+        loop = asyncio.get_event_loop()
 
-    def _hold() -> None:
-        import pyautogui
+        def _hold() -> None:
+            import pyautogui
 
-        pyautogui.keyDown(key)
-        time.sleep(duration)
-        pyautogui.keyUp(key)
+            pyautogui.keyDown(key)
+            time.sleep(duration)
+            pyautogui.keyUp(key)
 
-    await loop.run_in_executor(None, _hold)
+        await loop.run_in_executor(None, _hold)
 
     logger.info("key_held", key=key, duration=duration)
     return f"Held {key} for {duration}s"

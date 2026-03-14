@@ -38,6 +38,23 @@ class Events:
     VOICE_SYNTHESIZED = "voice.synthesized"
     FILE_SEND = "file.send"
 
+    # Self-building skills
+    SKILL_BUILD_REQUESTED = "skill.build.requested"
+    SKILL_BUILD_COMPLETED = "skill.build.completed"
+
+    # Sub-agent orchestration
+    SUBAGENT_SPAWNED = "subagent.spawned"
+    SUBAGENT_STARTED = "subagent.started"
+    SUBAGENT_PROGRESS = "subagent.progress"
+    SUBAGENT_COMPLETED = "subagent.completed"
+    SUBAGENT_FAILED = "subagent.failed"
+    SUBAGENT_CANCELLED = "subagent.cancelled"
+
+    # Proactive autonomy
+    PROACTIVE_MESSAGE = "proactive.message"
+    SCHEDULED_TASK_DUE = "scheduled.task.due"
+    MONITORING_ALERT = "monitoring.alert"
+
 
 class EventBus:
     """Async event bus for internal component communication.
