@@ -109,62 +109,110 @@ _DEFAULT_SHORTCUTS = [
 
 
 def _tool_explanation(tool_name: str, arguments: dict[str, Any]) -> str:
-    """Build a human-readable approval message using the AI's own description.
+    """Build a human-readable approval message explaining the AI's intent.
 
-    The AI fills a ``description`` field in tool_input explaining what it wants
-    to do.  This function surfaces that intent alongside the concrete action and
-    a short note on what capability is being granted.
+    Uses the AI's ``description`` field (available on Bash/shell tools) and
+    constructs clear, natural-language explanations for all tool types so the
+    user understands *what* will happen and *why* it needs approval.
     """
-    # The AI's own explanation of what it wants to do (Claude fills this in)
-    ai_intent = arguments.get("description", "")
+    # The AI's own explanation (Claude fills 'description' for Bash-like tools)
+    ai_desc = arguments.get("description", "")
 
-    # What capability this tool grants if approved
-    capability: dict[str, str] = {
-        "Bash": "run any shell command on your machine",
-        "Write": "create or overwrite any file on disk",
-        "Edit": "modify contents of any file on disk",
-        "NotebookEdit": "modify Jupyter notebook cells",
-        "shell_exec": "run any shell command on your machine",
-        "file_write": "create or overwrite any file on disk",
-        "file_delete": "permanently delete a file from disk",
-        "python_exec": "execute arbitrary Python code with full system access",
-        "http_request": "send network requests to external servers",
-        "browser_navigate": "control a browser and visit websites",
-        "desktop_click": "perform mouse clicks on your desktop",
-        "desktop_type": "send keystrokes on your keyboard",
-    }
-    granted = capability.get(tool_name, f"use the '{tool_name}' tool")
+    # --- Build a natural-language "what & why" block per tool type ----------
 
-    # Concrete action summary
-    if tool_name == "Bash":
-        action = arguments.get("command", "unknown command")
+    if tool_name in ("Bash", "shell_exec"):
+        cmd = arguments.get("command", "unknown command")
+        if ai_desc:
+            intent = f"{ai_desc}"
+        else:
+            intent = "Run a shell command"
+        detail = f"Command:\n<code>{cmd}</code>"
+        risk = "This will execute a shell command on your machine."
+
     elif tool_name in ("Write", "file_write"):
         path = arguments.get("file_path") or arguments.get("path", "?")
         size = len(arguments.get("content", ""))
-        action = f"write {size} chars to {path}"
+        intent = ai_desc or f"Create or overwrite a file"
+        detail = f"File: <code>{path}</code> ({size} characters)"
+        risk = "This will write to your filesystem — the file will be created or overwritten."
+
     elif tool_name == "Edit":
         path = arguments.get("file_path", "?")
-        action = f"edit {path}"
+        old = arguments.get("old_string", "")
+        new = arguments.get("new_string", "")
+        intent = ai_desc or "Modify an existing file"
+        # Show a compact diff preview
+        old_preview = (old[:120] + "…") if len(old) > 120 else old
+        new_preview = (new[:120] + "…") if len(new) > 120 else new
+        detail = (
+            f"File: <code>{path}</code>\n"
+            f"Replace:\n<code>{old_preview}</code>\n"
+            f"With:\n<code>{new_preview}</code>"
+        )
+        risk = "This will modify the contents of a file on disk."
+
     elif tool_name == "file_delete":
-        action = f"delete {arguments.get('path', '?')}"
+        path = arguments.get("path", "?")
+        intent = ai_desc or f"Delete a file"
+        detail = f"File: <code>{path}</code>"
+        risk = "This will permanently delete a file from disk."
+
     elif tool_name == "python_exec":
         code = arguments.get("code", "")
-        action = code[:300] + ("…" if len(code) > 300 else "")
+        preview = (code[:400] + "…") if len(code) > 400 else code
+        intent = ai_desc or "Execute Python code"
+        detail = f"Code:\n<code>{preview}</code>"
+        risk = "This runs Python with full system access."
+
     elif tool_name == "http_request":
-        action = f"{arguments.get('method', 'GET')} {arguments.get('url', '?')}"
-    elif tool_name in ("shell_exec",):
-        action = arguments.get("command", "unknown command")
+        method = arguments.get("method", "GET")
+        url = arguments.get("url", "?")
+        intent = ai_desc or f"Make an HTTP request"
+        detail = f"{method} {url}"
+        risk = "This sends a network request to an external server."
+
+    elif tool_name in ("browser_navigate", "browser_action"):
+        url = arguments.get("url", arguments.get("action", "?"))
+        intent = ai_desc or "Control the browser"
+        detail = f"URL/Action: {url}"
+        risk = "This will open or interact with a website in a browser."
+
+    elif tool_name in ("desktop_click", "desktop_type"):
+        intent = ai_desc or "Control your desktop"
+        if tool_name == "desktop_click":
+            x, y = arguments.get("x", "?"), arguments.get("y", "?")
+            detail = f"Click at ({x}, {y})"
+        else:
+            text = arguments.get("text", "?")
+            detail = f"Type: {text[:100]}"
+        risk = "This will perform actions on your desktop (mouse/keyboard)."
+
+    elif tool_name == "NotebookEdit":
+        path = arguments.get("notebook_path", "?")
+        intent = ai_desc or "Edit a Jupyter notebook"
+        detail = f"Notebook: <code>{path}</code>"
+        risk = "This will modify a Jupyter notebook file."
+
     else:
-        parts = [f"{k}={str(v)[:80]}" for k, v in list(arguments.items())[:3]
-                 if k != "description"]
-        action = ", ".join(parts) if parts else str(arguments)[:200]
+        # Generic fallback for unknown tools
+        intent = ai_desc or f"Use the {tool_name} tool"
+        parts = [
+            f"{k}={str(v)[:80]}"
+            for k, v in list(arguments.items())[:4]
+            if k != "description"
+        ]
+        detail = ", ".join(parts) if parts else str(arguments)[:200]
+        risk = f"This grants access to the '{tool_name}' tool."
 
-    lines = [f"\U0001f916 The AI wants to: {ai_intent}" if ai_intent else ""]
-    lines.append(f"\U0001f527 Tool: {tool_name}")
-    lines.append(f"\U0001f4bb Action: {action}")
-    lines.append(f"\U0001f513 This grants access to: {granted}")
+    lines = [
+        f"<b>AI wants to:</b> {intent}",
+        "",
+        detail,
+        "",
+        f"<i>{risk}</i>",
+    ]
 
-    return "\n".join(line for line in lines if line)
+    return "\n".join(lines)
 
 
 class TelegramChannel(BaseChannel):
@@ -205,6 +253,7 @@ class TelegramChannel(BaseChannel):
         self._dispatcher: Any = None
         self._router: Any = None
         self._approval_futures: dict[str, asyncio.Future[bool]] = {}
+        self._had_approvals: bool = False
 
         if AIOGRAM_AVAILABLE and config.token:
             self._bot = Bot(token=config.token)
@@ -1728,6 +1777,7 @@ class TelegramChannel(BaseChannel):
             accumulated = ""
             sdk_session_id = session.metadata.get("sdk_session_id")
             last_status_update = 0.0
+            self._had_approvals = False
             import time as _time
 
             # Permission callback: ask user via inline keyboard for dangerous tools
@@ -1893,9 +1943,9 @@ class TelegramChannel(BaseChannel):
     ) -> None:
         """Replace the placeholder status message with the final response.
 
-        For short responses, edits the status message in-place.
-        For long responses, deletes the status message and sends the full
-        response via send_streamed_response (which handles splitting).
+        If approval prompts were shown during processing, the status message
+        is now far up in the chat.  In that case we delete it and send a fresh
+        message at the bottom so the user sees the answer immediately.
 
         Args:
             status_message: The placeholder message to replace (may be None).
@@ -1915,9 +1965,17 @@ class TelegramChannel(BaseChannel):
             return
 
         chunks = self._split_message(response_text)
+        chat_id = int(channel_user_id)
+
+        # If approvals happened, the status message is buried under approval
+        # messages.  Delete it and send a fresh message at the bottom.
+        if status_message is not None and self._had_approvals:
+            with contextlib.suppress(Exception):
+                await status_message.delete()
+            status_message = None  # fall through to "no status_message" path
 
         if status_message is not None:
-            # Edit the first chunk into the status message
+            # Edit the first chunk into the status message (still at bottom)
             try:
                 await status_message.edit_text(
                     chunks[0], parse_mode="Markdown",
@@ -1940,7 +1998,6 @@ class TelegramChannel(BaseChannel):
                     )
 
             # Send remaining chunks as new messages
-            chat_id = int(channel_user_id)
             for chunk in chunks[1:]:
                 try:
                     await self._bot.send_message(
@@ -2274,7 +2331,7 @@ class TelegramChannel(BaseChannel):
         # it needs approval, plus a clear summary of the action.
         explanation = _tool_explanation(tool_name, arguments)
         text = (
-            f"\u26a0\ufe0f Permission Required\n\n"
+            f"\u26a0\ufe0f <b>Permission Required</b>\n\n"
             f"{explanation}\n\n"
             f"Do you approve this action?"
         )
@@ -2305,9 +2362,13 @@ class TelegramChannel(BaseChannel):
         future: asyncio.Future[bool] = loop.create_future()
         self._approval_futures[request_id] = future
 
+        # Track that approvals happened so response goes to bottom of chat
+        self._had_approvals = True
+
         try:
             await self._bot.send_message(
-                chat_id=chat_id, text=text, reply_markup=keyboard
+                chat_id=chat_id, text=text, reply_markup=keyboard,
+                parse_mode="HTML",
             )
 
             result = await asyncio.wait_for(future, timeout=_APPROVAL_TIMEOUT)
