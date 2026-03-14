@@ -275,7 +275,9 @@ class TestFileWriteIntegration:
             Path(original).write_text("original content")
 
             patch_target = "agent.tools.builtins.filesystem.get_rollback_manager"
-            with patch(patch_target, return_value=manager):
+            fs_patch = "agent.tools.builtins.filesystem._get_fs_config"
+            with patch(patch_target, return_value=manager), \
+                 patch(fs_patch, return_value=("/", tmpdir, [])):
                 from agent.tools.builtins.filesystem import file_write
 
                 await file_write(path=original, content="new content")
@@ -296,7 +298,9 @@ class TestFileWriteIntegration:
             Path(original).write_text("original")
 
             patch_target = "agent.tools.builtins.filesystem.get_rollback_manager"
-            with patch(patch_target, return_value=manager):
+            fs_patch = "agent.tools.builtins.filesystem._get_fs_config"
+            with patch(patch_target, return_value=manager), \
+                 patch(fs_patch, return_value=("/", tmpdir, [])):
                 from agent.tools.builtins.filesystem import file_write
 
                 await file_write(path=original, content=" appended", append=True)
@@ -311,7 +315,9 @@ class TestFileWriteIntegration:
             new_file = os.path.join(tmpdir, "new.txt")
 
             patch_target = "agent.tools.builtins.filesystem.get_rollback_manager"
-            with patch(patch_target, return_value=manager):
+            fs_patch = "agent.tools.builtins.filesystem._get_fs_config"
+            with patch(patch_target, return_value=manager), \
+                 patch(fs_patch, return_value=("/", tmpdir, [])):
                 from agent.tools.builtins.filesystem import file_write
 
                 await file_write(path=new_file, content="new content")

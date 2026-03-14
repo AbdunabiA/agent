@@ -160,9 +160,14 @@ class TestHandleText:
         channel: TelegramChannel,
     ) -> None:
         msg = _make_tg_message(text="Hi")
+        # msg.answer returns a status message mock that supports edit_text
+        status_msg = AsyncMock()
+        msg.answer.return_value = status_msg
         await channel._handle_text(msg)
 
-        channel._bot.send_message.assert_called()
+        # Status message should be sent, then edited with the response
+        msg.answer.assert_called()
+        status_msg.edit_text.assert_called()
 
     async def test_emits_incoming_event(
         self,
@@ -204,9 +209,14 @@ class TestHandleText:
     ) -> None:
         mock_agent_loop.process_message.side_effect = RuntimeError("LLM down")
         msg = _make_tg_message(text="boom")
+        status_msg = AsyncMock()
+        msg.answer.return_value = status_msg
         await channel._handle_text(msg)
 
-        msg.answer.assert_called_with("Sorry, something went wrong processing your message.")
+        # Error should be shown by editing the status message
+        status_msg.edit_text.assert_called_with(
+            "Sorry, something went wrong processing your message."
+        )
 
     async def test_blocks_when_paused(
         self,

@@ -212,11 +212,13 @@ async def _handle_sdk_message(
         session_id=getattr(session, "sdk_session_id", None),
     ):
         if event.type == "text":
-            accumulated_text += event.content
-            await _safe_send(websocket, {
-                "type": "response.chunk",
-                "content": event.content,
-            })
+            # Only accumulate main agent text, not subagent output
+            if not (event.data and event.data.get("subagent")):
+                accumulated_text += event.content
+                await _safe_send(websocket, {
+                    "type": "response.chunk",
+                    "content": event.content,
+                })
         elif event.type == "tool_use":
             await _safe_send(websocket, {
                 "type": "tool.execute",

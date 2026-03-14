@@ -37,6 +37,8 @@ class Events:
     VOICE_TRANSCRIBED = "voice.transcribed"
     VOICE_SYNTHESIZED = "voice.synthesized"
     FILE_SEND = "file.send"
+    CHANNEL_POST = "channel.post"
+    CHANNEL_SEND_MESSAGE = "channel.send_message"
 
     # Self-building skills
     SKILL_BUILD_REQUESTED = "skill.build.requested"

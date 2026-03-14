@@ -80,6 +80,9 @@ app.add_typer(workspace_app, name="workspace")
 voice_app = typer.Typer(help="Voice pipeline commands.")
 app.add_typer(voice_app, name="voice")
 
+daemon_app = typer.Typer(help="Daemon service management (launchd/systemd).")
+app.add_typer(daemon_app, name="daemon")
+
 
 def _load_config(config_path: str | None = None) -> AgentConfig:
     """Load config with error handling."""
@@ -574,8 +577,10 @@ async def _chat_loop_sdk(cfg: AgentConfig) -> None:
                 on_question=on_question,
             ):
                 if event.type == "text":
-                    console.print(event.content, end="")
-                    result_text += event.content
+                    is_subagent = event.data and event.data.get("subagent")
+                    if not is_subagent:
+                        console.print(event.content, end="")
+                        result_text += event.content
                 elif event.type == "thinking":
                     console.print(f"[dim italic]{event.content}[/dim italic]", end="")
                 elif event.type == "tool_use":
@@ -2088,5 +2093,78 @@ def voice_config_cmd(
     table.add_row("Output Format", vc.tts.output_format)
     table.add_row("Auto Voice Reply", str(vc.auto_voice_reply))
     table.add_row("Voice Reply Channels", ", ".join(vc.voice_reply_channels))
+
+    console.print(table)
+
+
+# -----------------------------------------------------------------------
+# Daemon commands
+# -----------------------------------------------------------------------
+
+
+@daemon_app.command("install")
+def daemon_install_cmd() -> None:
+    """Install the agent as an OS service (launchd on macOS, systemd on Linux)."""
+    from agent.core.daemon import daemon_install
+
+    result = daemon_install()
+    console.print(result)
+
+
+@daemon_app.command("uninstall")
+def daemon_uninstall_cmd() -> None:
+    """Uninstall the agent OS service."""
+    from agent.core.daemon import daemon_uninstall
+
+    result = daemon_uninstall()
+    console.print(result)
+
+
+@daemon_app.command("start")
+def daemon_start_cmd() -> None:
+    """Start the agent daemon service."""
+    from agent.core.daemon import daemon_start
+
+    result = daemon_start()
+    console.print(result)
+
+
+@daemon_app.command("stop")
+def daemon_stop_cmd() -> None:
+    """Stop the agent daemon service."""
+    from agent.core.daemon import daemon_stop
+
+    result = daemon_stop()
+    console.print(result)
+
+
+@daemon_app.command("restart")
+def daemon_restart_cmd() -> None:
+    """Restart the agent daemon service."""
+    from agent.core.daemon import daemon_restart
+
+    result = daemon_restart()
+    console.print(result)
+
+
+@daemon_app.command("status")
+def daemon_status_cmd() -> None:
+    """Show the current daemon service status."""
+    from agent.core.daemon import daemon_status
+
+    status = daemon_status()
+
+    table = Table(title="Daemon Status")
+    table.add_column("Property", style="cyan")
+    table.add_column("Value")
+
+    table.add_row("Installed", "[green]Yes[/green]" if status.installed else "[red]No[/red]")
+    table.add_row("Running", "[green]Yes[/green]" if status.running else "[red]No[/red]")
+    if status.pid:
+        table.add_row("PID", str(status.pid))
+    if status.service_path:
+        table.add_row("Service File", status.service_path)
+    if status.log_path:
+        table.add_row("Log Directory", status.log_path)
 
     console.print(table)

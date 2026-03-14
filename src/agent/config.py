@@ -442,7 +442,7 @@ def _apply_env_api_keys(config: AgentConfig) -> None:
                 setattr(sub, field_name, env_value)
 
     voice_auto_env = os.environ.get("VOICE_AUTO_REPLY")
-    if voice_auto_env is not None and config.voice.auto_voice_reply is True:
+    if voice_auto_env is not None:
         config.voice.auto_voice_reply = voice_auto_env.lower() in ("1", "true", "yes")
 
 

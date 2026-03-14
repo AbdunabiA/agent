@@ -21,6 +21,7 @@ from agent.tools.builtins import (  # noqa: F401, E402
     shell,
     skill_builder,
     system,
+    telegram_post,
     web_search,
 )
 

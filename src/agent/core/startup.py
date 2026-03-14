@@ -234,7 +234,7 @@ class Application:
         try:
             from agent.desktop.platform_utils import get_capabilities_summary
             platform_capabilities = get_capabilities_summary()
-        except Exception:
+        except BaseException:
             pass
 
         self.agent_loop = AgentLoop(
@@ -330,6 +330,14 @@ class Application:
         # Wire event bus into send_file tool so the LLM can send files
         from agent.tools.builtins.send_file import set_file_send_bus
         set_file_send_bus(self.event_bus)
+
+        # Wire event bus + scheduler into telegram posting tools
+        from agent.tools.builtins.telegram_post import (
+            set_telegram_post_bus,
+            set_telegram_post_scheduler,
+        )
+        set_telegram_post_bus(self.event_bus)
+        set_telegram_post_scheduler(self.scheduler)
 
         # 7.5. Skill manager
         self.skill_manager = SkillManager(
@@ -633,6 +641,27 @@ class Application:
                     user_id=user_id,
                 )
                 return
+
+            # Check if this is a scheduled post (from schedule_post tool)
+            if description.startswith("[scheduled_post:"):
+                import json as _json
+
+                try:
+                    end = description.index("]", len("[scheduled_post:"))
+                    meta = _json.loads(description[len("[scheduled_post:"):end])
+                    post_text = description[end + 2:]  # skip "] "
+                    post_data = {
+                        "chat_id": meta.get("chat_id", ""),
+                        "text": post_text,
+                        "photo_path": meta.get("photo_path", ""),
+                        "pin": meta.get("pin", False),
+                        "parse_mode": meta.get("parse_mode", "Markdown"),
+                        "channel": channel or "telegram",
+                    }
+                    await self.event_bus.emit(Events.CHANNEL_POST, post_data)
+                    return
+                except (ValueError, _json.JSONDecodeError):
+                    pass  # Fall through to normal reminder delivery
 
             reminder_text = f"⏰ **Reminder:** {description}"
             await target_channel.send_message(

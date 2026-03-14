@@ -6,7 +6,9 @@ using local embeddings (all-MiniLM-L6-v2).
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any
 from uuid import uuid4
 
@@ -166,7 +168,7 @@ class VectorStore:
         }
         if metadata:
             add_kwargs["metadatas"] = [metadata]
-        self._collection.add(**add_kwargs)
+        await asyncio.to_thread(self._collection.add, **add_kwargs)
         logger.debug("vector_added", doc_id=doc_id)
         return doc_id
 
@@ -198,7 +200,7 @@ class VectorStore:
         }
         if metadatas:
             add_kwargs["metadatas"] = metadatas
-        self._collection.add(**add_kwargs)
+        await asyncio.to_thread(self._collection.add, **add_kwargs)
         logger.debug("vector_batch_added", count=len(texts))
         return doc_ids
 
@@ -221,7 +223,7 @@ class VectorStore:
         self._ensure_initialized()
 
         # ChromaDB raises if n_results > collection count
-        count = self._collection.count()
+        count = await asyncio.to_thread(self._collection.count)
         if count == 0:
             return []
         n_results = min(limit, count)
@@ -233,7 +235,7 @@ class VectorStore:
         if where:
             kwargs["where"] = where
 
-        results = self._collection.query(**kwargs)
+        results = await asyncio.to_thread(self._collection.query, **kwargs)
 
         vector_results: list[VectorResult] = []
         if results and results["ids"] and results["ids"][0]:
@@ -256,7 +258,7 @@ class VectorStore:
             doc_id: The document ID to delete.
         """
         self._ensure_initialized()
-        self._collection.delete(ids=[doc_id])
+        await asyncio.to_thread(self._collection.delete, ids=[doc_id])
         logger.debug("vector_deleted", doc_id=doc_id)
 
     async def delete_by_session(self, session_id: str) -> None:
@@ -266,7 +268,9 @@ class VectorStore:
             session_id: The session ID to filter by.
         """
         self._ensure_initialized()
-        self._collection.delete(where={"session_id": session_id})
+        await asyncio.to_thread(
+            self._collection.delete, where={"session_id": session_id}
+        )
         logger.debug("vectors_deleted_by_session", session_id=session_id)
 
     async def count(self) -> int:
@@ -276,4 +280,4 @@ class VectorStore:
             Document count.
         """
         self._ensure_initialized()
-        return self._collection.count()
+        return await asyncio.to_thread(self._collection.count)

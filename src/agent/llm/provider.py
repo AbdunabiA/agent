@@ -265,6 +265,11 @@ class LLMProvider:
                         try:
                             args = json.loads(args)
                         except (json.JSONDecodeError, TypeError):
+                            logger.warning(
+                                "tool_call_args_parse_failed",
+                                tool=tc_data["name"],
+                                raw_args=args[:200] if isinstance(args, str) else str(args)[:200],
+                            )
                             args = {}
                     tool_calls.append(
                         ToolCall(
@@ -344,10 +349,9 @@ class LLMProvider:
             Parsed LLMResponse.
         """
         if not response.choices:
-            return LLMResponse(
-                content="[No response from model]",
-                model=model,
-                usage=TokenUsage(0, 0, 0),
+            logger.warning("llm_empty_choices", model=model)
+            raise ValueError(
+                f"Model {model} returned no choices — possibly rate-limited or overloaded"
             )
 
         choice = response.choices[0]
@@ -363,6 +367,11 @@ class LLMProvider:
                     try:
                         args = json.loads(args)
                     except (json.JSONDecodeError, TypeError):
+                        logger.warning(
+                            "tool_call_args_parse_failed",
+                            tool=tc.function.name,
+                            raw_args=args[:200],
+                        )
                         args = {}
                 elif not isinstance(args, dict):
                     args = {}

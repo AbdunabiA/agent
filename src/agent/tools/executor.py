@@ -14,7 +14,7 @@ import structlog
 from agent.config import ToolsConfig
 from agent.core.audit import AuditLog
 from agent.core.events import EventBus
-from agent.core.guardrails import Guardrails
+from agent.core.guardrails import GuardrailResult, Guardrails
 from agent.core.permissions import PermissionManager
 from agent.core.session import ToolCall
 from agent.tools.registry import (
@@ -322,7 +322,7 @@ class ToolExecutor:
                 f"Tool '{tool_def.name}' timed out after {timeout}s"
             ) from e
 
-    def _check_guardrails(self, tool_call: ToolCall) -> object:
+    def _check_guardrails(self, tool_call: ToolCall) -> GuardrailResult:
         """Apply guardrail checks based on tool type.
 
         Args:

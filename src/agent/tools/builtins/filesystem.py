@@ -96,7 +96,10 @@ def _validate_write_path(path: str) -> Path:
     _check_deny_paths(resolved, deny_paths)
 
     # Block system-critical files even if inside write_root
-    system_files = {"/etc/passwd", "/etc/shadow", "/etc/sudoers"}
+    # Resolve the system paths too so symlinks are handled (macOS: /etc → /private/etc)
+    system_files = {
+        str(Path(p).resolve()) for p in ("/etc/passwd", "/etc/shadow", "/etc/sudoers")
+    }
     if str(resolved) in system_files:
         raise ToolPermissionError(f"Access denied: {resolved} is a protected system file")
 

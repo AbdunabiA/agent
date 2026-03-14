@@ -91,12 +91,15 @@ def detect_platform() -> PlatformInfo:
         display_server = "win32"
 
     # Check pyautogui availability
+    # Catch BaseException because pyautogui's dependencies may raise
+    # AssertionError (pyobjc missing), RuntimeError (objc reload),
+    # or SystemExit (mouseinfo/tkinter missing on Linux).
     has_pyautogui = False
     try:
         import pyautogui  # noqa: F401
 
         has_pyautogui = True
-    except ImportError:
+    except BaseException:
         pass
 
     # Check platform-specific window management tools
@@ -116,7 +119,7 @@ def detect_platform() -> PlatformInfo:
         import pygetwindow  # noqa: F401
 
         has_pygetwindow = True
-    except ImportError:
+    except BaseException:
         pass
 
     # Accessibility APIs
@@ -126,7 +129,7 @@ def detect_platform() -> PlatformInfo:
             import uiautomation  # noqa: F401
 
             has_uiautomation = True
-        except ImportError:
+        except BaseException:
             pass
 
     has_pyatspi = False
@@ -135,7 +138,7 @@ def detect_platform() -> PlatformInfo:
             import pyatspi  # noqa: F401
 
             has_pyatspi = True
-        except ImportError:
+        except BaseException:
             pass
 
     # Screen resolution

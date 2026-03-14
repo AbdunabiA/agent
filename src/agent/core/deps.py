@@ -40,7 +40,7 @@ def check_missing() -> list[str]:
     for import_name, pip_name in OPTIONAL_DEPS.items():
         try:
             importlib.import_module(import_name)
-        except ImportError:
+        except BaseException:
             missing.append(pip_name)
     return missing
 

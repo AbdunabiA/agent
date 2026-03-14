@@ -90,7 +90,9 @@ class TestFileWrite:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             filepath = os.path.join(tmpdir, "test.txt")
-            result = await file_write(path=filepath, content="hello")
+            with patch("agent.tools.builtins.filesystem._get_fs_config",
+                        return_value=("/", tmpdir, [])):
+                result = await file_write(path=filepath, content="hello")
             assert "written" in result.lower() or "Written" in result
             assert Path(filepath).read_text() == "hello"  # noqa: ASYNC240
 
@@ -99,7 +101,9 @@ class TestFileWrite:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             filepath = os.path.join(tmpdir, "sub", "dir", "test.txt")
-            await file_write(path=filepath, content="nested")
+            with patch("agent.tools.builtins.filesystem._get_fs_config",
+                        return_value=("/", tmpdir, [])):
+                await file_write(path=filepath, content="nested")
             assert Path(filepath).exists()  # noqa: ASYNC240
             assert Path(filepath).read_text() == "nested"  # noqa: ASYNC240
 
@@ -109,7 +113,9 @@ class TestFileWrite:
         with tempfile.TemporaryDirectory() as tmpdir:
             filepath = os.path.join(tmpdir, "append.txt")
             Path(filepath).write_text("first")  # noqa: ASYNC240
-            await file_write(path=filepath, content=" second", append=True)
+            with patch("agent.tools.builtins.filesystem._get_fs_config",
+                        return_value=("/", tmpdir, [])):
+                await file_write(path=filepath, content=" second", append=True)
             assert Path(filepath).read_text() == "first second"  # noqa: ASYNC240
 
 

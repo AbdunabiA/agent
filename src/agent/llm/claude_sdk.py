@@ -366,22 +366,32 @@ class ClaudeSDKService:
         """
         # Try with resume first; on any error retry once without resume,
         # since session corruption or stale state can cause various failures.
-        async for event in self._run_task_impl(
-            prompt,
-            task_id=task_id,
-            session_id=session_id,
-            working_dir=working_dir,
-            on_permission=on_permission,
-            on_question=on_question,
-        ):
-            if event.type == "error" and session_id is not None:
-                # Resume failed — retry with fresh session
-                logger.warning(
-                    "sdk_resume_failed_retrying",
-                    task_id=task_id,
-                    session_id=session_id[:16] + "...",
-                    error=event.content[:120] if event.content else None,
-                )
+        # Buffer events so we don't yield text from a failed attempt that
+        # would get duplicated when the retry also yields text.
+        if session_id is not None:
+            buffered: list[SDKStreamEvent] = []
+            needs_retry = False
+            async for event in self._run_task_impl(
+                prompt,
+                task_id=task_id,
+                session_id=session_id,
+                working_dir=working_dir,
+                on_permission=on_permission,
+                on_question=on_question,
+            ):
+                if event.type == "error":
+                    logger.warning(
+                        "sdk_resume_failed_retrying",
+                        task_id=task_id,
+                        session_id=session_id[:16] + "...",
+                        error=event.content[:120] if event.content else None,
+                    )
+                    needs_retry = True
+                    break
+                buffered.append(event)
+
+            if needs_retry:
+                # Discard buffered events from the failed attempt
                 async for retry_event in self._run_task_impl(
                     prompt,
                     task_id=task_id,
@@ -391,8 +401,19 @@ class ClaudeSDKService:
                     on_question=on_question,
                 ):
                     yield retry_event
-                return
-            yield event
+            else:
+                for event in buffered:
+                    yield event
+        else:
+            async for event in self._run_task_impl(
+                prompt,
+                task_id=task_id,
+                session_id=None,
+                working_dir=working_dir,
+                on_permission=on_permission,
+                on_question=on_question,
+            ):
+                yield event
 
     async def _query_memory(
         self, user_message: str,
@@ -486,36 +507,45 @@ class ClaudeSDKService:
         detect and skip stale ResultMessages that sit in the buffer from
         a previous query cycle.
 
-        receive_messages() returns already-parsed Message objects.
+        Unknown message types (e.g. rate_limit_event) are skipped per-message
+        instead of aborting the entire stream, so the actual response is still
+        received.
         """
         from claude_code_sdk import AssistantMessage, ResultMessage
 
         got_assistant = False
+        stream = client.receive_messages().__aiter__()
 
-        try:
-            async for message in client.receive_messages():
-                if isinstance(message, AssistantMessage):
-                    got_assistant = True
-
-                if isinstance(message, ResultMessage):
-                    if not got_assistant:
-                        # Stale ResultMessage from a previous query — skip it
-                        logger.warning(
-                            "sdk_stale_result_skipped",
-                            session_id=getattr(message, "session_id", None),
-                            num_turns=getattr(message, "num_turns", None),
-                        )
-                        continue
-                    # Real result — yield it and stop
-                    yield message
-                    return
-
-                yield message
-        except Exception as e:
-            if "Unknown message type" in str(e):
-                logger.debug("sdk_unknown_message_skipped", error=str(e))
-            else:
+        while True:
+            try:
+                message = await stream.__anext__()
+            except StopAsyncIteration:
+                break
+            except Exception as e:
+                if "Unknown message type" in str(e):
+                    # Skip unparseable messages (e.g. rate_limit_event)
+                    # and keep iterating — the real response follows.
+                    logger.debug("sdk_unknown_message_skipped", error=str(e))
+                    continue
                 raise
+
+            if isinstance(message, AssistantMessage):
+                got_assistant = True
+
+            if isinstance(message, ResultMessage):
+                if not got_assistant:
+                    # Stale ResultMessage from a previous query — skip it
+                    logger.warning(
+                        "sdk_stale_result_skipped",
+                        session_id=getattr(message, "session_id", None),
+                        num_turns=getattr(message, "num_turns", None),
+                    )
+                    continue
+                # Real result — yield it and stop
+                yield message
+                return
+
+            yield message
 
     async def _safe_extract_facts(
         self, user_message: str, assistant_response: str,
@@ -711,7 +741,10 @@ class ClaudeSDKService:
                     message="User denied permission", interrupt=False
                 )
 
-            return PermissionResultAllow(updated_input=tool_input)
+            # No permission callback — deny non-safe tools by default
+            return PermissionResultDeny(
+                message="No permission handler configured", interrupt=False
+            )
 
         # Query memory for system prompt
         facts, vector_results = await self._query_memory("")
@@ -898,11 +931,21 @@ class ClaudeSDKService:
                     continue
 
                 if isinstance(message, AssistantMessage):
+                    # Subagent messages have parent_tool_use_id set —
+                    # their text is internal and should not be part of
+                    # the final response sent to the user.
+                    is_subagent = getattr(
+                        message, "parent_tool_use_id", None,
+                    ) is not None
+
                     for block in message.content:
                         if isinstance(block, TextBlock):
-                            result_text += block.text
+                            if not is_subagent:
+                                result_text += block.text
                             yield SDKStreamEvent(
-                                type="text", content=block.text
+                                type="text",
+                                content=block.text,
+                                data={"subagent": is_subagent},
                             )
                         elif isinstance(block, ThinkingBlock):
                             yield SDKStreamEvent(
@@ -916,6 +959,7 @@ class ClaudeSDKService:
                                     "tool": block.name,
                                     "input": block.input,
                                     "id": block.id,
+                                    "subagent": is_subagent,
                                 },
                             )
 
@@ -967,9 +1011,17 @@ class ClaudeSDKService:
                         )
                         emit_task.add_done_callback(_log_task_exception)
 
+                    # Use the longer of result_text (from TextBlocks) and
+                    # message.result — the SDK sometimes only fills one.
+                    msg_result = getattr(message, "result", "") or ""
+                    final_content = (
+                        msg_result if len(msg_result) > len(result_text)
+                        else result_text
+                    )
+
                     yield SDKStreamEvent(
                         type="result",
-                        content=getattr(message, "result", "") or result_text,
+                        content=final_content,
                         data={
                             "session_id": message.session_id,
                             "cost_usd": getattr(

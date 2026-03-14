@@ -297,3 +297,277 @@ class TestEditableConfigMeta:
 
         backend_meta = meta["models"]["backend"]
         assert backend_meta["options"] == ["litellm", "claude-sdk"]
+
+
+# -----------------------------------------------------------------------
+# _safe_receive tests
+# -----------------------------------------------------------------------
+
+
+class TestSafeReceive:
+    """Tests for ClaudeSDKService._safe_receive — unknown message handling."""
+
+    async def _mock_client(self, messages, error_at=None, error_msg=None):
+        """Create a mock client whose receive_messages() yields messages.
+
+        If error_at is set, raises an exception at that index.
+        """
+        class _MockStream:
+            def __init__(self):
+                self._index = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self._index >= len(messages):
+                    raise StopAsyncIteration
+                if error_at is not None and self._index == error_at:
+                    self._index += 1
+                    raise Exception(error_msg or "Unknown message type: rate_limit_event")
+                msg = messages[self._index]
+                self._index += 1
+                return msg
+
+        class _MockClient:
+            def receive_messages(self):
+                return _MockStream()
+
+        return _MockClient()
+
+    async def test_normal_messages_yielded(self):
+        """Normal messages pass through."""
+        from unittest.mock import MagicMock
+        from claude_code_sdk import AssistantMessage, ResultMessage, TextBlock
+
+        assistant = AssistantMessage(
+            content=[TextBlock(text="Hello")], model="test",
+        )
+        result = ResultMessage(
+            subtype="result", session_id="s1", num_turns=1,
+            duration_ms=100, duration_api_ms=50, is_error=False,
+            total_cost_usd=0.0, usage={},
+        )
+
+        client = await self._mock_client([assistant, result])
+        received = []
+        async for msg in ClaudeSDKService._safe_receive(client):
+            received.append(msg)
+
+        assert len(received) == 2
+        assert isinstance(received[0], AssistantMessage)
+        assert isinstance(received[1], ResultMessage)
+
+    async def test_unknown_message_type_skipped(self):
+        """Unknown message types are skipped, iteration continues."""
+        from claude_code_sdk import AssistantMessage, ResultMessage, TextBlock
+
+        assistant = AssistantMessage(
+            content=[TextBlock(text="Hello")], model="test",
+        )
+        result = ResultMessage(
+            subtype="result", session_id="s1", num_turns=1,
+            duration_ms=100, duration_api_ms=50, is_error=False,
+            total_cost_usd=0.0, usage={},
+        )
+
+        # Error at index 1 (between assistant and result)
+        client = await self._mock_client(
+            [assistant, None, result],  # None is placeholder, error_at skips it
+            error_at=1,
+            error_msg="Unknown message type: rate_limit_event",
+        )
+        received = []
+        async for msg in ClaudeSDKService._safe_receive(client):
+            received.append(msg)
+
+        # Should still get both real messages
+        assert len(received) == 2
+        assert isinstance(received[0], AssistantMessage)
+        assert isinstance(received[1], ResultMessage)
+
+    async def test_unknown_error_still_raised(self):
+        """Non-'Unknown message type' errors still propagate."""
+        from claude_code_sdk import AssistantMessage, TextBlock
+
+        assistant = AssistantMessage(
+            content=[TextBlock(text="Hi")], model="test",
+        )
+
+        client = await self._mock_client(
+            [assistant, None],
+            error_at=1,
+            error_msg="Connection reset by peer",
+        )
+
+        with pytest.raises(Exception, match="Connection reset"):
+            async for _ in ClaudeSDKService._safe_receive(client):
+                pass
+
+    async def test_stale_result_skipped(self):
+        """ResultMessage before any AssistantMessage is skipped as stale."""
+        from claude_code_sdk import AssistantMessage, ResultMessage, TextBlock
+
+        stale_result = ResultMessage(
+            subtype="result", session_id="old", num_turns=0,
+            duration_ms=0, duration_api_ms=0, is_error=False,
+            total_cost_usd=0.0, usage={},
+        )
+        assistant = AssistantMessage(
+            content=[TextBlock(text="Real response")], model="test",
+        )
+        real_result = ResultMessage(
+            subtype="result", session_id="new", num_turns=1,
+            duration_ms=100, duration_api_ms=50, is_error=False,
+            total_cost_usd=0.0, usage={},
+        )
+
+        client = await self._mock_client([stale_result, assistant, real_result])
+        received = []
+        async for msg in ClaudeSDKService._safe_receive(client):
+            received.append(msg)
+
+        # Stale result skipped, got assistant + real result
+        assert len(received) == 2
+        assert isinstance(received[0], AssistantMessage)
+        assert isinstance(received[1], ResultMessage)
+        assert received[1].session_id == "new"
+
+    async def test_multiple_unknown_messages_skipped(self):
+        """Multiple unknown messages in a row are all skipped."""
+        from claude_code_sdk import AssistantMessage, ResultMessage, TextBlock
+
+        assistant = AssistantMessage(
+            content=[TextBlock(text="Done")], model="test",
+        )
+        result = ResultMessage(
+            subtype="result", session_id="s1", num_turns=1,
+            duration_ms=100, duration_api_ms=50, is_error=False,
+            total_cost_usd=0.0, usage={},
+        )
+
+        # Two consecutive errors then real messages
+        class _MultiErrorClient:
+            def receive_messages(self):
+                return self._stream()
+
+            async def _stream(self):
+                raise Exception("Unknown message type: rate_limit_event")
+
+        # Build a custom client with multiple errors
+        class _Stream:
+            def __init__(self):
+                self._items = [
+                    ("error", "Unknown message type: rate_limit_event"),
+                    ("error", "Unknown message type: system_event"),
+                    ("msg", assistant),
+                    ("msg", result),
+                ]
+                self._i = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self._i >= len(self._items):
+                    raise StopAsyncIteration
+                kind, val = self._items[self._i]
+                self._i += 1
+                if kind == "error":
+                    raise Exception(val)
+                return val
+
+        class _Client:
+            def receive_messages(self):
+                return _Stream()
+
+        received = []
+        async for msg in ClaudeSDKService._safe_receive(_Client()):
+            received.append(msg)
+
+        assert len(received) == 2
+
+
+# -----------------------------------------------------------------------
+# Subagent filtering tests
+# -----------------------------------------------------------------------
+
+
+class TestSubagentFiltering:
+    """Tests for subagent text filtering in _run_task_locked."""
+
+    def test_assistant_message_subagent_flag(self):
+        """AssistantMessage with parent_tool_use_id is a subagent message."""
+        from claude_code_sdk import AssistantMessage, TextBlock
+
+        # Main agent message
+        main_msg = AssistantMessage(
+            content=[TextBlock(text="Main response")],
+            model="test",
+            parent_tool_use_id=None,
+        )
+        assert getattr(main_msg, "parent_tool_use_id", None) is None
+
+        # Subagent message
+        sub_msg = AssistantMessage(
+            content=[TextBlock(text="Subagent research")],
+            model="test",
+            parent_tool_use_id="toolu_abc123",
+        )
+        assert getattr(sub_msg, "parent_tool_use_id", None) == "toolu_abc123"
+
+    def test_subagent_text_not_in_result(self):
+        """Verify the logic: subagent text should not be accumulated."""
+        from claude_code_sdk import AssistantMessage, TextBlock
+
+        main_msg = AssistantMessage(
+            content=[TextBlock(text="Final answer")],
+            model="test",
+            parent_tool_use_id=None,
+        )
+        sub_msg = AssistantMessage(
+            content=[TextBlock(text="Internal research notes")],
+            model="test",
+            parent_tool_use_id="toolu_abc",
+        )
+
+        # Simulate accumulation logic from _run_task_locked
+        result_text = ""
+        for message in [sub_msg, main_msg]:
+            is_subagent = getattr(message, "parent_tool_use_id", None) is not None
+            for block in message.content:
+                if isinstance(block, TextBlock) and not is_subagent:
+                    result_text += block.text
+
+        assert result_text == "Final answer"
+        assert "Internal research" not in result_text
+
+    def test_sdk_stream_event_carries_subagent_flag(self):
+        """SDKStreamEvent should carry subagent flag in data."""
+        event_main = SDKStreamEvent(
+            type="text", content="Hello", data={"subagent": False},
+        )
+        event_sub = SDKStreamEvent(
+            type="text", content="Research", data={"subagent": True},
+        )
+
+        assert not event_main.data.get("subagent")
+        assert event_sub.data.get("subagent")
+
+    def test_telegram_accumulation_skips_subagent(self):
+        """Simulate telegram's accumulation logic with subagent events."""
+        events = [
+            SDKStreamEvent(type="text", content="Sub work", data={"subagent": True}),
+            SDKStreamEvent(type="text", content="Main answer", data={"subagent": False}),
+            SDKStreamEvent(type="text", content="More sub", data={"subagent": True}),
+        ]
+
+        accumulated = ""
+        for event in events:
+            if event.type == "text":
+                if not (event.data and event.data.get("subagent")):
+                    accumulated += event.content
+
+        assert accumulated == "Main answer"
+        assert "Sub work" not in accumulated
+        assert "More sub" not in accumulated

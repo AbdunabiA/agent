@@ -108,6 +108,65 @@ _DEFAULT_SHORTCUTS = [
 ]
 
 
+def _tool_explanation(tool_name: str, arguments: dict[str, Any]) -> str:
+    """Build a human-readable approval message using the AI's own description.
+
+    The AI fills a ``description`` field in tool_input explaining what it wants
+    to do.  This function surfaces that intent alongside the concrete action and
+    a short note on what capability is being granted.
+    """
+    # The AI's own explanation of what it wants to do (Claude fills this in)
+    ai_intent = arguments.get("description", "")
+
+    # What capability this tool grants if approved
+    capability: dict[str, str] = {
+        "Bash": "run any shell command on your machine",
+        "Write": "create or overwrite any file on disk",
+        "Edit": "modify contents of any file on disk",
+        "NotebookEdit": "modify Jupyter notebook cells",
+        "shell_exec": "run any shell command on your machine",
+        "file_write": "create or overwrite any file on disk",
+        "file_delete": "permanently delete a file from disk",
+        "python_exec": "execute arbitrary Python code with full system access",
+        "http_request": "send network requests to external servers",
+        "browser_navigate": "control a browser and visit websites",
+        "desktop_click": "perform mouse clicks on your desktop",
+        "desktop_type": "send keystrokes on your keyboard",
+    }
+    granted = capability.get(tool_name, f"use the '{tool_name}' tool")
+
+    # Concrete action summary
+    if tool_name == "Bash":
+        action = arguments.get("command", "unknown command")
+    elif tool_name in ("Write", "file_write"):
+        path = arguments.get("file_path") or arguments.get("path", "?")
+        size = len(arguments.get("content", ""))
+        action = f"write {size} chars to {path}"
+    elif tool_name == "Edit":
+        path = arguments.get("file_path", "?")
+        action = f"edit {path}"
+    elif tool_name == "file_delete":
+        action = f"delete {arguments.get('path', '?')}"
+    elif tool_name == "python_exec":
+        code = arguments.get("code", "")
+        action = code[:300] + ("…" if len(code) > 300 else "")
+    elif tool_name == "http_request":
+        action = f"{arguments.get('method', 'GET')} {arguments.get('url', '?')}"
+    elif tool_name in ("shell_exec",):
+        action = arguments.get("command", "unknown command")
+    else:
+        parts = [f"{k}={str(v)[:80]}" for k, v in list(arguments.items())[:3]
+                 if k != "description"]
+        action = ", ".join(parts) if parts else str(arguments)[:200]
+
+    lines = [f"\U0001f916 The AI wants to: {ai_intent}" if ai_intent else ""]
+    lines.append(f"\U0001f527 Tool: {tool_name}")
+    lines.append(f"\U0001f4bb Action: {action}")
+    lines.append(f"\U0001f513 This grants access to: {granted}")
+
+    return "\n".join(line for line in lines if line)
+
+
 class TelegramChannel(BaseChannel):
     """Telegram messaging channel via aiogram 3.x.
 
@@ -190,8 +249,10 @@ class TelegramChannel(BaseChannel):
         # Set bot command menu (the "/" button near the input field)
         await self._set_bot_commands()
 
-        # Subscribe to file send events
+        # Subscribe to file send and channel posting events
         self.event_bus.on(Events.FILE_SEND, self._on_file_send)
+        self.event_bus.on(Events.CHANNEL_POST, self._on_channel_post)
+        self.event_bus.on(Events.CHANNEL_SEND_MESSAGE, self._on_send_message)
 
         self._running = True
         self._polling_task = asyncio.create_task(self._run_polling())
@@ -907,6 +968,8 @@ class TelegramChannel(BaseChannel):
 
         from agent.tools.builtins.send_file import set_file_send_context
         set_file_send_context(channel="telegram", user_id=str(user_id))
+        from agent.tools.builtins.telegram_post import set_telegram_post_context
+        set_telegram_post_context(channel="telegram", user_id=str(user_id))
 
         await self.send_typing(str(user_id))
 
@@ -920,6 +983,7 @@ class TelegramChannel(BaseChannel):
         try:
             response_text = await self._process_via_sdk_or_loop(
                 prompt, session, agent_loop,
+                user_id=str(user_id),
             )
             typing_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -959,11 +1023,13 @@ class TelegramChannel(BaseChannel):
             return
 
         user_id = message.from_user.id
-        await self.send_typing(str(user_id))
+        status_message = None
 
         # Set file-send context for voice messages
         from agent.tools.builtins.send_file import set_file_send_context
         set_file_send_context(channel="telegram", user_id=str(user_id))
+        from agent.tools.builtins.telegram_post import set_telegram_post_context
+        set_telegram_post_context(channel="telegram", user_id=str(user_id))
 
         try:
             file = await self._bot.get_file(message.voice.file_id)
@@ -992,16 +1058,18 @@ class TelegramChannel(BaseChannel):
                     transcription_msg = f"🎤 *Transcription:* {stt_result.text}"
                     await message.reply(transcription_msg, parse_mode="Markdown")
 
-                # Process transcribed text through agent loop or SDK
-                typing_task = asyncio.create_task(self._keep_typing(str(user_id)))
+                # Send status message and process via agent loop or SDK
+                status_message = None
                 try:
-                    response_text = await self._process_via_sdk_or_loop(
-                        stt_result.text, session, agent_loop,
-                    )
-                finally:
-                    typing_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await typing_task
+                    status_message = await message.answer("\u23f3 Processing\u2026")
+                except Exception:
+                    pass
+
+                response_text = await self._process_via_sdk_or_loop(
+                    stt_result.text, session, agent_loop,
+                    status_message=status_message,
+                    user_id=str(user_id),
+                )
 
             else:
                 # LLM native: send audio directly (current behaviour)
@@ -1040,6 +1108,10 @@ class TelegramChannel(BaseChannel):
                         file=tts_result.audio_data,
                         filename="response.ogg",
                     )
+                    # Delete the status message before sending voice
+                    if status_message is not None:
+                        with contextlib.suppress(Exception):
+                            await status_message.delete()
                     await message.reply_voice(
                         voice=voice_file,
                         duration=int(tts_result.duration_seconds),
@@ -1047,11 +1119,13 @@ class TelegramChannel(BaseChannel):
                     # Also send text for accessibility
                     if len(response_text) > 200:
                         short = response_text[:200] + "..."
-                        await message.reply(f"📝 _{short}_", parse_mode="Markdown")
+                        await message.reply(f"\U0001f4dd _{short}_", parse_mode="Markdown")
                     return
 
-            # Text-only reply
-            await self.send_streamed_response(str(user_id), response_text)
+            # Text-only reply — edit the status message with the response
+            await self._replace_status_with_response(
+                status_message, str(user_id), response_text
+            )
 
         except Exception as e:
             logger.error("voice_handle_error", error=str(e), user_id=user_id)
@@ -1142,7 +1216,7 @@ class TelegramChannel(BaseChannel):
             return
 
         user_id = message.from_user.id
-        await self.send_typing(str(user_id))
+        status_message = None
 
         try:
             doc = message.document
@@ -1177,33 +1251,35 @@ class TelegramChannel(BaseChannel):
                 session_id=session_id, channel="telegram"
             )
 
-            typing_task = asyncio.create_task(self._keep_typing(str(user_id)))
+            status_message = None
+            try:
+                status_message = await message.answer("\u23f3 Processing document\u2026")
+            except Exception:
+                pass
 
             try:
                 response_text = await self._process_via_sdk_or_loop(
                     description, session, self.agent_loop,
+                    status_message=status_message,
+                    user_id=str(user_id),
                 )
 
-                typing_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await typing_task
-
-                await self.send_message(
-                    OutgoingMessage(
-                        content=response_text,
-                        channel_user_id=str(user_id),
-                        parse_mode="Markdown",
-                    )
+                await self._replace_status_with_response(
+                    status_message, str(user_id), response_text
                 )
             except Exception:
-                typing_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await typing_task
+                if status_message:
+                    with contextlib.suppress(Exception):
+                        await status_message.edit_text(
+                            "Sorry, I couldn't process your document."
+                        )
                 raise
 
         except Exception as e:
             logger.error("document_handle_error", error=str(e), user_id=user_id)
-            await message.answer("Sorry, I couldn't process your document.")
+            # Only send if not already handled above
+            if not status_message:
+                await message.answer("Sorry, I couldn't process your document.")
 
     # ------------------------------------------------------------------
     # Callback dispatcher
@@ -1635,8 +1711,13 @@ class TelegramChannel(BaseChannel):
         text: str,
         session: Any,
         agent_loop: Any,
+        status_message: Any | None = None,
+        user_id: str | None = None,
     ) -> str:
         """Route a message through Claude SDK or the LiteLLM agent loop.
+
+        If status_message is provided, it will be edited with live status
+        updates as the SDK processes the request (e.g. tool usage).
 
         Returns the response text.
         """
@@ -1646,17 +1727,59 @@ class TelegramChannel(BaseChannel):
             sdk: ClaudeSDKService = self.sdk_service  # type: ignore[assignment]
             accumulated = ""
             sdk_session_id = session.metadata.get("sdk_session_id")
+            last_status_update = 0.0
+            import time as _time
+
+            # Permission callback: ask user via inline keyboard for dangerous tools
+            on_permission = None
+            if user_id and AIOGRAM_AVAILABLE:
+                async def _on_permission(
+                    tool_name: str, details: str, tool_input: dict[str, Any],
+                ) -> bool:
+                    import uuid
+
+                    request_id = str(uuid.uuid4())[:8]
+                    return await self.send_approval_request(
+                        channel_user_id=user_id,
+                        tool_name=tool_name,
+                        arguments=tool_input,
+                        request_id=request_id,
+                    )
+
+                on_permission = _on_permission
+
             async for event in sdk.run_task_stream(
                 prompt=text,
                 task_id=session.id,
                 session_id=sdk_session_id,
+                on_permission=on_permission,
             ):
                 if event.type == "text":
-                    accumulated += event.content
+                    # Only accumulate main agent text, not subagent output
+                    if not (event.data and event.data.get("subagent")):
+                        accumulated += event.content
+                elif event.type == "tool_use":
+                    # Update status message with current action
+                    if status_message is not None:
+                        now = _time.monotonic()
+                        # Throttle edits to avoid Telegram rate limits
+                        if now - last_status_update > 2.0:
+                            tool_name = event.data.get("tool", "tool")
+                            is_sub = event.data.get("subagent", False)
+                            prefix = "\U0001f50d Researching" if is_sub else "\u2699\ufe0f Working"
+                            status_text = f"{prefix}\u2026 using {tool_name}"
+                            with contextlib.suppress(Exception):
+                                await status_message.edit_text(status_text)
+                            last_status_update = now
                 elif event.type == "result":
                     sdk_sid = event.data.get("session_id")
                     if sdk_sid:
                         session.metadata["sdk_session_id"] = sdk_sid
+                    # Prefer the result content over accumulated text events
+                    # when available — the SDK sometimes sends the full answer
+                    # only in the ResultMessage.result field.
+                    if event.content and len(event.content) > len(accumulated):
+                        accumulated = event.content
                 elif event.type == "error":
                     raise RuntimeError(event.content)
             return accumulated or "[No response]"
@@ -1689,6 +1812,8 @@ class TelegramChannel(BaseChannel):
         # Set file-send context so send_file tool knows who to deliver to
         from agent.tools.builtins.send_file import set_file_send_context
         set_file_send_context(channel="telegram", user_id=str(user_id))
+        from agent.tools.builtins.telegram_post import set_telegram_post_context
+        set_telegram_post_context(channel="telegram", user_id=str(user_id))
 
         # Auto-detect natural language reminder requests
         reminder_confirmation = await self._try_extract_reminder(
@@ -1697,9 +1822,6 @@ class TelegramChannel(BaseChannel):
         if reminder_confirmation:
             await message.answer(reminder_confirmation)
             return
-
-        # Show typing
-        await self.send_typing(str(user_id))
 
         # Resolve workspace-specific components
         agent_loop, session_store = self._resolve_components(
@@ -1723,33 +1845,115 @@ class TelegramChannel(BaseChannel):
             },
         )
 
-        # Keep typing active while processing
-        typing_task = asyncio.create_task(self._keep_typing(str(user_id)))
+        # Send a placeholder message instead of typing indicator
+        status_message = None
+        try:
+            status_message = await message.answer("\u23f3 Processing\u2026")
+        except Exception:
+            pass
 
         try:
             response_text = await self._process_via_sdk_or_loop(
                 user_text, session, agent_loop,
+                status_message=status_message,
+                user_id=str(user_id),
             )
 
-            # Cancel typing
-            typing_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await typing_task
-
-            # Send response (with streaming for long responses)
-            await self.send_streamed_response(str(user_id), response_text)
+            # Edit the placeholder with the final response
+            await self._replace_status_with_response(
+                status_message, str(user_id), response_text
+            )
 
         except Exception as e:
-            typing_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await typing_task
-
             logger.error(
                 "telegram_handle_error",
                 error=str(e),
                 user_id=user_id,
             )
-            await message.answer("Sorry, something went wrong processing your message.")
+            # Edit the placeholder with error text
+            if status_message:
+                with contextlib.suppress(Exception):
+                    await status_message.edit_text(
+                        "Sorry, something went wrong processing your message."
+                    )
+            else:
+                await message.answer(
+                    "Sorry, something went wrong processing your message."
+                )
+
+    # ------------------------------------------------------------------
+    # Status message helpers
+    # ------------------------------------------------------------------
+
+    async def _replace_status_with_response(
+        self,
+        status_message: Any | None,
+        channel_user_id: str,
+        response_text: str,
+    ) -> None:
+        """Replace the placeholder status message with the final response.
+
+        For short responses, edits the status message in-place.
+        For long responses, deletes the status message and sends the full
+        response via send_streamed_response (which handles splitting).
+
+        Args:
+            status_message: The placeholder message to replace (may be None).
+            channel_user_id: Telegram user/chat ID as string.
+            response_text: The complete response text from the agent.
+        """
+        if not self._bot:
+            return
+
+        if not response_text:
+            # Clean up the stale status message instead of leaving it
+            if status_message is not None:
+                with contextlib.suppress(Exception):
+                    await status_message.edit_text(
+                        "No response was generated. Please try again."
+                    )
+            return
+
+        chunks = self._split_message(response_text)
+
+        if status_message is not None:
+            # Edit the first chunk into the status message
+            try:
+                await status_message.edit_text(
+                    chunks[0], parse_mode="Markdown",
+                )
+            except Exception:
+                # Fallback: try without parse_mode
+                try:
+                    await status_message.edit_text(chunks[0])
+                except Exception as e:
+                    logger.debug("status_edit_failed", error=str(e))
+                    # Last resort: delete status and send fresh
+                    with contextlib.suppress(Exception):
+                        await status_message.delete()
+                    await self.send_message(
+                        OutgoingMessage(
+                            content=chunks[0],
+                            channel_user_id=channel_user_id,
+                            parse_mode="Markdown",
+                        )
+                    )
+
+            # Send remaining chunks as new messages
+            chat_id = int(channel_user_id)
+            for chunk in chunks[1:]:
+                try:
+                    await self._bot.send_message(
+                        chat_id=chat_id, text=chunk, parse_mode="Markdown",
+                    )
+                except Exception:
+                    try:
+                        await self._bot.send_message(chat_id=chat_id, text=chunk)
+                    except Exception as e:
+                        logger.debug("chunk_send_failed", error=str(e))
+        else:
+            # No status message — send normally
+            await self.send_streamed_response(channel_user_id, response_text)
 
     # ------------------------------------------------------------------
     # Sending
@@ -1959,6 +2163,69 @@ class TelegramChannel(BaseChannel):
                     text=f"Failed to send file: {e}",
                 )
 
+    async def _on_channel_post(self, data: dict[str, Any]) -> None:
+        """Handle CHANNEL_POST events — post to a Telegram channel/group."""
+        if data.get("channel") != "telegram" or not self._bot:
+            return
+
+        chat_id = data.get("chat_id")
+        text = data.get("text", "")
+        photo_path = data.get("photo_path", "")
+        pin = data.get("pin", False)
+        parse_mode = data.get("parse_mode", "Markdown") or None
+
+        if not chat_id or not text:
+            logger.warning("channel_post_missing_data", data=data)
+            return
+
+        try:
+            if photo_path:
+                from aiogram.types import FSInputFile
+
+                photo = FSInputFile(photo_path)
+                msg = await self._bot.send_photo(
+                    chat_id=chat_id, photo=photo,
+                    caption=text, parse_mode=parse_mode,
+                )
+            else:
+                msg = await self._bot.send_message(
+                    chat_id=chat_id, text=text, parse_mode=parse_mode,
+                )
+
+            if pin and msg:
+                with contextlib.suppress(Exception):
+                    await self._bot.pin_chat_message(
+                        chat_id=chat_id, message_id=msg.message_id,
+                    )
+
+            logger.info("channel_post_sent", chat_id=chat_id)
+
+        except Exception as e:
+            logger.error("channel_post_failed", chat_id=chat_id, error=str(e))
+
+    async def _on_send_message(self, data: dict[str, Any]) -> None:
+        """Handle CHANNEL_SEND_MESSAGE events — send DM to a user."""
+        if data.get("channel") != "telegram" or not self._bot:
+            return
+
+        user_id = data.get("user_id")
+        text = data.get("text", "")
+        parse_mode = data.get("parse_mode", "Markdown") or None
+
+        if not user_id or not text:
+            logger.warning("send_message_missing_data", data=data)
+            return
+
+        try:
+            await self._bot.send_message(
+                chat_id=int(user_id), text=text, parse_mode=parse_mode,
+            )
+            logger.info("telegram_message_sent", user_id=user_id)
+        except Exception as e:
+            logger.error(
+                "telegram_message_failed", user_id=user_id, error=str(e),
+            )
+
     async def _on_file_send(self, data: dict[str, Any]) -> None:
         """Handle FILE_SEND events from the send_file tool.
 
@@ -2003,11 +2270,12 @@ class TelegramChannel(BaseChannel):
         if not self._bot or not AIOGRAM_AVAILABLE:
             return True
 
-        args_str = ", ".join(f"{k}={v!r}" for k, v in arguments.items())
+        # Build a human-readable explanation of what the tool does and why
+        # it needs approval, plus a clear summary of the action.
+        explanation = _tool_explanation(tool_name, arguments)
         text = (
-            f"\u26a0\ufe0f Tool Approval Required\n\n"
-            f"Tool: {tool_name}\n"
-            f"Arguments: {args_str}\n\n"
+            f"\u26a0\ufe0f Permission Required\n\n"
+            f"{explanation}\n\n"
             f"Do you approve this action?"
         )
 
