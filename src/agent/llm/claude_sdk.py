@@ -37,6 +37,106 @@ logger = structlog.get_logger(__name__)
 
 # Lazy SDK availability check
 _SDK_AVAILABLE: bool | None = None
+_SDK_PATCHED: bool = False
+
+
+def _patch_sdk_permission_protocol() -> None:
+    """Patch claude-code-sdk to use the new permission response format.
+
+    SDK v0.0.25 sends {allow: true, input: {...}} but Claude Code CLI v2.1+
+    expects {behavior: "allow", updatedInput: {...}}. This monkey-patch
+    fixes the protocol mismatch until the SDK is updated.
+    """
+    global _SDK_PATCHED
+    if _SDK_PATCHED:
+        return
+
+    try:
+        from claude_code_sdk._internal.query import Query
+        from claude_code_sdk.types import PermissionResultAllow, PermissionResultDeny
+
+        _original_handle = Query._handle_control_request
+
+        async def _patched_handle_control_request(
+            self: Any, request: dict[str, Any],
+        ) -> None:
+            import json as _json
+
+            request_id = request.get("request_id", "")
+            request_data = request["request"]
+            subtype = request_data["subtype"]
+
+            if subtype != "can_use_tool":
+                # Delegate non-permission requests to original handler
+                return await _original_handle(self, request)
+
+            try:
+                from claude_code_sdk.types import (
+                    SDKControlPermissionRequest,
+                    SDKControlResponse,
+                    ToolPermissionContext,
+                )
+
+                permission_request: SDKControlPermissionRequest = request_data  # type: ignore[assignment]
+
+                if not self.can_use_tool:
+                    raise Exception("canUseTool callback is not provided")
+
+                context = ToolPermissionContext(
+                    signal=None,
+                    suggestions=permission_request.get("permission_suggestions", [])
+                    or [],
+                )
+
+                response = await self.can_use_tool(
+                    permission_request["tool_name"],
+                    permission_request["input"],
+                    context,
+                )
+
+                # New protocol format expected by Claude Code CLI v2.1+
+                response_data: dict[str, Any]
+                if isinstance(response, PermissionResultAllow):
+                    response_data = {"behavior": "allow"}
+                    if response.updated_input is not None:
+                        response_data["updatedInput"] = response.updated_input
+                elif isinstance(response, PermissionResultDeny):
+                    response_data = {
+                        "behavior": "deny",
+                        "message": response.message or "Permission denied",
+                    }
+                else:
+                    raise TypeError(
+                        f"Tool permission callback must return PermissionResult, "
+                        f"got {type(response)}"
+                    )
+
+                success_response: SDKControlResponse = {
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "success",
+                        "request_id": request_id,
+                        "response": response_data,
+                    },
+                }
+                await self.transport.write(_json.dumps(success_response) + "\n")
+
+            except Exception as e:
+                error_response: SDKControlResponse = {
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "error",
+                        "request_id": request_id,
+                        "error": str(e),
+                    },
+                }
+                await self.transport.write(_json.dumps(error_response) + "\n")
+
+        Query._handle_control_request = _patched_handle_control_request  # type: ignore[assignment]
+        _SDK_PATCHED = True
+        logger.info("sdk_permission_protocol_patched")
+    except Exception as e:
+        logger.warning("sdk_permission_patch_failed", error=str(e))
 
 
 def sdk_available() -> bool:
@@ -47,6 +147,7 @@ def sdk_available() -> bool:
             import claude_code_sdk  # noqa: F401
 
             _SDK_AVAILABLE = True
+            _patch_sdk_permission_protocol()
         except ImportError:
             _SDK_AVAILABLE = False
     return _SDK_AVAILABLE

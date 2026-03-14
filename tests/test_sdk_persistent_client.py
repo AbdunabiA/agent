@@ -1013,3 +1013,149 @@ class TestStaleResultSkipping:
         with pytest.raises(RuntimeError, match="Connection lost"):
             async for _ in ClaudeSDKService._safe_receive(mock_client):
                 pass
+
+
+# ===================================================================
+# Permission protocol patch (SDK v0.0.25 <-> CLI v2.1+ compat)
+# ===================================================================
+
+
+class TestPermissionProtocolPatch:
+    """Test that the SDK permission protocol is patched to use new format."""
+
+    @pytest.fixture(autouse=True)
+    def _ensure_patch(self):
+        """Ensure SDK patch is applied before each test."""
+        from agent.llm.claude_sdk import sdk_available
+        sdk_available()
+
+    def test_patch_applied(self):
+        """Patch should be applied when sdk_available() is called."""
+        from agent.llm.claude_sdk import _SDK_PATCHED, sdk_available
+
+        # Ensure the patch is triggered
+        sdk_available()
+        # Re-import to get updated value
+        from agent.llm import claude_sdk
+        assert claude_sdk._SDK_PATCHED is True
+
+    def test_patched_method_exists(self):
+        """Query._handle_control_request should be patched."""
+        from agent.llm.claude_sdk import sdk_available
+
+        sdk_available()  # Ensure patch is applied
+
+        from claude_code_sdk._internal.query import Query as QuerySession
+
+        method = QuerySession._handle_control_request
+        assert method is not None
+
+    @pytest.mark.asyncio
+    async def test_allow_response_format(self):
+        """Patched handler should return {behavior: 'allow', updatedInput: ...}."""
+        import json
+
+        from claude_code_sdk._internal.query import Query as QuerySession
+        from claude_code_sdk.types import PermissionResultAllow
+
+        written: list[str] = []
+
+        # Create a minimal QuerySession-like object
+        session = object.__new__(QuerySession)
+        session.transport = MagicMock()
+        session.transport.write = AsyncMock(side_effect=lambda s: written.append(s))
+
+        tool_input = {"command": "ls -la"}
+
+        async def fake_can_use_tool(name: str, inp: dict, ctx: Any) -> Any:
+            return PermissionResultAllow(updated_input=inp)
+
+        session.can_use_tool = fake_can_use_tool
+
+        request = {
+            "request_id": "req_1",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Bash",
+                "input": tool_input,
+            },
+        }
+
+        await session._handle_control_request(request)
+
+        assert len(written) == 1
+        response = json.loads(written[0])
+        inner = response["response"]["response"]
+        assert inner["behavior"] == "allow"
+        assert inner["updatedInput"] == tool_input
+
+    @pytest.mark.asyncio
+    async def test_deny_response_format(self):
+        """Patched handler should return {behavior: 'deny', message: '...'}."""
+        import json
+
+        from claude_code_sdk._internal.query import Query as QuerySession
+        from claude_code_sdk.types import PermissionResultDeny
+
+        written: list[str] = []
+
+        session = object.__new__(QuerySession)
+        session.transport = MagicMock()
+        session.transport.write = AsyncMock(side_effect=lambda s: written.append(s))
+
+        async def fake_can_use_tool(name: str, inp: dict, ctx: Any) -> Any:
+            return PermissionResultDeny(message="Not allowed")
+
+        session.can_use_tool = fake_can_use_tool
+
+        request = {
+            "request_id": "req_2",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Bash",
+                "input": {"command": "rm -rf /"},
+            },
+        }
+
+        await session._handle_control_request(request)
+
+        assert len(written) == 1
+        response = json.loads(written[0])
+        inner = response["response"]["response"]
+        assert inner["behavior"] == "deny"
+        assert inner["message"] == "Not allowed"
+
+    @pytest.mark.asyncio
+    async def test_allow_without_updated_input(self):
+        """Allow without updated_input should not include updatedInput key."""
+        import json
+
+        from claude_code_sdk._internal.query import Query as QuerySession
+        from claude_code_sdk.types import PermissionResultAllow
+
+        written: list[str] = []
+
+        session = object.__new__(QuerySession)
+        session.transport = MagicMock()
+        session.transport.write = AsyncMock(side_effect=lambda s: written.append(s))
+
+        async def fake_can_use_tool(name: str, inp: dict, ctx: Any) -> Any:
+            return PermissionResultAllow()
+
+        session.can_use_tool = fake_can_use_tool
+
+        request = {
+            "request_id": "req_3",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Read",
+                "input": {"file_path": "/tmp/test"},
+            },
+        }
+
+        await session._handle_control_request(request)
+
+        response = json.loads(written[0])
+        inner = response["response"]["response"]
+        assert inner["behavior"] == "allow"
+        assert "updatedInput" not in inner
