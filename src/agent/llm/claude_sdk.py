@@ -162,6 +162,9 @@ class ClaudeSDKService:
         # Issue 1: System prompt fingerprint tracking
         self._prompt_fingerprints: dict[str, str] = {}
 
+        # Per-task lock to serialize concurrent queries on the same client
+        self._query_locks: dict[str, asyncio.Lock] = {}
+
     def check_available_sync(self) -> tuple[bool, str]:
         """Check if SDK is installed and Claude Code is authenticated (sync)."""
         if not sdk_available():
@@ -656,7 +659,14 @@ class ClaudeSDKService:
         self._last_activity.pop(task_id, None)
         self._tool_generations.pop(task_id, None)
         self._prompt_fingerprints.pop(task_id, None)
+        self._query_locks.pop(task_id, None)
         # Keep _last_session_ids — needed for resume on next connect
+
+    def _get_query_lock(self, task_id: str) -> asyncio.Lock:
+        """Get or create a per-task lock to serialize concurrent queries."""
+        if task_id not in self._query_locks:
+            self._query_locks[task_id] = asyncio.Lock()
+        return self._query_locks[task_id]
 
     async def _run_task_impl(
         self,
@@ -668,7 +678,44 @@ class ClaudeSDKService:
         on_permission: PermissionCallback | None = None,
         on_question: QuestionCallback | None = None,
     ) -> AsyncGenerator[SDKStreamEvent, None]:
-        """Send a message to a persistent SDK client and stream the response."""
+        """Send a message to a persistent SDK client and stream the response.
+
+        Uses a per-task lock to prevent concurrent queries on the same client,
+        which would cause out-of-order responses.
+        """
+        from claude_code_sdk import (
+            AssistantMessage,
+            ResultMessage,
+            TextBlock,
+            ThinkingBlock,
+            ToolUseBlock,
+        )
+
+        # Serialize queries per task — the SDK client cannot handle concurrent
+        # query()+receive_response() calls on the same connection.
+        lock = self._get_query_lock(task_id)
+        async with lock:
+            async for event in self._run_task_locked(
+                prompt,
+                task_id=task_id,
+                session_id=session_id,
+                working_dir=working_dir,
+                on_permission=on_permission,
+                on_question=on_question,
+            ):
+                yield event
+
+    async def _run_task_locked(
+        self,
+        prompt: str,
+        *,
+        task_id: str = "default",
+        session_id: str | None = None,
+        working_dir: str | None = None,
+        on_permission: PermissionCallback | None = None,
+        on_question: QuestionCallback | None = None,
+    ) -> AsyncGenerator[SDKStreamEvent, None]:
+        """Inner implementation — must be called under _query_locks[task_id]."""
         from claude_code_sdk import (
             AssistantMessage,
             ResultMessage,

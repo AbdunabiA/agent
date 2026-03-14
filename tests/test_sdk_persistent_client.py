@@ -696,3 +696,111 @@ class TestEnsureClientStoresState:
         assert "user1" in service._last_activity
         assert service._last_activity["user1"] > 0
         await service.disconnect_client("user1")
+
+
+# ===================================================================
+# Concurrent query serialization (per-task lock)
+# ===================================================================
+
+
+class TestQueryLockSerialization:
+    """Test that concurrent queries on the same task are serialized."""
+
+    def test_query_locks_start_empty(self, service: ClaudeSDKService):
+        assert service._query_locks == {}
+
+    def test_get_query_lock_creates_lock(self, service: ClaudeSDKService):
+        lock = service._get_query_lock("user1")
+        assert isinstance(lock, asyncio.Lock)
+        assert "user1" in service._query_locks
+
+    def test_get_query_lock_reuses_same_lock(self, service: ClaudeSDKService):
+        lock1 = service._get_query_lock("user1")
+        lock2 = service._get_query_lock("user1")
+        assert lock1 is lock2
+
+    def test_different_tasks_get_different_locks(self, service: ClaudeSDKService):
+        lock1 = service._get_query_lock("user1")
+        lock2 = service._get_query_lock("user2")
+        assert lock1 is not lock2
+
+    @pytest.mark.asyncio
+    async def test_disconnect_removes_lock(self, service: ClaudeSDKService):
+        service._get_query_lock("user1")
+        service._clients["user1"] = AsyncMock()
+        await service.disconnect_client("user1")
+        assert "user1" not in service._query_locks
+
+    @pytest.mark.asyncio
+    async def test_concurrent_queries_serialized(self, service: ClaudeSDKService):
+        """Two concurrent messages for the same task should run sequentially."""
+        execution_order: list[str] = []
+
+        async def fake_impl(
+            prompt, *, task_id, session_id, working_dir, on_permission, on_question
+        ):
+            from agent.llm.claude_sdk import SDKStreamEvent
+
+            execution_order.append(f"start:{prompt}")
+            await asyncio.sleep(0.05)  # Simulate processing time
+            execution_order.append(f"end:{prompt}")
+            yield SDKStreamEvent(type="result", content=prompt)
+
+        service._run_task_locked = fake_impl  # type: ignore[assignment]
+
+        # Launch two concurrent queries for the same task
+        async def collect(prompt):
+            events = []
+            async for event in service._run_task_impl(
+                prompt, task_id="user1"
+            ):
+                events.append(event)
+            return events
+
+        results = await asyncio.gather(collect("msg1"), collect("msg2"))
+
+        # Both should succeed
+        assert len(results[0]) == 1
+        assert len(results[1]) == 1
+
+        # They should NOT interleave — must be fully sequential
+        assert execution_order == [
+            "start:msg1", "end:msg1", "start:msg2", "end:msg2",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_different_tasks_run_concurrently(self, service: ClaudeSDKService):
+        """Queries for different tasks should NOT block each other."""
+        execution_order: list[str] = []
+
+        async def fake_impl(
+            prompt, *, task_id, session_id, working_dir, on_permission, on_question
+        ):
+            from agent.llm.claude_sdk import SDKStreamEvent
+
+            execution_order.append(f"start:{task_id}")
+            await asyncio.sleep(0.05)
+            execution_order.append(f"end:{task_id}")
+            yield SDKStreamEvent(type="result", content=prompt)
+
+        service._run_task_locked = fake_impl  # type: ignore[assignment]
+
+        async def collect(task_id, prompt):
+            events = []
+            async for event in service._run_task_impl(
+                prompt, task_id=task_id
+            ):
+                events.append(event)
+            return events
+
+        await asyncio.gather(
+            collect("user1", "hello"),
+            collect("user2", "world"),
+        )
+
+        # Both should start before either ends (concurrent)
+        starts = [e for e in execution_order if e.startswith("start:")]
+        assert len(starts) == 2
+        # Both starts should appear before both ends
+        first_end = next(i for i, e in enumerate(execution_order) if e.startswith("end:"))
+        assert first_end >= 2  # Both starts happened before first end
