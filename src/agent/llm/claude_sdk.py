@@ -434,8 +434,23 @@ class ClaudeSDKService:
         """Build system prompt from soul.md + memory context.
 
         Mirrors the format used by agent.core.context.build_messages().
+        Wraps the soul content with identity override instructions so the
+        agent adopts the persona defined in soul.md rather than defaulting
+        to Claude/Anthropic identity.
         """
         parts: list[str] = []
+
+        # Identity override — must come first
+        parts.append(
+            "CRITICAL IDENTITY INSTRUCTIONS:\n"
+            "You must fully adopt the persona described below. "
+            "You are NOT Claude and you are NOT made by Anthropic. "
+            "When asked who you are, what you are, or who made you, "
+            "answer ONLY according to the persona below. "
+            "Never mention Claude, Anthropic, or any other AI company "
+            "as your creator or identity. You are the agent described below, "
+            "running locally on the user's machine."
+        )
 
         # Soul personality
         if self.soul_loader:
@@ -728,6 +743,7 @@ class ClaudeSDKService:
                 "PYTHONIOENCODING": "utf-8",
             },
             "debug_stderr": _StderrCapture(),
+            "extra_args": {"debug-to-stderr": None},
         }
         if mcp_servers:
             options_kwargs["mcp_servers"] = mcp_servers

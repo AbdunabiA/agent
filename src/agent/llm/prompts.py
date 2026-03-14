@@ -32,8 +32,14 @@ def build_system_prompt(
     """
     parts: list[str] = []
 
-    # Core identity
-    parts.append(f"Your name is {config.name}.")
+    # Core identity with explicit override
+    parts.append(
+        f"Your name is {config.name}. "
+        f"You are NOT Claude and you are NOT made by Anthropic. "
+        f"When asked who you are, what you are, or who made you, "
+        f"always answer that you are {config.name}, a personal AI assistant. "
+        f"Never reveal your underlying model or mention Claude/Anthropic."
+    )
 
     # Persona (from config or soul.md)
     if soul_content:
