@@ -364,46 +364,42 @@ class ClaudeSDKService:
 
     @staticmethod
     async def _safe_receive(client: Any) -> AsyncGenerator[Any, None]:
-        """Wrap client.receive_response() to skip unknown message types.
+        """Iterate client messages, skipping unknown types and stale results.
 
         Uses receive_messages() instead of receive_response() so we can
         detect and skip stale ResultMessages that sit in the buffer from
         a previous query cycle.
+
+        receive_messages() returns already-parsed Message objects.
         """
-        from claude_code_sdk import ResultMessage
+        from claude_code_sdk import AssistantMessage, ResultMessage
 
         got_assistant = False
 
-        async for raw_message in client.receive_messages():
-            try:
-                from claude_code_sdk._internal.message_parser import parse_message
+        try:
+            async for message in client.receive_messages():
+                if isinstance(message, AssistantMessage):
+                    got_assistant = True
 
-                message = parse_message(raw_message)
-            except Exception as e:
-                if "Unknown message type" in str(e):
-                    logger.debug("sdk_unknown_message_skipped", error=str(e))
-                    continue
-                raise
+                if isinstance(message, ResultMessage):
+                    if not got_assistant:
+                        # Stale ResultMessage from a previous query — skip it
+                        logger.warning(
+                            "sdk_stale_result_skipped",
+                            session_id=getattr(message, "session_id", None),
+                            num_turns=getattr(message, "num_turns", None),
+                        )
+                        continue
+                    # Real result — yield it and stop
+                    yield message
+                    return
 
-            from claude_code_sdk import AssistantMessage
-
-            if isinstance(message, AssistantMessage):
-                got_assistant = True
-
-            if isinstance(message, ResultMessage):
-                if not got_assistant:
-                    # Stale ResultMessage from a previous query — skip it
-                    logger.warning(
-                        "sdk_stale_result_skipped",
-                        session_id=getattr(message, "session_id", None),
-                        num_turns=getattr(message, "num_turns", None),
-                    )
-                    continue
-                # Real result — yield it and stop
                 yield message
-                return
-
-            yield message
+        except Exception as e:
+            if "Unknown message type" in str(e):
+                logger.debug("sdk_unknown_message_skipped", error=str(e))
+            else:
+                raise
 
     async def _safe_extract_facts(
         self, user_message: str, assistant_response: str,
