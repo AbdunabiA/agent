@@ -713,17 +713,6 @@ class ClaudeSDKService:
 
             return PermissionResultAllow(updated_input=tool_input)
 
-        # Stderr capture
-        import io
-
-        class _StderrCapture(io.TextIOBase):
-            def write(self, s: str) -> int:
-                for line in s.splitlines():
-                    safe = line.rstrip().encode("ascii", errors="replace").decode("ascii")
-                    if safe:
-                        logger.debug("sdk_stderr", line=safe, task_id=task_id)
-                return len(s)
-
         # Query memory for system prompt
         facts, vector_results = await self._query_memory("")
         system_prompt = self._build_system_prompt(facts, vector_results)
@@ -742,8 +731,6 @@ class ClaudeSDKService:
                 "PYTHONUTF8": "1",
                 "PYTHONIOENCODING": "utf-8",
             },
-            "debug_stderr": _StderrCapture(),
-            "extra_args": {"debug-to-stderr": None},
         }
         if mcp_servers:
             options_kwargs["mcp_servers"] = mcp_servers
