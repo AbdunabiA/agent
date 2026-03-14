@@ -804,3 +804,174 @@ class TestQueryLockSerialization:
         # Both starts should appear before both ends
         first_end = next(i for i, e in enumerate(execution_order) if e.startswith("end:"))
         assert first_end >= 2  # Both starts happened before first end
+
+
+# ===================================================================
+# Stale ResultMessage detection
+# ===================================================================
+
+
+class TestStaleResultSkipping:
+    """Test that stale ResultMessages from previous queries are skipped."""
+
+    @pytest.mark.asyncio
+    async def test_stale_result_skipped(self):
+        """A ResultMessage before any AssistantMessage should be skipped."""
+        from claude_code_sdk import AssistantMessage, ResultMessage, TextBlock
+
+        # Simulate a stream that has a stale ResultMessage, then real messages
+        stale_result = ResultMessage(
+            subtype="success",
+            duration_ms=100,
+            duration_api_ms=50,
+            is_error=False,
+            num_turns=1,
+            session_id="old-session",
+            total_cost_usd=0.001,
+            usage={},
+            result="old response",
+        )
+        real_assistant = AssistantMessage(
+            content=[TextBlock(text="Hello!")],
+            model="claude-sonnet-4-6",
+        )
+        real_result = ResultMessage(
+            subtype="success",
+            duration_ms=2000,
+            duration_api_ms=1500,
+            is_error=False,
+            num_turns=1,
+            session_id="new-session",
+            total_cost_usd=0.01,
+            usage={},
+            result="Hello!",
+        )
+
+        # Mock client.receive_messages() to return raw dicts
+        raw_messages = [
+            {"type": "result", "subtype": "success", "duration_ms": 100,
+             "duration_api_ms": 50, "is_error": False, "num_turns": 1,
+             "session_id": "old-session", "total_cost_usd": 0.001},
+            {"type": "assistant", "message": {
+                "content": [{"type": "text", "text": "Hello!"}],
+                "model": "claude-sonnet-4-6",
+            }},
+            {"type": "result", "subtype": "success", "duration_ms": 2000,
+             "duration_api_ms": 1500, "is_error": False, "num_turns": 1,
+             "session_id": "new-session", "total_cost_usd": 0.01},
+        ]
+
+        async def mock_receive_messages():
+            for msg in raw_messages:
+                yield msg
+
+        mock_client = MagicMock()
+        mock_client.receive_messages = mock_receive_messages
+
+        messages = []
+        async for msg in ClaudeSDKService._safe_receive(mock_client):
+            messages.append(msg)
+
+        # Should have skipped the stale result, yielded assistant + real result
+        assert len(messages) == 2
+        assert isinstance(messages[0], AssistantMessage)
+        assert isinstance(messages[1], ResultMessage)
+        assert messages[1].session_id == "new-session"
+
+    @pytest.mark.asyncio
+    async def test_normal_flow_not_affected(self):
+        """Normal flow (AssistantMessage before ResultMessage) should work."""
+        raw_messages = [
+            {"type": "assistant", "message": {
+                "content": [{"type": "text", "text": "Hi!"}],
+                "model": "claude-sonnet-4-6",
+            }},
+            {"type": "result", "subtype": "success", "duration_ms": 2000,
+             "duration_api_ms": 1500, "is_error": False, "num_turns": 1,
+             "session_id": "sess-123", "total_cost_usd": 0.01},
+        ]
+
+        async def mock_receive_messages():
+            for msg in raw_messages:
+                yield msg
+
+        mock_client = MagicMock()
+        mock_client.receive_messages = mock_receive_messages
+
+        from claude_code_sdk import AssistantMessage, ResultMessage
+
+        messages = []
+        async for msg in ClaudeSDKService._safe_receive(mock_client):
+            messages.append(msg)
+
+        assert len(messages) == 2
+        assert isinstance(messages[0], AssistantMessage)
+        assert isinstance(messages[1], ResultMessage)
+
+    @pytest.mark.asyncio
+    async def test_unknown_message_type_skipped(self):
+        """Unknown message types should be skipped without error."""
+        raw_messages = [
+            {"type": "rate_limit_event", "data": {}},
+            {"type": "assistant", "message": {
+                "content": [{"type": "text", "text": "Hi!"}],
+                "model": "claude-sonnet-4-6",
+            }},
+            {"type": "result", "subtype": "success", "duration_ms": 2000,
+             "duration_api_ms": 1500, "is_error": False, "num_turns": 1,
+             "session_id": "sess-123", "total_cost_usd": 0.01},
+        ]
+
+        async def mock_receive_messages():
+            for msg in raw_messages:
+                yield msg
+
+        mock_client = MagicMock()
+        mock_client.receive_messages = mock_receive_messages
+
+        from claude_code_sdk import AssistantMessage, ResultMessage
+
+        messages = []
+        async for msg in ClaudeSDKService._safe_receive(mock_client):
+            messages.append(msg)
+
+        assert len(messages) == 2
+        assert isinstance(messages[0], AssistantMessage)
+        assert isinstance(messages[1], ResultMessage)
+
+    @pytest.mark.asyncio
+    async def test_multiple_stale_results_skipped(self):
+        """Multiple stale ResultMessages should all be skipped."""
+        raw_messages = [
+            {"type": "result", "subtype": "success", "duration_ms": 50,
+             "duration_api_ms": 30, "is_error": False, "num_turns": 0,
+             "session_id": "stale-1"},
+            {"type": "result", "subtype": "success", "duration_ms": 50,
+             "duration_api_ms": 30, "is_error": False, "num_turns": 0,
+             "session_id": "stale-2"},
+            {"type": "assistant", "message": {
+                "content": [{"type": "text", "text": "Real response"}],
+                "model": "claude-sonnet-4-6",
+            }},
+            {"type": "result", "subtype": "success", "duration_ms": 2000,
+             "duration_api_ms": 1500, "is_error": False, "num_turns": 1,
+             "session_id": "real-session"},
+        ]
+
+        async def mock_receive_messages():
+            for msg in raw_messages:
+                yield msg
+
+        mock_client = MagicMock()
+        mock_client.receive_messages = mock_receive_messages
+
+        from claude_code_sdk import AssistantMessage, ResultMessage
+
+        messages = []
+        async for msg in ClaudeSDKService._safe_receive(mock_client):
+            messages.append(msg)
+
+        assert len(messages) == 2
+        assert isinstance(messages[0], AssistantMessage)
+        assert isinstance(messages[1], ResultMessage)
+        assert messages[1].session_id == "real-session"

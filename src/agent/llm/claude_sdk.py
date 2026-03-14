@@ -364,19 +364,46 @@ class ClaudeSDKService:
 
     @staticmethod
     async def _safe_receive(client: Any) -> AsyncGenerator[Any, None]:
-        """Wrap client.receive_response() to skip unknown message types."""
-        response_iter = client.receive_response()
-        while True:
+        """Wrap client.receive_response() to skip unknown message types.
+
+        Uses receive_messages() instead of receive_response() so we can
+        detect and skip stale ResultMessages that sit in the buffer from
+        a previous query cycle.
+        """
+        from claude_code_sdk import ResultMessage
+
+        got_assistant = False
+
+        async for raw_message in client.receive_messages():
             try:
-                message = await response_iter.__anext__()
-                yield message
-            except StopAsyncIteration:
-                break
+                from claude_code_sdk._internal.message_parser import parse_message
+
+                message = parse_message(raw_message)
             except Exception as e:
                 if "Unknown message type" in str(e):
                     logger.debug("sdk_unknown_message_skipped", error=str(e))
                     continue
                 raise
+
+            from claude_code_sdk import AssistantMessage
+
+            if isinstance(message, AssistantMessage):
+                got_assistant = True
+
+            if isinstance(message, ResultMessage):
+                if not got_assistant:
+                    # Stale ResultMessage from a previous query — skip it
+                    logger.warning(
+                        "sdk_stale_result_skipped",
+                        session_id=getattr(message, "session_id", None),
+                        num_turns=getattr(message, "num_turns", None),
+                    )
+                    continue
+                # Real result — yield it and stop
+                yield message
+                return
+
+            yield message
 
     async def _safe_extract_facts(
         self, user_message: str, assistant_response: str,
@@ -747,8 +774,20 @@ class ClaudeSDKService:
 
             result_text = ""
             num_turns = 0
+            msg_count = 0
+            t_query = time.monotonic()
 
             async for message in self._safe_receive(client):
+                msg_count += 1
+                msg_type = type(message).__name__
+                logger.debug(
+                    "sdk_message_received",
+                    task_id=task_id,
+                    msg_type=msg_type,
+                    msg_num=msg_count,
+                    elapsed_ms=int((time.monotonic() - t_query) * 1000),
+                )
+
                 cancel_event = self._cancel_events.get(task_id)
                 if cancel_event and cancel_event.is_set():
                     with contextlib.suppress(Exception):
@@ -842,11 +881,25 @@ class ClaudeSDKService:
                         },
                     )
 
+            elapsed_ms = int((time.monotonic() - t_query) * 1000)
+            logger.info(
+                "sdk_query_complete",
+                task_id=task_id,
+                messages_received=msg_count,
+                result_len=len(result_text),
+                num_turns=num_turns,
+                elapsed_ms=elapsed_ms,
+            )
             self._status[task_id] = SDKTaskStatus.COMPLETED
 
         except Exception as e:
             self._status[task_id] = SDKTaskStatus.FAILED
-            logger.error("sdk_task_failed", error=str(e), task_id=task_id)
+            logger.error(
+                "sdk_task_failed",
+                error=str(e),
+                error_type=type(e).__name__,
+                task_id=task_id,
+            )
 
             # Client is dead — remove it so next message reconnects
             await self.disconnect_client(task_id)
