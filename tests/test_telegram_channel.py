@@ -30,6 +30,15 @@ def _make_tg_message(
     return msg
 
 
+async def _drain_background_tasks(channel: Any) -> None:
+    """Await all background tasks spawned by the channel."""
+    for tasks in channel._background_tasks.values():
+        for task, _desc in tasks:
+            if not task.done():
+                with contextlib.suppress(Exception):
+                    await task
+
+
 @pytest.fixture
 def config() -> TelegramConfig:
     return TelegramConfig(enabled=True, token="fake-token", allowed_users=[])
@@ -150,6 +159,7 @@ class TestHandleText:
     ) -> None:
         msg = _make_tg_message(text="What is 2+2?")
         await channel._handle_text(msg)
+        await _drain_background_tasks(channel)
 
         mock_agent_loop.process_message.assert_called_once()
         call_args = mock_agent_loop.process_message.call_args
@@ -164,6 +174,7 @@ class TestHandleText:
         status_msg = AsyncMock()
         msg.answer.return_value = status_msg
         await channel._handle_text(msg)
+        await _drain_background_tasks(channel)
 
         # Status message should be sent, then edited with the response
         msg.answer.assert_called()
@@ -184,6 +195,7 @@ class TestHandleText:
         msg = _make_tg_message(text="test event")
         await channel._handle_text(msg)
 
+        # Event is emitted synchronously before spawning background task
         assert len(events) == 1
         assert events[0]["content"] == "test event"
 
@@ -196,7 +208,9 @@ class TestHandleText:
         msg2 = _make_tg_message(user_id=42, text="second")
 
         await channel._handle_text(msg1)
+        await _drain_background_tasks(channel)
         await channel._handle_text(msg2)
+        await _drain_background_tasks(channel)
 
         # Should have one session for user 42
         session = await session_store.get("telegram:42")
@@ -212,6 +226,7 @@ class TestHandleText:
         status_msg = AsyncMock()
         msg.answer.return_value = status_msg
         await channel._handle_text(msg)
+        await _drain_background_tasks(channel)
 
         # Error should be shown by editing the status message
         status_msg.edit_text.assert_called_with(

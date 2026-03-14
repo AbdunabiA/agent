@@ -253,7 +253,9 @@ class TelegramChannel(BaseChannel):
         self._dispatcher: Any = None
         self._router: Any = None
         self._approval_futures: dict[str, asyncio.Future[bool]] = {}
-        self._had_approvals: bool = False
+        self._had_approvals: dict[str, bool] = {}  # per-user approval tracking
+        # Background task tracking: user_id → list of (task, description)
+        self._background_tasks: dict[str, list[tuple[asyncio.Task[Any], str]]] = {}
 
         if AIOGRAM_AVAILABLE and config.token:
             self._bot = Bot(token=config.token)
@@ -409,6 +411,7 @@ class TelegramChannel(BaseChannel):
         self._router.message(Command("remind"))(self._cmd_remind)
         self._router.message(Command("reminders"))(self._cmd_reminders)
         self._router.message(Command("run"))(self._cmd_run)
+        self._router.message(Command("tasks"))(self._cmd_tasks)
 
         # Media handlers (before catch-all text)
         self._router.message(F.content_type == ContentType.VOICE)(self._handle_voice)
@@ -452,6 +455,7 @@ class TelegramChannel(BaseChannel):
             "/workdir — View/change working directory\n"
             "/remind <delay> <text> — Set a reminder\n"
             "/reminders — List pending reminders\n"
+            "/tasks — Show running background tasks\n"
             "/pause — Pause message processing\n"
             "/resume — Resume message processing\n"
             "/mute — Disable heartbeat\n"
@@ -1020,51 +1024,53 @@ class TelegramChannel(BaseChannel):
         from agent.tools.builtins.telegram_post import set_telegram_post_context
         set_telegram_post_context(channel="telegram", user_id=str(user_id))
 
-        await self.send_typing(str(user_id))
-
         agent_loop, session_store = self._resolve_components(str(user_id))
         session_id = self._make_session_id(str(user_id))
         session = await session_store.get_or_create(
             session_id=session_id, channel="telegram"
         )
 
-        typing_task = asyncio.create_task(self._keep_typing(str(user_id)))
+        status_message = None
         try:
-            response_text = await self._process_via_sdk_or_loop(
-                prompt, session, agent_loop,
-                user_id=str(user_id),
-            )
-            typing_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await typing_task
+            status_message = await message.answer("\u23f3 Processing\u2026")
+        except Exception:
+            pass
 
-            await self.send_message(
-                OutgoingMessage(
-                    content=response_text,
-                    channel_user_id=str(user_id),
-                    parse_mode="Markdown",
-                )
-            )
-        except Exception as e:
-            typing_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await typing_task
-            logger.error("run_shortcut_error", error=str(e), alias=alias)
-            await message.answer("Sorry, something went wrong running that shortcut.")
+        # Dispatch to background
+        task = asyncio.create_task(
+            self._run_text_task(
+                user_text=prompt,
+                session=session,
+                agent_loop=agent_loop,
+                status_message=status_message,
+                user_id=str(user_id),
+                message=message,
+            ),
+            name=f"run:{user_id}:{alias}",
+        )
+        self._register_background_task(str(user_id), task, f"/run {alias}")
+
+    async def _cmd_tasks(self, message: Any) -> None:
+        """Handle /tasks — show running background tasks."""
+        if not self._check_message(message):
+            return
+
+        active = self._get_active_tasks()
+        if not active:
+            await message.answer("No tasks running right now. I'm free to chat!")
+            return
+
+        lines = [f"\u2699\ufe0f <b>Running tasks ({len(active)}):</b>\n"]
+        for uid, desc in active:
+            lines.append(f"\u2022 {desc}")
+        await message.answer("\n".join(lines), parse_mode="HTML")
 
     # ------------------------------------------------------------------
     # Media handlers
     # ------------------------------------------------------------------
 
     async def _handle_voice(self, message: Any) -> None:
-        """Handle voice messages with full voice pipeline support.
-
-        Flow:
-        1. Download voice .ogg file
-        2. If STT is llm_native: send audio to LLM directly (legacy behaviour)
-        3. Otherwise: transcribe -> show transcription -> process text via agent loop
-        4. If voice reply enabled: synthesize response and send as voice message
-        """
+        """Handle voice messages — download, transcribe, dispatch to background."""
         if not self._check_message(message):
             return
         if self._paused:
@@ -1072,7 +1078,6 @@ class TelegramChannel(BaseChannel):
             return
 
         user_id = message.from_user.id
-        status_message = None
 
         # Set file-send context for voice messages
         from agent.tools.builtins.send_file import set_file_send_context
@@ -1096,19 +1101,51 @@ class TelegramChannel(BaseChannel):
                 session_id=session_id, channel="telegram"
             )
 
+            # Dispatch to background
+            task = asyncio.create_task(
+                self._run_voice_task(
+                    audio_bytes=audio_bytes,
+                    session=session,
+                    agent_loop=agent_loop,
+                    user_id=str(user_id),
+                    message=message,
+                ),
+                name=f"voice:{user_id}",
+            )
+            self._register_background_task(str(user_id), task, "[voice message]")
+
+        except Exception as e:
+            logger.error("voice_handle_error", error=str(e), user_id=user_id)
+            await message.answer(
+                "Sorry, I couldn't process your voice message. "
+                "Try sending it as text instead."
+            )
+
+    async def _run_voice_task(
+        self,
+        audio_bytes: bytes,
+        session: Any,
+        agent_loop: Any,
+        user_id: str,
+        message: Any,
+    ) -> None:
+        """Background coroutine that processes a voice message."""
+        status_message = None
+        try:
             response_text: str
 
             # Standalone STT path (whisper, deepgram, etc.)
             if self.voice_pipeline and not self.voice_pipeline.is_llm_native():
-                stt_result = await self.voice_pipeline.transcribe(audio_bytes, "audio/ogg")
+                stt_result = await self.voice_pipeline.transcribe(
+                    audio_bytes, "audio/ogg",
+                )
 
                 # Show transcription to user
                 if self.voice_pipeline.config.voice_transcription_prefix:
-                    transcription_msg = f"🎤 *Transcription:* {stt_result.text}"
+                    transcription_msg = f"\U0001f3a4 *Transcription:* {stt_result.text}"
                     await message.reply(transcription_msg, parse_mode="Markdown")
 
                 # Send status message and process via agent loop or SDK
-                status_message = None
                 try:
                     status_message = await message.answer("\u23f3 Processing\u2026")
                 except Exception:
@@ -1117,11 +1154,11 @@ class TelegramChannel(BaseChannel):
                 response_text = await self._process_via_sdk_or_loop(
                     stt_result.text, session, agent_loop,
                     status_message=status_message,
-                    user_id=str(user_id),
+                    user_id=user_id,
                 )
 
             else:
-                # LLM native: send audio directly (current behaviour)
+                # LLM native: send audio directly
                 audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
                 multimodal_content: list[dict[str, Any]] = [
                     {
@@ -1148,7 +1185,9 @@ class TelegramChannel(BaseChannel):
                 )
 
             # Voice reply if enabled
-            if self.voice_pipeline and self.voice_pipeline.should_voice_reply("telegram"):
+            if self.voice_pipeline and self.voice_pipeline.should_voice_reply(
+                "telegram",
+            ):
                 tts_result = await self.voice_pipeline.synthesize(response_text)
                 if tts_result and AIOGRAM_AVAILABLE:
                     from aiogram.types import BufferedInputFile
@@ -1157,7 +1196,6 @@ class TelegramChannel(BaseChannel):
                         file=tts_result.audio_data,
                         filename="response.ogg",
                     )
-                    # Delete the status message before sending voice
                     if status_message is not None:
                         with contextlib.suppress(Exception):
                             await status_message.delete()
@@ -1165,23 +1203,27 @@ class TelegramChannel(BaseChannel):
                         voice=voice_file,
                         duration=int(tts_result.duration_seconds),
                     )
-                    # Also send text for accessibility
                     if len(response_text) > 200:
                         short = response_text[:200] + "..."
-                        await message.reply(f"\U0001f4dd _{short}_", parse_mode="Markdown")
+                        await message.reply(
+                            f"\U0001f4dd _{short}_", parse_mode="Markdown",
+                        )
                     return
 
-            # Text-only reply — edit the status message with the response
+            # Text-only reply
             await self._replace_status_with_response(
-                status_message, str(user_id), response_text
+                status_message, user_id, response_text
             )
 
         except Exception as e:
-            logger.error("voice_handle_error", error=str(e), user_id=user_id)
-            await message.answer(
-                "Sorry, I couldn't process your voice message. "
-                "Try sending it as text instead."
-            )
+            logger.error("voice_task_error", error=str(e), user_id=user_id)
+            with contextlib.suppress(Exception):
+                await message.answer(
+                    "Sorry, I couldn't process your voice message. "
+                    "Try sending it as text instead."
+                )
+        finally:
+            self._unregister_background_task(user_id)
 
     async def _handle_photo(self, message: Any) -> None:
         """Handle photo messages — download highest-res, base64-encode, send to LLM."""
@@ -1257,7 +1299,7 @@ class TelegramChannel(BaseChannel):
             )
 
     async def _handle_document(self, message: Any) -> None:
-        """Handle document uploads — save to data/uploads/, inform agent."""
+        """Handle document uploads — save to data/uploads/, dispatch to background."""
         if not self._check_message(message):
             return
         if self._paused:
@@ -1265,7 +1307,6 @@ class TelegramChannel(BaseChannel):
             return
 
         user_id = message.from_user.id
-        status_message = None
 
         try:
             doc = message.document
@@ -1302,33 +1343,65 @@ class TelegramChannel(BaseChannel):
 
             status_message = None
             try:
-                status_message = await message.answer("\u23f3 Processing document\u2026")
+                status_message = await message.answer(
+                    "\u23f3 Processing document\u2026",
+                )
             except Exception:
                 pass
 
-            try:
-                response_text = await self._process_via_sdk_or_loop(
-                    description, session, self.agent_loop,
+            # Dispatch to background
+            task = asyncio.create_task(
+                self._run_document_task(
+                    description=description,
+                    session=session,
                     status_message=status_message,
                     user_id=str(user_id),
-                )
-
-                await self._replace_status_with_response(
-                    status_message, str(user_id), response_text
-                )
-            except Exception:
-                if status_message:
-                    with contextlib.suppress(Exception):
-                        await status_message.edit_text(
-                            "Sorry, I couldn't process your document."
-                        )
-                raise
+                    message=message,
+                ),
+                name=f"doc:{user_id}:{filename[:30]}",
+            )
+            self._register_background_task(
+                str(user_id), task, f"[document: {filename}]",
+            )
 
         except Exception as e:
             logger.error("document_handle_error", error=str(e), user_id=user_id)
-            # Only send if not already handled above
-            if not status_message:
-                await message.answer("Sorry, I couldn't process your document.")
+            await message.answer("Sorry, I couldn't process your document.")
+
+    async def _run_document_task(
+        self,
+        description: str,
+        session: Any,
+        status_message: Any | None,
+        user_id: str,
+        message: Any,
+    ) -> None:
+        """Background coroutine that processes a document upload."""
+        try:
+            response_text = await self._process_via_sdk_or_loop(
+                description, session, self.agent_loop,
+                status_message=status_message,
+                user_id=user_id,
+            )
+
+            await self._replace_status_with_response(
+                status_message, user_id, response_text
+            )
+
+        except Exception as e:
+            logger.error("document_task_error", error=str(e), user_id=user_id)
+            if status_message:
+                with contextlib.suppress(Exception):
+                    await status_message.edit_text(
+                        "Sorry, I couldn't process your document."
+                    )
+            else:
+                with contextlib.suppress(Exception):
+                    await message.answer(
+                        "Sorry, I couldn't process your document."
+                    )
+        finally:
+            self._unregister_background_task(user_id)
 
     # ------------------------------------------------------------------
     # Callback dispatcher
@@ -1777,7 +1850,7 @@ class TelegramChannel(BaseChannel):
             accumulated = ""
             sdk_session_id = session.metadata.get("sdk_session_id")
             last_status_update = 0.0
-            self._had_approvals = False
+            self._had_approvals[user_id or ""] = False
             import time as _time
 
             # Permission callback: ask user via inline keyboard for dangerous tools
@@ -1840,7 +1913,11 @@ class TelegramChannel(BaseChannel):
         return response.content
 
     async def _handle_text(self, message: Any) -> None:
-        """Process an incoming text message through the agent loop."""
+        """Process an incoming text message through the agent loop.
+
+        Processing is dispatched to a background task so the bot stays
+        responsive.  The user can send new messages while tasks run.
+        """
         if not self._check_message(message):
             return
 
@@ -1902,16 +1979,40 @@ class TelegramChannel(BaseChannel):
         except Exception:
             pass
 
+        # Dispatch processing to a background task so the bot stays free
+        task = asyncio.create_task(
+            self._run_text_task(
+                user_text=user_text,
+                session=session,
+                agent_loop=agent_loop,
+                status_message=status_message,
+                user_id=str(user_id),
+                message=message,
+            ),
+            name=f"task:{user_id}:{user_text[:40]}",
+        )
+        self._register_background_task(str(user_id), task, user_text[:80])
+
+    async def _run_text_task(
+        self,
+        user_text: str,
+        session: Any,
+        agent_loop: Any,
+        status_message: Any | None,
+        user_id: str,
+        message: Any,
+    ) -> None:
+        """Background coroutine that processes a text message and delivers the response."""
         try:
             response_text = await self._process_via_sdk_or_loop(
                 user_text, session, agent_loop,
                 status_message=status_message,
-                user_id=str(user_id),
+                user_id=user_id,
             )
 
-            # Edit the placeholder with the final response
+            # Deliver the response
             await self._replace_status_with_response(
-                status_message, str(user_id), response_text
+                status_message, user_id, response_text
             )
 
         except Exception as e:
@@ -1920,16 +2021,54 @@ class TelegramChannel(BaseChannel):
                 error=str(e),
                 user_id=user_id,
             )
-            # Edit the placeholder with error text
             if status_message:
                 with contextlib.suppress(Exception):
                     await status_message.edit_text(
                         "Sorry, something went wrong processing your message."
                     )
             else:
-                await message.answer(
-                    "Sorry, something went wrong processing your message."
-                )
+                with contextlib.suppress(Exception):
+                    await message.answer(
+                        "Sorry, something went wrong processing your message."
+                    )
+        finally:
+            self._unregister_background_task(user_id)
+
+    # ------------------------------------------------------------------
+    # Background task management
+    # ------------------------------------------------------------------
+
+    def _register_background_task(
+        self, user_id: str, task: asyncio.Task[Any], description: str,
+    ) -> None:
+        """Register a background task for a user."""
+        if user_id not in self._background_tasks:
+            self._background_tasks[user_id] = []
+        self._background_tasks[user_id].append((task, description))
+
+    def _unregister_background_task(self, user_id: str) -> None:
+        """Remove completed tasks for a user."""
+        if user_id in self._background_tasks:
+            self._background_tasks[user_id] = [
+                (t, d) for t, d in self._background_tasks[user_id]
+                if not t.done()
+            ]
+            if not self._background_tasks[user_id]:
+                del self._background_tasks[user_id]
+
+    def _get_active_tasks(self, user_id: str | None = None) -> list[tuple[str, str]]:
+        """Get active background tasks as (user_id, description) pairs."""
+        result: list[tuple[str, str]] = []
+        targets = (
+            {user_id: self._background_tasks.get(user_id, [])}
+            if user_id
+            else self._background_tasks
+        )
+        for uid, tasks in targets.items():
+            for task, desc in tasks:
+                if not task.done():
+                    result.append((uid, desc))
+        return result
 
     # ------------------------------------------------------------------
     # Status message helpers
@@ -1969,7 +2108,7 @@ class TelegramChannel(BaseChannel):
 
         # If approvals happened, the status message is buried under approval
         # messages.  Delete it and send a fresh message at the bottom.
-        if status_message is not None and self._had_approvals:
+        if status_message is not None and self._had_approvals.get(channel_user_id):
             with contextlib.suppress(Exception):
                 await status_message.delete()
             status_message = None  # fall through to "no status_message" path
@@ -2363,7 +2502,7 @@ class TelegramChannel(BaseChannel):
         self._approval_futures[request_id] = future
 
         # Track that approvals happened so response goes to bottom of chat
-        self._had_approvals = True
+        self._had_approvals[channel_user_id] = True
 
         try:
             await self._bot.send_message(

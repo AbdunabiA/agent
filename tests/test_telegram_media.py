@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -80,6 +82,15 @@ def channel(
             return ch
 
 
+async def _drain_background_tasks(channel: Any) -> None:
+    """Await all background tasks spawned by the channel."""
+    for tasks in channel._background_tasks.values():
+        for task, _desc in tasks:
+            if not task.done():
+                with contextlib.suppress(Exception):
+                    await task
+
+
 class TestVoice:
     """Voice message handling tests."""
 
@@ -107,6 +118,7 @@ class TestVoice:
         mock_agent_loop.llm.completion.return_value = llm_response
 
         await channel._handle_voice(msg)
+        await _drain_background_tasks(channel)
 
         mock_agent_loop.llm.completion.assert_awaited_once()
         call_args = mock_agent_loop.llm.completion.call_args
@@ -234,6 +246,7 @@ class TestDocument:
 
         with patch("agent.channels.telegram._UPLOAD_DIR", tmp_path / "uploads"):
             await channel._handle_document(msg)
+            await _drain_background_tasks(channel)
 
         mock_agent_loop.process_message.assert_awaited_once()
         call_text = mock_agent_loop.process_message.call_args[0][0]
