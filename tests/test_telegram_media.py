@@ -84,11 +84,15 @@ def channel(
 
 async def _drain_background_tasks(channel: Any) -> None:
     """Await all background tasks spawned by the channel."""
-    for tasks in channel._background_tasks.values():
-        for task, _desc in tasks:
-            if not task.done():
-                with contextlib.suppress(Exception):
-                    await task
+    all_tasks = [
+        task
+        for tasks in list(channel._background_tasks.values())
+        for task, _desc in list(tasks)
+    ]
+    for task in all_tasks:
+        if not task.done():
+            with contextlib.suppress(Exception):
+                await task
 
 
 class TestVoice:

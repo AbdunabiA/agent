@@ -2047,14 +2047,21 @@ class TelegramChannel(BaseChannel):
         self._background_tasks[user_id].append((task, description))
 
     def _unregister_background_task(self, user_id: str) -> None:
-        """Remove completed tasks for a user."""
-        if user_id in self._background_tasks:
-            self._background_tasks[user_id] = [
-                (t, d) for t, d in self._background_tasks[user_id]
-                if not t.done()
-            ]
-            if not self._background_tasks[user_id]:
-                del self._background_tasks[user_id]
+        """Remove completed tasks for a user.
+
+        Called from within a task's ``finally`` block, where the calling
+        task is still technically "running" (``t.done()`` is False).  We
+        also exclude the *current* asyncio task so it gets cleaned up.
+        """
+        if user_id not in self._background_tasks:
+            return
+        current = asyncio.current_task()
+        self._background_tasks[user_id] = [
+            (t, d) for t, d in self._background_tasks[user_id]
+            if not t.done() and t is not current
+        ]
+        if not self._background_tasks[user_id]:
+            del self._background_tasks[user_id]
 
     def _get_active_tasks(self, user_id: str | None = None) -> list[tuple[str, str]]:
         """Get active background tasks as (user_id, description) pairs."""
