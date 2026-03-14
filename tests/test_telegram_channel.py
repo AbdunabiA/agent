@@ -1394,3 +1394,182 @@ class TestKeepTyping:
 
         # Should not raise — task cancelled cleanly
         assert task.done()
+
+
+# =====================================================================
+# Orchestrator integration
+# =====================================================================
+
+
+class TestOrchestratorDispatch:
+    """Tests for _dispatch_to_agent routing through the orchestrator."""
+
+    async def test_dispatch_uses_orchestrator_when_available(
+        self, channel: TelegramChannel, mock_agent_loop: AsyncMock,
+    ) -> None:
+        """When orchestrator is set, _dispatch_to_agent should call run_channel_task."""
+        from agent.core.subagent import SubAgentResult, SubAgentStatus
+
+        mock_orch = AsyncMock()
+        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
+            task_id="t1",
+            role_name="channel",
+            status=SubAgentStatus.COMPLETED,
+            output="Orchestrated reply",
+        ))
+        channel.orchestrator = mock_orch
+
+        session = MagicMock()
+        session.id = "sess-1"
+        session.metadata = {}
+
+        result = await channel._dispatch_to_agent(
+            "hello", session, mock_agent_loop, user_id="42",
+        )
+
+        assert result == "Orchestrated reply"
+        mock_orch.run_channel_task.assert_awaited_once()
+        # Should NOT have called _process_via_sdk_or_loop directly
+        mock_agent_loop.process_message.assert_not_called()
+
+    async def test_dispatch_falls_back_without_orchestrator(
+        self, channel: TelegramChannel, mock_agent_loop: AsyncMock,
+    ) -> None:
+        """Without orchestrator, _dispatch_to_agent should use agent_loop directly."""
+        channel.orchestrator = None
+        channel.sdk_service = None  # force LiteLLM path
+
+        session = MagicMock()
+        session.id = "sess-1"
+        session.metadata = {}
+
+        result = await channel._dispatch_to_agent(
+            "hello", session, mock_agent_loop, user_id="42",
+        )
+
+        assert result == "Agent reply"
+        mock_agent_loop.process_message.assert_awaited_once()
+
+    async def test_dispatch_cancelled_returns_empty(
+        self, channel: TelegramChannel,
+    ) -> None:
+        """Cancelled orchestrator tasks should return empty string."""
+        from agent.core.subagent import SubAgentResult, SubAgentStatus
+
+        mock_orch = AsyncMock()
+        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
+            task_id="t1",
+            role_name="channel",
+            status=SubAgentStatus.CANCELLED,
+        ))
+        channel.orchestrator = mock_orch
+
+        session = MagicMock()
+        session.id = "sess-1"
+        session.metadata = {}
+
+        result = await channel._dispatch_to_agent(
+            "hello", session, MagicMock(), user_id="42",
+        )
+
+        assert result == ""
+
+    async def test_dispatch_failed_raises(
+        self, channel: TelegramChannel,
+    ) -> None:
+        """Failed orchestrator tasks should raise RuntimeError."""
+        from agent.core.subagent import SubAgentResult, SubAgentStatus
+
+        mock_orch = AsyncMock()
+        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
+            task_id="t1",
+            role_name="channel",
+            status=SubAgentStatus.FAILED,
+            error="Timed out after 300s.",
+        ))
+        channel.orchestrator = mock_orch
+
+        session = MagicMock()
+        session.id = "sess-1"
+        session.metadata = {}
+
+        with pytest.raises(RuntimeError, match="Timed out"):
+            await channel._dispatch_to_agent(
+                "hello", session, MagicMock(), user_id="42",
+            )
+
+    async def test_dispatch_passes_permission_callback(
+        self, channel: TelegramChannel,
+    ) -> None:
+        """Orchestrator should receive on_permission callback."""
+        from agent.core.subagent import SubAgentResult, SubAgentStatus
+
+        mock_orch = AsyncMock()
+        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
+            task_id="t1",
+            role_name="channel",
+            status=SubAgentStatus.COMPLETED,
+            output="done",
+        ))
+        channel.orchestrator = mock_orch
+
+        session = MagicMock()
+        session.id = "sess-1"
+        session.metadata = {}
+
+        await channel._dispatch_to_agent(
+            "hello", session, MagicMock(), user_id="42",
+        )
+
+        call_kwargs = mock_orch.run_channel_task.call_args[1]
+        assert call_kwargs.get("on_permission") is not None
+
+    async def test_cancel_uses_orchestrator(
+        self, channel: TelegramChannel,
+    ) -> None:
+        """_cancel_user_tasks should call orchestrator.cancel when available."""
+        mock_orch = AsyncMock()
+        mock_orch.cancel = AsyncMock(return_value=True)
+        channel.orchestrator = mock_orch
+
+        gate = asyncio.Event()
+
+        async def blocked() -> None:
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                pass
+
+        t = asyncio.create_task(blocked())
+        channel._register_background_task("42", t, "test task")
+
+        # Create a session with the correct key (telegram:42)
+        await channel.session_store.get_or_create("telegram:42", channel="telegram")
+
+        cancelled = await channel._cancel_user_tasks("42")
+
+        assert cancelled >= 1
+        mock_orch.cancel.assert_awaited_once()
+
+    async def test_handle_text_uses_orchestrator_e2e(
+        self, channel: TelegramChannel, mock_agent_loop: AsyncMock,
+    ) -> None:
+        """End-to-end: _handle_text should route through orchestrator."""
+        from agent.core.subagent import SubAgentResult, SubAgentStatus
+
+        mock_orch = AsyncMock()
+        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
+            task_id="t1",
+            role_name="channel",
+            status=SubAgentStatus.COMPLETED,
+            output="Orchestrated response",
+        ))
+        channel.orchestrator = mock_orch
+
+        msg = _make_tg_message(text="do something")
+        await channel._handle_text(msg)
+        await _drain_background_tasks(channel)
+
+        mock_orch.run_channel_task.assert_awaited_once()
+        # Agent loop should NOT have been called directly
+        mock_agent_loop.process_message.assert_not_called()

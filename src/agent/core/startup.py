@@ -409,6 +409,7 @@ class Application:
                     event_bus=self.event_bus,
                     tool_registry=registry,
                     teams=teams,
+                    sdk_service=self.sdk_service,
                 )
                 set_orchestrator(self.orchestrator)
                 logger.info(
@@ -468,6 +469,7 @@ class Application:
                     scheduler=self.scheduler,
                     audit_log=self.audit,
                     cost_tracker=self.cost_tracker,
+                    orchestrator=self.orchestrator,
                 )
                 self._channels.append(telegram)
                 self.permissions.set_approval_channel(telegram)

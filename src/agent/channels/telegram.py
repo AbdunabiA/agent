@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from agent.core.cost_tracker import CostTracker
     from agent.core.events import EventBus
     from agent.core.heartbeat import HeartbeatDaemon
+    from agent.core.orchestrator import SubAgentOrchestrator
     from agent.core.scheduler import TaskScheduler
     from agent.core.session import SessionStore
     from agent.voice.pipeline import VoicePipeline
@@ -236,6 +237,7 @@ class TelegramChannel(BaseChannel):
         scheduler: TaskScheduler | None = None,
         audit_log: AuditLog | None = None,
         cost_tracker: CostTracker | None = None,
+        orchestrator: SubAgentOrchestrator | None = None,
     ) -> None:
         super().__init__(config=config, event_bus=event_bus, session_store=session_store)
         self.agent_loop = agent_loop
@@ -246,6 +248,7 @@ class TelegramChannel(BaseChannel):
         self.scheduler = scheduler
         self.audit_log = audit_log
         self.cost_tracker = cost_tracker
+        self.orchestrator = orchestrator
         self._workspace_agent_loops: dict[str, AgentLoop] = {}
         self._workspace_session_stores: dict[str, SessionStore] = {}
         self._polling_task: asyncio.Task[Any] | None = None
@@ -1086,8 +1089,9 @@ class TelegramChannel(BaseChannel):
     async def _cancel_user_tasks(self, user_id: str) -> int:
         """Cancel all running tasks for a user.
 
-        Cancels both the asyncio background tasks and the underlying
-        SDK sessions so the AI stops working immediately.
+        When an orchestrator is available, cancels via the orchestrator
+        (which handles SDK interruption, event emission, and cleanup).
+        Otherwise falls back to raw asyncio task cancellation.
 
         Returns the number of tasks cancelled.
         """
@@ -1096,23 +1100,31 @@ class TelegramChannel(BaseChannel):
             return 0
 
         cancelled = 0
+
+        # Cancel via orchestrator when available (handles SDK interruption)
+        if self.orchestrator is not None:
+            session_id = self._make_session_id(user_id)
+            session = await self.session_store.get(session_id)
+            if session:
+                with contextlib.suppress(Exception):
+                    await self.orchestrator.cancel(session.id)
+
+        # Also cancel the asyncio wrapper tasks
         for task, _desc in tasks:
             if not task.done():
                 task.cancel()
                 cancelled += 1
 
-        # Also interrupt the SDK session so the AI stops mid-stream
-        if self.sdk_service is not None:
+        # Also interrupt the SDK session directly (in case no orchestrator)
+        if self.orchestrator is None and self.sdk_service is not None:
             from agent.llm.claude_sdk import ClaudeSDKService
 
             sdk: ClaudeSDKService = self.sdk_service  # type: ignore[assignment]
-            # The SDK task_id is the session ID — look it up
             session_id = self._make_session_id(user_id)
             session = await self.session_store.get(session_id)
             if session:
-                sdk_task_id = session.id
                 with contextlib.suppress(Exception):
-                    await sdk.cancel_task(sdk_task_id)
+                    await sdk.cancel_task(session.id)
 
         # Wait briefly for tasks to handle cancellation
         for task, _desc in tasks:
@@ -1211,7 +1223,7 @@ class TelegramChannel(BaseChannel):
                 except Exception:
                     pass
 
-                response_text = await self._process_via_sdk_or_loop(
+                response_text = await self._dispatch_to_agent(
                     stt_result.text, session, agent_loop,
                     status_message=status_message,
                     user_id=user_id,
@@ -1438,7 +1450,7 @@ class TelegramChannel(BaseChannel):
     ) -> None:
         """Background coroutine that processes a document upload."""
         try:
-            response_text = await self._process_via_sdk_or_loop(
+            response_text = await self._dispatch_to_agent(
                 description, session, self.agent_loop,
                 status_message=status_message,
                 user_id=user_id,
@@ -1972,6 +1984,92 @@ class TelegramChannel(BaseChannel):
         )
         return response.content
 
+    async def _dispatch_to_agent(
+        self,
+        text: str,
+        session: Any,
+        agent_loop: Any,
+        status_message: Any | None = None,
+        user_id: str | None = None,
+    ) -> str:
+        """Dispatch a message through the orchestrator or fall back to direct processing.
+
+        When an orchestrator is available, this uses ``run_channel_task``
+        which gives concurrency limits, timeouts, cancellation, and event
+        tracking for free.  Otherwise it falls back to the direct
+        ``_process_via_sdk_or_loop`` path.
+
+        Returns the response text.
+        """
+        if self.orchestrator is not None:
+            from agent.core.subagent import SubAgentStatus
+
+            # Build on_progress callback for status message updates
+            on_progress = None
+            if status_message is not None:
+                import time as _time
+
+                last_update = [0.0]
+
+                async def _on_progress(event: Any) -> None:
+                    if event.type == "tool_use":
+                        now = _time.monotonic()
+                        if now - last_update[0] > 2.0:
+                            tool_name = event.data.get("tool", "tool")
+                            is_sub = event.data.get("subagent", False)
+                            prefix = "\U0001f50d Researching" if is_sub else "\u2699\ufe0f Working"
+                            with contextlib.suppress(Exception):
+                                await status_message.edit_text(
+                                    f"{prefix}\u2026 using {tool_name}"
+                                )
+                            last_update[0] = now
+
+                on_progress = _on_progress
+
+            # Build on_permission callback
+            on_permission = None
+            if user_id and AIOGRAM_AVAILABLE:
+                async def _on_permission(
+                    tool_name: str, details: str, tool_input: dict[str, Any],
+                ) -> bool:
+                    import uuid
+
+                    request_id = str(uuid.uuid4())[:8]
+                    return await self.send_approval_request(
+                        channel_user_id=user_id,
+                        tool_name=tool_name,
+                        arguments=tool_input,
+                        request_id=request_id,
+                    )
+
+                on_permission = _on_permission
+
+            # Reset approval tracking for this user
+            self._had_approvals[user_id or ""] = False
+
+            result = await self.orchestrator.run_channel_task(
+                prompt=text,
+                task_id=session.id,
+                session=session,
+                on_progress=on_progress,
+                on_permission=on_permission,
+            )
+
+            if result.status == SubAgentStatus.COMPLETED:
+                return result.output or "[No response]"
+            elif result.status == SubAgentStatus.CANCELLED:
+                return ""  # cancelled tasks don't need a response
+            else:
+                error_msg = result.error or "Unknown error"
+                raise RuntimeError(error_msg)
+
+        # Fallback: direct processing without orchestrator
+        return await self._process_via_sdk_or_loop(
+            text, session, agent_loop,
+            status_message=status_message,
+            user_id=user_id,
+        )
+
     async def _handle_text(self, message: Any) -> None:
         """Process an incoming text message through the agent loop.
 
@@ -2073,7 +2171,7 @@ class TelegramChannel(BaseChannel):
     ) -> None:
         """Background coroutine that processes a text message and delivers the response."""
         try:
-            response_text = await self._process_via_sdk_or_loop(
+            response_text = await self._dispatch_to_agent(
                 user_text, session, agent_loop,
                 status_message=status_message,
                 user_id=user_id,

@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from agent.config import OrchestrationConfig
     from agent.core.agent_loop import AgentLoop
     from agent.core.events import EventBus
+    from agent.llm.claude_sdk import ClaudeSDKService
     from agent.tools.registry import ToolRegistry
 
 logger = structlog.get_logger(__name__)
@@ -55,11 +56,13 @@ class SubAgentOrchestrator:
         event_bus: EventBus,
         tool_registry: ToolRegistry,
         teams: list[AgentTeam] | None = None,
+        sdk_service: ClaudeSDKService | None = None,
     ) -> None:
         self.agent_loop = agent_loop
         self.config = config
         self.event_bus = event_bus
         self.tool_registry = tool_registry
+        self.sdk_service = sdk_service
         self.teams = {t.name: t for t in (teams or [])}
 
         self._running_tasks: dict[str, asyncio.Task[SubAgentResult]] = {}
@@ -382,6 +385,214 @@ class SubAgentOrchestrator:
             })
 
             return result
+
+    async def run_channel_task(
+        self,
+        prompt: str,
+        task_id: str,
+        session: Session,
+        *,
+        on_progress: Any | None = None,
+        on_permission: Any | None = None,
+    ) -> SubAgentResult:
+        """Run a user message as an orchestrated task.
+
+        This is the entry point for channels (Telegram, webchat) to dispatch
+        work through the orchestrator.  If an SDK service is available, it
+        routes through the SDK; otherwise it falls back to the agent loop.
+
+        The task is tracked, has timeouts, and can be cancelled via
+        ``cancel(task_id)``.
+
+        Args:
+            prompt: The user message to process.
+            task_id: Unique ID for this task (e.g. session ID).
+            session: The conversation session.
+            on_progress: Optional async callback ``(event) -> None`` for
+                streaming progress (tool use, text chunks).
+            on_permission: Optional async callback for tool approval.
+
+        Returns:
+            SubAgentResult with the response text or error.
+        """
+        # Concurrency check
+        active = sum(1 for t in self._running_tasks.values() if not t.done())
+        if active >= self.config.max_concurrent_agents:
+            return SubAgentResult(
+                task_id=task_id,
+                role_name="channel",
+                status=SubAgentStatus.FAILED,
+                error=f"Too many tasks running ({active}). "
+                      f"Use /stop to cancel some.",
+            )
+
+        await self.event_bus.emit(Events.SUBAGENT_SPAWNED, {
+            "task_id": task_id,
+            "role": "channel",
+            "instruction": prompt[:200],
+        })
+
+        exec_coro = self._execute_channel_task(
+            prompt, task_id, session,
+            on_progress=on_progress,
+            on_permission=on_permission,
+        )
+        exec_task = asyncio.ensure_future(exec_coro)
+        self._running_tasks[task_id] = exec_task
+
+        result: SubAgentResult
+        try:
+            result = await asyncio.wait_for(
+                exec_task,
+                timeout=self.config.subagent_timeout,
+            )
+        except TimeoutError:
+            result = SubAgentResult(
+                task_id=task_id,
+                role_name="channel",
+                status=SubAgentStatus.FAILED,
+                error=f"Task timed out after {self.config.subagent_timeout}s.",
+            )
+            await self.event_bus.emit(Events.SUBAGENT_FAILED, {
+                "task_id": task_id,
+                "error": result.error,
+            })
+        except asyncio.CancelledError:
+            result = SubAgentResult(
+                task_id=task_id,
+                role_name="channel",
+                status=SubAgentStatus.CANCELLED,
+            )
+            await self.event_bus.emit(Events.SUBAGENT_CANCELLED, {
+                "task_id": task_id,
+            })
+        except Exception as e:
+            result = SubAgentResult(
+                task_id=task_id,
+                role_name="channel",
+                status=SubAgentStatus.FAILED,
+                error=f"Unexpected error: {e}",
+            )
+            await self.event_bus.emit(Events.SUBAGENT_FAILED, {
+                "task_id": task_id,
+                "error": result.error,
+            })
+        finally:
+            self._running_tasks.pop(task_id, None)
+
+        self._results[task_id] = result
+        return result
+
+    async def _execute_channel_task(
+        self,
+        prompt: str,
+        task_id: str,
+        session: Session,
+        *,
+        on_progress: Any | None = None,
+        on_permission: Any | None = None,
+    ) -> SubAgentResult:
+        """Execute a channel task via SDK or agent loop."""
+        import time as _time
+
+        start = _time.monotonic()
+
+        await self.event_bus.emit(Events.SUBAGENT_STARTED, {
+            "task_id": task_id,
+            "role": "channel",
+        })
+
+        try:
+            # Prefer SDK path when available
+            if self.sdk_service is not None:
+                response_text = await self._execute_via_sdk(
+                    prompt, task_id, session,
+                    on_progress=on_progress,
+                    on_permission=on_permission,
+                )
+            else:
+                response = await self.agent_loop.process_message(
+                    prompt, session, trigger="user_message"
+                )
+                response_text = response.content
+
+            duration_ms = int((_time.monotonic() - start) * 1000)
+
+            result = SubAgentResult(
+                task_id=task_id,
+                role_name="channel",
+                status=SubAgentStatus.COMPLETED,
+                output=response_text,
+                duration_ms=duration_ms,
+            )
+
+            await self.event_bus.emit(Events.SUBAGENT_COMPLETED, {
+                "task_id": task_id,
+                "role": "channel",
+                "duration_ms": duration_ms,
+            })
+
+            return result
+
+        except asyncio.CancelledError:
+            raise  # let outer handler deal with it
+        except Exception as e:
+            duration_ms = int((_time.monotonic() - start) * 1000)
+            result = SubAgentResult(
+                task_id=task_id,
+                role_name="channel",
+                status=SubAgentStatus.FAILED,
+                error=str(e),
+                duration_ms=duration_ms,
+            )
+            await self.event_bus.emit(Events.SUBAGENT_FAILED, {
+                "task_id": task_id,
+                "error": str(e),
+            })
+            return result
+
+    async def _execute_via_sdk(
+        self,
+        prompt: str,
+        task_id: str,
+        session: Session,
+        *,
+        on_progress: Any | None = None,
+        on_permission: Any | None = None,
+    ) -> str:
+        """Execute a task through the Claude SDK, streaming events."""
+        from agent.llm.claude_sdk import ClaudeSDKService
+
+        sdk: ClaudeSDKService = self.sdk_service  # type: ignore[assignment]
+        accumulated = ""
+        sdk_session_id = session.metadata.get("sdk_session_id")
+
+        async for event in sdk.run_task_stream(
+            prompt=prompt,
+            task_id=task_id,
+            session_id=sdk_session_id,
+            on_permission=on_permission,
+        ):
+            if event.type == "text":
+                if not (event.data and event.data.get("subagent")):
+                    accumulated += event.content
+            elif event.type == "result":
+                sdk_sid = event.data.get("session_id")
+                if sdk_sid:
+                    session.metadata["sdk_session_id"] = sdk_sid
+                if event.content and len(event.content) > len(accumulated):
+                    accumulated = event.content
+            elif event.type == "error":
+                raise RuntimeError(event.content)
+
+            # Forward progress events to the caller
+            if on_progress is not None:
+                try:
+                    await on_progress(event)
+                except Exception:
+                    pass
+
+        return accumulated or "[No response]"
 
     def _create_scoped_registry(self, role: SubAgentRole) -> ScopedToolRegistry:
         """Create a filtered copy of the tool registry for a sub-agent.
