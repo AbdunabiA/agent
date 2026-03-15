@@ -1551,6 +1551,413 @@ class TestOrchestratorDispatch:
         assert cancelled >= 1
         mock_orch.cancel.assert_awaited_once()
 
+    async def test_dispatch_completed_empty_output_returns_no_response(
+        self, channel: TelegramChannel,
+    ) -> None:
+        """Completed with empty output should return '[No response]'."""
+        from agent.core.subagent import SubAgentResult, SubAgentStatus
+
+        mock_orch = AsyncMock()
+        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
+            task_id="t1",
+            role_name="channel",
+            status=SubAgentStatus.COMPLETED,
+            output="",
+        ))
+        channel.orchestrator = mock_orch
+
+        session = MagicMock()
+        session.id = "sess-1"
+        session.metadata = {}
+
+        result = await channel._dispatch_to_agent(
+            "hello", session, MagicMock(), user_id="42",
+        )
+        assert result == "[No response]"
+
+    async def test_dispatch_failed_no_error_msg_raises_unknown(
+        self, channel: TelegramChannel,
+    ) -> None:
+        """Failed with no error message should raise 'Unknown error'."""
+        from agent.core.subagent import SubAgentResult, SubAgentStatus
+
+        mock_orch = AsyncMock()
+        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
+            task_id="t1",
+            role_name="channel",
+            status=SubAgentStatus.FAILED,
+            error=None,
+        ))
+        channel.orchestrator = mock_orch
+
+        session = MagicMock()
+        session.id = "sess-1"
+        session.metadata = {}
+
+        with pytest.raises(RuntimeError, match="Unknown error"):
+            await channel._dispatch_to_agent(
+                "hello", session, MagicMock(), user_id="42",
+            )
+
+    async def test_dispatch_on_progress_updates_status_message(
+        self, channel: TelegramChannel,
+    ) -> None:
+        """on_progress should edit the status message on tool_use events."""
+        from agent.core.subagent import SubAgentResult, SubAgentStatus
+
+        status_msg = AsyncMock()
+
+        async def fake_run_channel_task(
+            prompt: str, task_id: str, session: Any, **kwargs: Any
+        ) -> SubAgentResult:
+            # Simulate a tool_use progress event
+            on_progress = kwargs.get("on_progress")
+            if on_progress:
+                event = MagicMock()
+                event.type = "tool_use"
+                event.data = {"tool": "shell_exec", "subagent": False}
+                await on_progress(event)
+            return SubAgentResult(
+                task_id="t1",
+                role_name="channel",
+                status=SubAgentStatus.COMPLETED,
+                output="done",
+            )
+
+        mock_orch = AsyncMock()
+        mock_orch.run_channel_task = AsyncMock(side_effect=fake_run_channel_task)
+        channel.orchestrator = mock_orch
+
+        session = MagicMock()
+        session.id = "sess-1"
+        session.metadata = {}
+
+        await channel._dispatch_to_agent(
+            "hello", session, MagicMock(),
+            status_message=status_msg, user_id="42",
+        )
+
+        status_msg.edit_text.assert_awaited_once()
+        edit_text = status_msg.edit_text.call_args[0][0]
+        assert "shell_exec" in edit_text
+
+    async def test_dispatch_on_progress_throttles_updates(
+        self, channel: TelegramChannel,
+    ) -> None:
+        """on_progress should throttle edits to at most one per 2 seconds."""
+        from agent.core.subagent import SubAgentResult, SubAgentStatus
+
+        status_msg = AsyncMock()
+
+        async def fake_run_channel_task(
+            prompt: str, task_id: str, session: Any, **kwargs: Any
+        ) -> SubAgentResult:
+            on_progress = kwargs.get("on_progress")
+            if on_progress:
+                # Fire two events back-to-back (same monotonic time)
+                for tool in ("tool_a", "tool_b"):
+                    event = MagicMock()
+                    event.type = "tool_use"
+                    event.data = {"tool": tool, "subagent": False}
+                    await on_progress(event)
+            return SubAgentResult(
+                task_id="t1",
+                role_name="channel",
+                status=SubAgentStatus.COMPLETED,
+                output="done",
+            )
+
+        mock_orch = AsyncMock()
+        mock_orch.run_channel_task = AsyncMock(side_effect=fake_run_channel_task)
+        channel.orchestrator = mock_orch
+
+        session = MagicMock()
+        session.id = "sess-1"
+        session.metadata = {}
+
+        await channel._dispatch_to_agent(
+            "hello", session, MagicMock(),
+            status_message=status_msg, user_id="42",
+        )
+
+        # First call goes through; second is throttled (<2s apart)
+        assert status_msg.edit_text.await_count == 1
+
+    async def test_dispatch_on_progress_subagent_prefix(
+        self, channel: TelegramChannel,
+    ) -> None:
+        """Subagent tool_use should show 'Researching' prefix."""
+        from agent.core.subagent import SubAgentResult, SubAgentStatus
+
+        status_msg = AsyncMock()
+
+        async def fake_run_channel_task(
+            prompt: str, task_id: str, session: Any, **kwargs: Any
+        ) -> SubAgentResult:
+            on_progress = kwargs.get("on_progress")
+            if on_progress:
+                event = MagicMock()
+                event.type = "tool_use"
+                event.data = {"tool": "web_search", "subagent": True}
+                await on_progress(event)
+            return SubAgentResult(
+                task_id="t1",
+                role_name="channel",
+                status=SubAgentStatus.COMPLETED,
+                output="done",
+            )
+
+        mock_orch = AsyncMock()
+        mock_orch.run_channel_task = AsyncMock(side_effect=fake_run_channel_task)
+        channel.orchestrator = mock_orch
+
+        session = MagicMock()
+        session.id = "sess-1"
+        session.metadata = {}
+
+        await channel._dispatch_to_agent(
+            "hello", session, MagicMock(),
+            status_message=status_msg, user_id="42",
+        )
+
+        edit_text = status_msg.edit_text.call_args[0][0]
+        assert "Researching" in edit_text
+
+    async def test_dispatch_no_progress_without_status_message(
+        self, channel: TelegramChannel,
+    ) -> None:
+        """No on_progress should be passed when status_message is None."""
+        from agent.core.subagent import SubAgentResult, SubAgentStatus
+
+        mock_orch = AsyncMock()
+        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
+            task_id="t1",
+            role_name="channel",
+            status=SubAgentStatus.COMPLETED,
+            output="done",
+        ))
+        channel.orchestrator = mock_orch
+
+        session = MagicMock()
+        session.id = "sess-1"
+        session.metadata = {}
+
+        await channel._dispatch_to_agent(
+            "hello", session, MagicMock(),
+            status_message=None, user_id="42",
+        )
+
+        call_kwargs = mock_orch.run_channel_task.call_args[1]
+        assert call_kwargs.get("on_progress") is None
+
+    async def test_dispatch_no_permission_without_user_id(
+        self, channel: TelegramChannel,
+    ) -> None:
+        """No on_permission should be passed when user_id is None."""
+        from agent.core.subagent import SubAgentResult, SubAgentStatus
+
+        mock_orch = AsyncMock()
+        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
+            task_id="t1",
+            role_name="channel",
+            status=SubAgentStatus.COMPLETED,
+            output="done",
+        ))
+        channel.orchestrator = mock_orch
+
+        session = MagicMock()
+        session.id = "sess-1"
+        session.metadata = {}
+
+        await channel._dispatch_to_agent(
+            "hello", session, MagicMock(),
+            user_id=None,
+        )
+
+        call_kwargs = mock_orch.run_channel_task.call_args[1]
+        assert call_kwargs.get("on_permission") is None
+
+    async def test_dispatch_resets_had_approvals(
+        self, channel: TelegramChannel,
+    ) -> None:
+        """_had_approvals should be reset to False before orchestrator call."""
+        from agent.core.subagent import SubAgentResult, SubAgentStatus
+
+        channel._had_approvals["42"] = True  # leftover from previous request
+
+        mock_orch = AsyncMock()
+        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
+            task_id="t1",
+            role_name="channel",
+            status=SubAgentStatus.COMPLETED,
+            output="done",
+        ))
+        channel.orchestrator = mock_orch
+
+        session = MagicMock()
+        session.id = "sess-1"
+        session.metadata = {}
+
+        await channel._dispatch_to_agent(
+            "hello", session, MagicMock(), user_id="42",
+        )
+
+        assert channel._had_approvals["42"] is False
+
+    async def test_dispatch_passes_correct_args_to_orchestrator(
+        self, channel: TelegramChannel,
+    ) -> None:
+        """run_channel_task should receive prompt, task_id=session.id, session."""
+        from agent.core.subagent import SubAgentResult, SubAgentStatus
+
+        mock_orch = AsyncMock()
+        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
+            task_id="t1",
+            role_name="channel",
+            status=SubAgentStatus.COMPLETED,
+            output="ok",
+        ))
+        channel.orchestrator = mock_orch
+
+        session = MagicMock()
+        session.id = "my-session-123"
+        session.metadata = {}
+
+        await channel._dispatch_to_agent(
+            "test prompt", session, MagicMock(), user_id="42",
+        )
+
+        call_args = mock_orch.run_channel_task.call_args
+        assert call_args[1]["prompt"] == "test prompt"
+        assert call_args[1]["task_id"] == "my-session-123"
+        assert call_args[1]["session"] is session
+
+    # ------------------------------------------------------------------
+    # _cancel_user_tasks edge cases
+    # ------------------------------------------------------------------
+
+    async def test_cancel_orchestrator_no_session(
+        self, channel: TelegramChannel,
+    ) -> None:
+        """Cancel with orchestrator but no session should still cancel asyncio tasks."""
+        mock_orch = AsyncMock()
+        mock_orch.cancel = AsyncMock(return_value=True)
+        channel.orchestrator = mock_orch
+
+        gate = asyncio.Event()
+
+        async def blocked() -> None:
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                pass
+
+        t = asyncio.create_task(blocked())
+        channel._register_background_task("99", t, "test")
+
+        # No session created for this user → orchestrator.cancel should NOT be called
+        cancelled = await channel._cancel_user_tasks("99")
+
+        assert cancelled == 1
+        assert t.cancelled() or t.done()
+        mock_orch.cancel.assert_not_awaited()
+
+    async def test_cancel_orchestrator_exception_still_cancels_tasks(
+        self, channel: TelegramChannel,
+    ) -> None:
+        """If orchestrator.cancel raises, asyncio tasks should still be cancelled."""
+        mock_orch = AsyncMock()
+        mock_orch.cancel = AsyncMock(side_effect=RuntimeError("boom"))
+        channel.orchestrator = mock_orch
+
+        gate = asyncio.Event()
+
+        async def blocked() -> None:
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                pass
+
+        t = asyncio.create_task(blocked())
+        channel._register_background_task("42", t, "test")
+
+        await channel.session_store.get_or_create("telegram:42", channel="telegram")
+
+        cancelled = await channel._cancel_user_tasks("42")
+
+        assert cancelled == 1
+        assert t.cancelled() or t.done()
+
+    async def test_cancel_without_orchestrator_with_sdk(
+        self, channel: TelegramChannel,
+    ) -> None:
+        """Without orchestrator, should fall back to SDK cancel_task."""
+        channel.orchestrator = None
+        mock_sdk = AsyncMock()
+        mock_sdk.cancel_task = AsyncMock()
+        channel.sdk_service = mock_sdk
+
+        gate = asyncio.Event()
+
+        async def blocked() -> None:
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                pass
+
+        t = asyncio.create_task(blocked())
+        channel._register_background_task("42", t, "test")
+
+        await channel.session_store.get_or_create("telegram:42", channel="telegram")
+
+        cancelled = await channel._cancel_user_tasks("42")
+
+        assert cancelled == 1
+        mock_sdk.cancel_task.assert_awaited_once()
+
+    async def test_cancel_without_orchestrator_without_sdk(
+        self, channel: TelegramChannel,
+    ) -> None:
+        """Without orchestrator or SDK, should just cancel asyncio tasks."""
+        channel.orchestrator = None
+        channel.sdk_service = None
+
+        gate = asyncio.Event()
+
+        async def blocked() -> None:
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                pass
+
+        t = asyncio.create_task(blocked())
+        channel._register_background_task("42", t, "test")
+
+        cancelled = await channel._cancel_user_tasks("42")
+
+        assert cancelled == 1
+        assert t.cancelled() or t.done()
+
+    async def test_cancel_already_done_tasks_returns_zero(
+        self, channel: TelegramChannel,
+    ) -> None:
+        """Tasks that are already done should not increment the cancelled count."""
+        channel.orchestrator = None
+        channel.sdk_service = None
+
+        # Create and immediately complete a task
+        done_task = asyncio.create_task(asyncio.sleep(0))
+        await done_task  # let it finish
+        channel._register_background_task("42", done_task, "done task")
+
+        cancelled = await channel._cancel_user_tasks("42")
+
+        assert cancelled == 0
+
+    # ------------------------------------------------------------------
+    # E2E integration edge cases
+    # ------------------------------------------------------------------
+
     async def test_handle_text_uses_orchestrator_e2e(
         self, channel: TelegramChannel, mock_agent_loop: AsyncMock,
     ) -> None:
@@ -1572,4 +1979,122 @@ class TestOrchestratorDispatch:
 
         mock_orch.run_channel_task.assert_awaited_once()
         # Agent loop should NOT have been called directly
+        mock_agent_loop.process_message.assert_not_called()
+
+    async def test_handle_text_orchestrator_failure_delivers_error(
+        self, channel: TelegramChannel,
+    ) -> None:
+        """When orchestrator returns FAILED, the error message should reach the user."""
+        from agent.core.subagent import SubAgentResult, SubAgentStatus
+
+        mock_orch = AsyncMock()
+        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
+            task_id="t1",
+            role_name="channel",
+            status=SubAgentStatus.FAILED,
+            error="Concurrency limit reached",
+        ))
+        channel.orchestrator = mock_orch
+
+        msg = _make_tg_message(text="do something")
+        await channel._handle_text(msg)
+        await _drain_background_tasks(channel)
+
+        # The status message (returned by msg.answer) should be edited with error
+        status_msg = msg.answer.return_value
+        status_msg.edit_text.assert_awaited()
+        error_text = status_msg.edit_text.call_args[0][0]
+        assert "sorry" in error_text.lower() or "wrong" in error_text.lower()
+
+    async def test_handle_text_cancelled_no_response_sent(
+        self, channel: TelegramChannel,
+    ) -> None:
+        """When orchestrator returns CANCELLED, status should be cleaned up."""
+        from agent.core.subagent import SubAgentResult, SubAgentStatus
+
+        mock_orch = AsyncMock()
+        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
+            task_id="t1",
+            role_name="channel",
+            status=SubAgentStatus.CANCELLED,
+        ))
+        channel.orchestrator = mock_orch
+
+        msg = _make_tg_message(text="do something")
+        await channel._handle_text(msg)
+        await _drain_background_tasks(channel)
+
+        # Status message should show "No response" since empty string is returned
+        status_msg = msg.answer.return_value
+        if status_msg.edit_text.called:
+            edit_text = status_msg.edit_text.call_args[0][0]
+            assert "no response" in edit_text.lower()
+
+    async def test_document_handler_routes_through_orchestrator(
+        self,
+        channel: TelegramChannel,
+        mock_agent_loop: AsyncMock,
+    ) -> None:
+        """Document handler should use orchestrator when available."""
+        from agent.core.subagent import SubAgentResult, SubAgentStatus
+
+        mock_orch = AsyncMock()
+        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
+            task_id="t1",
+            role_name="channel",
+            status=SubAgentStatus.COMPLETED,
+            output="Got your document",
+        ))
+        channel.orchestrator = mock_orch
+
+        msg = _make_tg_message()
+        msg.document = MagicMock()
+        msg.document.file_id = "doc123"
+        msg.document.file_name = "report.pdf"
+        msg.document.mime_type = "application/pdf"
+        msg.document.file_size = 12345
+        msg.caption = None
+
+        file_mock = MagicMock()
+        file_mock.file_path = "documents/report.pdf"
+        channel._bot.get_file = AsyncMock(return_value=file_mock)
+
+        from io import BytesIO
+
+        async def fake_download(path: str, buf: BytesIO) -> None:
+            buf.write(b"fake-pdf-content")
+
+        channel._bot.download_file = AsyncMock(side_effect=fake_download)
+
+        from pathlib import Path as _Path
+
+        with patch("agent.channels.telegram._UPLOAD_DIR", _Path("/tmp/test_uploads")):
+            with patch("agent.channels.telegram.os.makedirs"):
+                with patch.object(_Path, "write_bytes"):
+                    await channel._handle_document(msg)
+                    await _drain_background_tasks(channel)
+
+        mock_orch.run_channel_task.assert_awaited_once()
+        mock_agent_loop.process_message.assert_not_called()
+
+    async def test_run_command_routes_through_orchestrator(
+        self, channel: TelegramChannel, mock_agent_loop: AsyncMock,
+    ) -> None:
+        """/run command should route through orchestrator."""
+        from agent.core.subagent import SubAgentResult, SubAgentStatus
+
+        mock_orch = AsyncMock()
+        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
+            task_id="t1",
+            role_name="channel",
+            status=SubAgentStatus.COMPLETED,
+            output="Review complete",
+        ))
+        channel.orchestrator = mock_orch
+
+        msg = _make_tg_message(text="/run review")
+        await channel._cmd_run(msg)
+        await _drain_background_tasks(channel)
+
+        mock_orch.run_channel_task.assert_awaited_once()
         mock_agent_loop.process_message.assert_not_called()
