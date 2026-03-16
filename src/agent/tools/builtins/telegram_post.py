@@ -7,6 +7,7 @@ is an admin, and send direct messages to users who have started the bot.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,7 +23,14 @@ logger = structlog.get_logger(__name__)
 # Global state — set during startup and before each message
 _global_event_bus: EventBus | None = None
 _global_scheduler: Any | None = None  # TaskScheduler
-_global_context: dict[str, str | None] = {"channel": None, "user_id": None}
+
+# Per-task context vars — safe for concurrent asyncio tasks (GAP 15)
+_channel_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "tg_post_channel", default=None,
+)
+_user_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "tg_post_user_id", default=None,
+)
 
 
 def set_telegram_post_bus(event_bus: EventBus) -> None:
@@ -41,8 +49,8 @@ def set_telegram_post_context(
     channel: str | None = None, user_id: str | None = None,
 ) -> None:
     """Update the current channel/user context."""
-    _global_context["channel"] = channel
-    _global_context["user_id"] = user_id
+    _channel_var.set(channel)
+    _user_id_var.set(user_id)
 
 
 def _parse_delay(delay_str: str) -> timedelta | None:
@@ -262,7 +270,7 @@ async def schedule_post(
             return f"[ERROR] Photo not found: {resolved}"
         photo_path = str(resolved)
 
-    run_at = datetime.now() + td
+    run_at = datetime.now(tz=timezone.utc) + td
 
     if _global_scheduler is None:
         return "[ERROR] Scheduler not available — cannot schedule posts."
@@ -283,7 +291,7 @@ async def schedule_post(
         description=description,
         run_at=run_at,
         channel="telegram",
-        user_id=_global_context.get("user_id"),
+        user_id=_user_id_var.get(),
     )
 
     logger.info(

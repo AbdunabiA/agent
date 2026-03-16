@@ -8,6 +8,7 @@ Phase 4: Adds memory injection (facts, vectors, soul.md)
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -74,6 +75,7 @@ class AgentLoop:
         skill_builder_enabled: bool = False,
         orchestration_enabled: bool = False,
         platform_capabilities: str | None = None,
+        use_controller: bool = False,
     ) -> None:
         self.llm = llm
         self.config = config
@@ -92,6 +94,8 @@ class AgentLoop:
         self._skill_builder_enabled = skill_builder_enabled
         self._orchestration_enabled = orchestration_enabled
         self._platform_capabilities = platform_capabilities
+        self._use_controller = use_controller
+        self._default_tool_registry: Any = None  # Optional ScopedToolRegistry override
         self._background_tasks: set[asyncio.Task[None]] = set()
 
         # Build system prompt with soul.md content if available
@@ -102,6 +106,7 @@ class AgentLoop:
             skill_builder_enabled=skill_builder_enabled,
             orchestration_enabled=orchestration_enabled,
             platform_capabilities=platform_capabilities,
+            use_controller=use_controller,
         )
 
     async def _add_and_persist(self, session: Session, message: Message) -> None:
@@ -118,6 +123,7 @@ class AgentLoop:
         user_message: str,
         session: Session,
         trigger: str = "user_message",
+        tool_registry_override: Any | None = None,
     ) -> LLMResponse:
         """Process a message with full tool-calling support.
 
@@ -174,8 +180,9 @@ class AgentLoop:
             plan = await self.planner.create_plan(user_message, session)
             logger.info("plan_created", goal=plan.goal, steps=len(plan.steps))
 
-        # Get tool schemas
-        tool_schemas = registry.get_tool_schemas(enabled_only=True)
+        # Get tool schemas (use override if provided, e.g. scoped sub-agent registry)
+        effective_registry = tool_registry_override or self._default_tool_registry or registry
+        tool_schemas = effective_registry.get_tool_schemas(enabled_only=True)
 
         # ReAct loop
         iteration = 0
@@ -327,7 +334,11 @@ class AgentLoop:
             ),
         ))
 
-        final = await self.llm.completion(messages=self._build_messages(session, plan))
+        final = await self.llm.completion(
+            messages=self._build_messages(
+                session, plan, relevant_facts, vector_results, tool_schemas,
+            )
+        )
         await self._add_and_persist(session, Message(
             role="assistant",
             content=final.content,
@@ -467,18 +478,47 @@ class AgentLoop:
                 skill_builder_enabled=self._skill_builder_enabled,
                 orchestration_enabled=self._orchestration_enabled,
                 platform_capabilities=self._platform_capabilities,
+                use_controller=self._use_controller,
             )
 
         from agent.core.context import build_messages
+        from agent.llm.prompts import build_runtime_context
 
         # Get model name safely (llm may be mocked in tests)
         model = getattr(getattr(self.llm, "config", None), "default", None)
         if not isinstance(model, str):
             model = "claude-sonnet-4-5-20250929"
 
+        # Build runtime context (channel, capabilities, model)
+        channel = str(session.metadata.get("channel", "cli"))
+
+        enabled_tools: list[str] = []
+        if self.tool_executor:
+            with contextlib.suppress(Exception):
+                enabled_tools = [
+                    t.name for t in self.tool_executor.registry.list_tools()
+                    if t.enabled
+                ]
+
+        tool_names = set(enabled_tools)
+        runtime_ctx = build_runtime_context(
+            channel=channel,
+            model_name=model,
+            enabled_tools=enabled_tools,
+            has_memory=self.fact_store is not None,
+            has_voice=False,  # not accessible from agent loop
+            has_heartbeat=False,  # not accessible from agent loop
+            has_browser=bool(tool_names & {"browser_navigate"}),
+            has_desktop=bool(tool_names & {"screen_capture", "desktop_capabilities"}),
+            has_skills=self._skill_builder_enabled,
+            has_orchestration=self._orchestration_enabled,
+        )
+
+        system_with_context = f"{self.system_prompt}\n\n{runtime_ctx}"
+
         return build_messages(
             session=session,
-            system_prompt=self.system_prompt,
+            system_prompt=system_with_context,
             plan=plan,
             tool_schemas=tool_schemas,
             model=model,
@@ -552,6 +592,7 @@ class AgentLoop:
         user_message: str,
         session: Session,
         trigger: str = "user_message",
+        tool_registry_override: Any = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Process a message with streaming LLM responses.
 
@@ -590,8 +631,9 @@ class AgentLoop:
             plan = await self.planner.create_plan(user_message, session)
             logger.info("plan_created", goal=plan.goal, steps=len(plan.steps))
 
-        # Get tool schemas
-        tool_schemas = registry.get_tool_schemas(enabled_only=True)
+        # Get tool schemas (use override if provided, e.g. scoped sub-agent registry)
+        effective_registry = tool_registry_override or self._default_tool_registry or registry
+        tool_schemas = effective_registry.get_tool_schemas(enabled_only=True)
 
         # ReAct loop with streaming
         iteration = 0
@@ -784,7 +826,9 @@ class AgentLoop:
         final_usage: TokenUsage | None = None
         final_model = ""
         async for chunk in self.llm.stream_completion(
-            messages=self._build_messages(session, plan)
+            messages=self._build_messages(
+                session, plan, relevant_facts, vector_results, tool_schemas,
+            )
         ):
             if chunk.done:
                 final_usage = chunk.usage

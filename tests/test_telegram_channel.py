@@ -324,7 +324,7 @@ class TestHandleText:
         await channel._handle_text(msg1)
         await channel._handle_text(msg2)
 
-        # Both should be registered
+        # Both should be registered as background tasks
         await asyncio.sleep(0.01)
         active = channel._get_active_tasks("42")
         assert len(active) == 2
@@ -1723,10 +1723,10 @@ class TestOrchestratorDispatch:
         edit_text = status_msg.edit_text.call_args[0][0]
         assert "Researching" in edit_text
 
-    async def test_dispatch_no_progress_without_status_message(
+    async def test_dispatch_progress_always_provided(
         self, channel: TelegramChannel,
     ) -> None:
-        """No on_progress should be passed when status_message is None."""
+        """on_progress is always provided (for text buffering), even without status_message."""
         from agent.core.subagent import SubAgentResult, SubAgentStatus
 
         mock_orch = AsyncMock()
@@ -1748,7 +1748,7 @@ class TestOrchestratorDispatch:
         )
 
         call_kwargs = mock_orch.run_channel_task.call_args[1]
-        assert call_kwargs.get("on_progress") is None
+        assert call_kwargs.get("on_progress") is not None
 
     async def test_dispatch_no_permission_without_user_id(
         self, channel: TelegramChannel,
@@ -2098,3 +2098,336 @@ class TestOrchestratorDispatch:
 
         mock_orch.run_channel_task.assert_awaited_once()
         mock_agent_loop.process_message.assert_not_called()
+
+
+# =====================================================================
+# Intermediate streaming
+# =====================================================================
+
+def _make_stream_event(
+    event_type: str, content: str = "", data: dict[str, Any] | None = None,
+) -> MagicMock:
+    """Create a mock SDKStreamEvent-like object."""
+    ev = MagicMock()
+    ev.type = event_type
+    ev.content = content
+    ev.data = data or {}
+    return ev
+
+
+class TestIntermediateStreaming:
+    """Tests for buffer-and-flush intermediate text streaming to Telegram."""
+
+    async def _run_dispatch_with_events(
+        self,
+        channel: Any,
+        events: list[Any],
+        final_output: str = "final answer",
+    ) -> tuple[str, dict[str, Any]]:
+        """Helper: set up orchestrator mock that fires events via on_progress,
+        then call _dispatch_to_agent.  Returns (result_text, stream_state).
+        """
+        from agent.core.subagent import SubAgentResult, SubAgentStatus
+
+        async def _fake_run_channel_task(
+            prompt: str, task_id: str, session: Any,
+            on_progress: Any = None, on_permission: Any = None,
+        ) -> SubAgentResult:
+            if on_progress:
+                for ev in events:
+                    await on_progress(ev)
+            return SubAgentResult(
+                task_id="t1",
+                role_name="channel",
+                status=SubAgentStatus.COMPLETED,
+                output=final_output,
+            )
+
+        mock_orch = AsyncMock()
+        mock_orch.run_channel_task = AsyncMock(side_effect=_fake_run_channel_task)
+        channel.orchestrator = mock_orch
+
+        session = AsyncMock()
+        session.id = "sess1"
+
+        status_msg = AsyncMock()
+        status_msg.delete = AsyncMock()
+        status_msg.edit_text = AsyncMock()
+
+        stream_state: dict[str, Any] = {"status_consumed": False}
+
+        result = await channel._dispatch_to_agent(
+            "hello", session, AsyncMock(),
+            status_message=status_msg,
+            user_id="111",
+            stream_state=stream_state,
+        )
+        return result, stream_state
+
+    async def test_intermediate_text_sent_on_tool_use(
+        self, channel: Any,
+    ) -> None:
+        """text -> tool -> text -> end: first text flushed, second returned."""
+        events = [
+            _make_stream_event("text", "Let me check that."),
+            _make_stream_event("tool_use", "Using search", {"tool": "search"}),
+            _make_stream_event("text", "Here is the answer."),
+        ]
+
+        result, state = await self._run_dispatch_with_events(
+            channel, events,
+            final_output="Let me check that.Here is the answer.",
+        )
+
+        # Intermediate text should have been sent
+        channel._bot.send_message.assert_called()
+        first_call_kwargs = channel._bot.send_message.call_args_list[0]
+        assert "Let me check that." in str(first_call_kwargs)
+
+        # Final result should be only the second text
+        assert result == "Here is the answer."
+        assert state["status_consumed"] is True
+
+    async def test_no_tools_no_intermediate_sends(
+        self, channel: Any,
+    ) -> None:
+        """text -> end: no intermediate sends, full text returned."""
+        events = [
+            _make_stream_event("text", "Simple reply with no tools."),
+        ]
+
+        # Reset send_message mock
+        channel._bot.send_message.reset_mock()
+
+        result, state = await self._run_dispatch_with_events(
+            channel, events, final_output="Simple reply with no tools.",
+        )
+
+        # No intermediate messages sent
+        channel._bot.send_message.assert_not_called()
+
+        # Full text returned
+        assert result == "Simple reply with no tools."
+        assert state["status_consumed"] is False
+
+    async def test_multiple_tool_rounds(
+        self, channel: Any,
+    ) -> None:
+        """text -> tool -> text -> tool -> text -> end: two flushes."""
+        events = [
+            _make_stream_event("text", "First thought."),
+            _make_stream_event("tool_use", "", {"tool": "search"}),
+            _make_stream_event("text", "Second thought."),
+            _make_stream_event("tool_use", "", {"tool": "read"}),
+            _make_stream_event("text", "Final answer."),
+        ]
+
+        channel._bot.send_message.reset_mock()
+
+        result, state = await self._run_dispatch_with_events(
+            channel, events,
+            final_output="First thought.Second thought.Final answer.",
+        )
+
+        # Two intermediate messages sent
+        send_calls = channel._bot.send_message.call_args_list
+        assert len(send_calls) >= 2
+        assert "First thought." in str(send_calls[0])
+        assert "Second thought." in str(send_calls[1])
+
+        assert result == "Final answer."
+        assert state["status_consumed"] is True
+
+    async def test_empty_text_before_tool(
+        self, channel: Any,
+    ) -> None:
+        """tool -> text -> end: no flush, status edited with tool name."""
+        events = [
+            _make_stream_event("tool_use", "", {"tool": "shell"}),
+            _make_stream_event("text", "Done."),
+        ]
+
+        channel._bot.send_message.reset_mock()
+
+        result, state = await self._run_dispatch_with_events(
+            channel, events, final_output="Done.",
+        )
+
+        # No intermediate sends (no text before tool)
+        channel._bot.send_message.assert_not_called()
+
+        # Full text returned (nothing was flushed)
+        assert result == "Done."
+        assert state["status_consumed"] is False
+
+    async def test_status_deleted_on_first_flush(
+        self, channel: Any,
+    ) -> None:
+        """Verify status_message.delete() called and status_consumed set."""
+        from agent.core.subagent import SubAgentResult, SubAgentStatus
+
+        status_msg = AsyncMock()
+        status_msg.delete = AsyncMock()
+
+        async def _fake_run(
+            prompt: str, task_id: str, session: Any,
+            on_progress: Any = None, on_permission: Any = None,
+        ) -> SubAgentResult:
+            if on_progress:
+                await on_progress(_make_stream_event("text", "Checking..."))
+                await on_progress(
+                    _make_stream_event("tool_use", "", {"tool": "web"}),
+                )
+            return SubAgentResult(
+                task_id="t1", role_name="channel",
+                status=SubAgentStatus.COMPLETED, output="Checking...",
+            )
+
+        mock_orch = AsyncMock()
+        mock_orch.run_channel_task = AsyncMock(side_effect=_fake_run)
+        channel.orchestrator = mock_orch
+
+        session = AsyncMock()
+        session.id = "sess1"
+        stream_state: dict[str, Any] = {"status_consumed": False}
+
+        await channel._dispatch_to_agent(
+            "test", session, AsyncMock(),
+            status_message=status_msg, user_id="111",
+            stream_state=stream_state,
+        )
+
+        status_msg.delete.assert_awaited_once()
+        assert stream_state["status_consumed"] is True
+
+    async def test_result_content_override(
+        self, channel: Any,
+    ) -> None:
+        """Result event overrides: extract tail after sent text."""
+        events = [
+            _make_stream_event("text", "Intro. "),
+            _make_stream_event("tool_use", "", {"tool": "calc"}),
+            _make_stream_event("text", ""),  # no more text events
+            _make_stream_event(
+                "result", "Intro. The real final answer.",
+                {"session_id": "s1"},
+            ),
+        ]
+
+        channel._bot.send_message.reset_mock()
+
+        result, state = await self._run_dispatch_with_events(
+            channel, events,
+            final_output="Intro. The real final answer.",
+        )
+
+        # "Intro. " was flushed, result override extracted the tail
+        assert result == "The real final answer."
+
+    async def test_stream_state_not_provided(
+        self, channel: Any,
+    ) -> None:
+        """stream_state=None should not crash (backward compat)."""
+        from agent.core.subagent import SubAgentResult, SubAgentStatus
+
+        mock_orch = AsyncMock()
+        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
+            task_id="t1", role_name="channel",
+            status=SubAgentStatus.COMPLETED, output="Reply",
+        ))
+        channel.orchestrator = mock_orch
+
+        session = AsyncMock()
+        session.id = "sess1"
+
+        # No stream_state param — should not crash
+        result = await channel._dispatch_to_agent(
+            "test", session, AsyncMock(),
+            status_message=None, user_id="111",
+        )
+        assert result == "Reply"
+
+    async def test_fallback_path_streams(
+        self, channel: Any,
+    ) -> None:
+        """Buffer-and-flush works through _process_via_sdk_or_loop (SDK path)."""
+        events = [
+            _make_stream_event("text", "Looking into it."),
+            _make_stream_event("tool_use", "", {"tool": "search"}),
+            _make_stream_event("text", "Here you go."),
+            _make_stream_event("result", "", {"session_id": "s1"}),
+        ]
+
+        async def _fake_stream(**kwargs: Any):
+            for ev in events:
+                yield ev
+
+        mock_sdk = MagicMock()
+        mock_sdk.run_task_stream = MagicMock(return_value=_fake_stream())
+
+        # No orchestrator → falls through to _process_via_sdk_or_loop
+        channel.orchestrator = None
+        channel.sdk_service = mock_sdk
+
+        session = AsyncMock()
+        session.id = "sess1"
+        session.metadata = {}
+
+        status_msg = AsyncMock()
+        status_msg.delete = AsyncMock()
+        status_msg.edit_text = AsyncMock()
+
+        channel._bot.send_message.reset_mock()
+        stream_state: dict[str, Any] = {"status_consumed": False}
+
+        result = await channel._process_via_sdk_or_loop(
+            "hello", session, AsyncMock(),
+            status_message=status_msg, user_id="111",
+            stream_state=stream_state,
+        )
+
+        # Intermediate text sent
+        channel._bot.send_message.assert_called()
+        assert "Looking into it." in str(
+            channel._bot.send_message.call_args_list[0],
+        )
+
+        # Status deleted
+        status_msg.delete.assert_awaited_once()
+        assert stream_state["status_consumed"] is True
+
+        # Only final text returned
+        assert result == "Here you go."
+
+    async def test_fallback_no_tools_returns_full(
+        self, channel: Any,
+    ) -> None:
+        """SDK path without tools returns full text, no intermediate sends."""
+        events = [
+            _make_stream_event("text", "Just a simple answer."),
+            _make_stream_event("result", "", {"session_id": "s1"}),
+        ]
+
+        async def _fake_stream(**kwargs: Any):
+            for ev in events:
+                yield ev
+
+        mock_sdk = MagicMock()
+        mock_sdk.run_task_stream = MagicMock(return_value=_fake_stream())
+
+        channel.orchestrator = None
+        channel.sdk_service = mock_sdk
+
+        session = AsyncMock()
+        session.id = "sess1"
+        session.metadata = {}
+
+        channel._bot.send_message.reset_mock()
+
+        result = await channel._process_via_sdk_or_loop(
+            "hello", session, AsyncMock(),
+            status_message=None, user_id="111",
+        )
+
+        channel._bot.send_message.assert_not_called()
+        assert result == "Just a simple answer."

@@ -210,6 +210,7 @@ async def _handle_sdk_message(
         prompt=content,
         task_id=session.id,
         session_id=getattr(session, "sdk_session_id", None),
+        channel="webchat",
     ):
         if event.type == "text":
             # Only accumulate main agent text, not subagent output
@@ -422,10 +423,78 @@ async def websocket_chat(
                 # Typing indicator on
                 await _safe_send(websocket, {"type": "typing", "status": True})
 
+                orchestrator = getattr(websocket.app.state, "orchestrator", None)
                 sdk_service = getattr(websocket.app.state, "sdk_service", None)
 
                 try:
-                    if sdk_service is not None:
+                    if orchestrator is not None:
+                        # --- Orchestrator path (preferred) ---
+                        accumulated_text = ""
+
+                        async def _ws_on_progress(event: Any) -> None:
+                            nonlocal accumulated_text
+                            if event.type == "text":
+                                if not (event.data and event.data.get("subagent")):
+                                    accumulated_text += event.content
+                                    await _safe_send(websocket, {
+                                        "type": "response.chunk",
+                                        "content": event.content,
+                                    })
+                            elif event.type == "tool_use":
+                                await _safe_send(websocket, {
+                                    "type": "tool.execute",
+                                    "tool": (event.data or {}).get("tool", ""),
+                                    "arguments": (event.data or {}).get("input", {}),
+                                })
+
+                        result = await orchestrator.run_channel_task(
+                            prompt=content,
+                            task_id=session.id,
+                            session=session,
+                            on_progress=_ws_on_progress,
+                        )
+                        await _safe_send(
+                            websocket, {"type": "typing", "status": False},
+                        )
+
+                        if result is None:
+                            await _safe_send(websocket, {
+                                "type": "error",
+                                "message": "No result from orchestrator",
+                            })
+                            continue
+
+                        # Use accumulated streamed text, fall back to result
+                        final_content = (
+                            accumulated_text
+                            or getattr(result, "output", "")
+                            or ""
+                        )
+                        if result.status.value in ("failed", "cancelled"):
+                            await _safe_send(websocket, {
+                                "type": "error",
+                                "message": result.error or (
+                                    "Task cancelled" if result.status.value == "cancelled"
+                                    else "Task failed"
+                                ),
+                            })
+                        else:
+                            await _safe_send(websocket, {
+                                "type": "response.end",
+                                "content": final_content,
+                                "model": "orchestrator",
+                                "usage": {"input_tokens": 0, "output_tokens": 0},
+                            })
+
+                        # Update session history for multi-turn context
+                        # (skip if task failed — don't store error as assistant message)
+                        if result.status.value not in ("failed", "cancelled") and final_content:
+                            from agent.core.session import Message
+                            session.add_message(Message(role="user", content=content))
+                            session.add_message(
+                                Message(role="assistant", content=final_content),
+                            )
+                    elif sdk_service is not None:
                         # --- Claude SDK backend ---
                         await _handle_sdk_message(
                             websocket, sdk_service, session, content,
@@ -484,6 +553,15 @@ def setup_event_forwarding(event_bus: EventBus) -> None:
         Events.AGENT_ERROR,
         Events.AGENT_STARTED,
         Events.AGENT_STOPPED,
+        # Orchestration events (GAP 7)
+        Events.SUBAGENT_SPAWNED,
+        Events.SUBAGENT_COMPLETED,
+        Events.SUBAGENT_FAILED,
+        Events.SUBAGENT_CANCELLED,
+        Events.PROJECT_STARTED,
+        Events.PROJECT_STAGE_COMPLETED,
+        Events.PROJECT_COMPLETED,
+        Events.PROJECT_FAILED,
     ]
 
     for event_name in events_to_forward:

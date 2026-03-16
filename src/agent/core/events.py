@@ -52,6 +52,42 @@ class Events:
     SUBAGENT_FAILED = "subagent.failed"
     SUBAGENT_CANCELLED = "subagent.cancelled"
 
+    # Project pipeline
+    PROJECT_STARTED = "project.started"
+    PROJECT_STAGE_STARTED = "project.stage.started"
+    PROJECT_STAGE_COMPLETED = "project.stage.completed"
+    PROJECT_COMPLETED = "project.completed"
+    PROJECT_FAILED = "project.failed"
+
+    # Project feedback loops
+    PROJECT_FEEDBACK_STARTED = "project.feedback.started"
+    PROJECT_FEEDBACK_ITERATION = "project.feedback.iteration"
+    PROJECT_FEEDBACK_PASSED = "project.feedback.passed"
+    PROJECT_FEEDBACK_EXHAUSTED = "project.feedback.exhausted"
+
+    # Inter-agent consultation
+    AGENT_CONSULT_REQUESTED = "agent.consult.requested"
+    AGENT_CONSULT_COMPLETED = "agent.consult.completed"
+    AGENT_CONSULT_FAILED = "agent.consult.failed"
+
+    # Inter-agent delegation
+    AGENT_DELEGATION_REQUESTED = "agent.delegation.requested"
+    AGENT_DELEGATION_COMPLETED = "agent.delegation.completed"
+    AGENT_DELEGATION_FAILED = "agent.delegation.failed"
+
+    # Discussion rounds
+    DISCUSSION_STARTED = "discussion.started"
+    DISCUSSION_ROUND_COMPLETED = "discussion.round.completed"
+    DISCUSSION_CONSENSUS_REACHED = "discussion.consensus.reached"
+    DISCUSSION_COMPLETED = "discussion.completed"
+
+    # Controller agent
+    CONTROLLER_TASK_STARTED = "controller.task.started"
+    CONTROLLER_TASK_PROGRESS = "controller.task.progress"
+    CONTROLLER_TASK_COMPLETED = "controller.task.completed"
+    CONTROLLER_TASK_FAILED = "controller.task.failed"
+    CONTROLLER_TASK_CANCELLED = "controller.task.cancelled"
+
     # Proactive autonomy
     PROACTIVE_MESSAGE = "proactive.message"
     SCHEDULED_TASK_DUE = "scheduled.task.due"
@@ -104,7 +140,7 @@ class EventBus:
             event: Event name to emit.
             data: Optional data to pass to handlers.
         """
-        handlers = self._handlers.get(event, [])
+        handlers = list(self._handlers.get(event, []))
         if not handlers:
             return
 

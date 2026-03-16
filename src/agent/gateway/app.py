@@ -56,6 +56,7 @@ def create_app(
     cost_tracker: object | None = None,
     workspace_manager: object | None = None,
     sdk_service: object | None = None,
+    orchestrator: object | None = None,
 ) -> FastAPI:
     """Create and configure the FastAPI application.
 
@@ -117,6 +118,7 @@ def create_app(
     app.state.cost_tracker = cost_tracker
     app.state.workspace_manager = workspace_manager
     app.state.sdk_service = sdk_service
+    app.state.orchestrator = orchestrator
 
     # --- WebSocket connection manager ---
     app.state.ws_manager = ws_manager

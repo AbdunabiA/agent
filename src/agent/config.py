@@ -166,6 +166,7 @@ class AgentTeamRoleConfig(BaseModel):
 
     name: str = "agent"
     persona: str = "You are a helpful assistant."
+    model: str | None = None  # Override model for this role
     allowed_tools: list[str] = []
     denied_tools: list[str] = []
     max_iterations: int = 5
@@ -182,13 +183,17 @@ class AgentTeamConfig(BaseModel):
 class OrchestrationConfig(BaseModel):
     """Multi-agent orchestration configuration."""
 
+    model_config = {"extra": "ignore"}
+
     enabled: bool = False
     max_concurrent_agents: int = 5
-    max_depth: int = 1
     default_max_iterations: int = 5
     subagent_timeout: int = 300
     teams: list[AgentTeamConfig] = []
-    default_subagent_tier: str = "moderate"
+    teams_directory: str = "teams"
+    use_controller: bool = False
+    controller_model: str | None = None
+    controller_max_turns: int = 30
 
 
 class GatewayConfig(BaseModel):

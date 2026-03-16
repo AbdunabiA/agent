@@ -1,0 +1,25 @@
+name: code_review
+description: "Comprehensive code review — security, quality, performance"
+stages:
+  - name: analysis
+    mode: discussion
+    discussion:
+      rounds: 2
+      consensus_required: false
+    agents:
+      - team: quality
+        role: security_reviewer
+      - team: quality
+        role: qa_engineer
+      - team: quality
+        role: performance_engineer
+    feedback:
+      fix_stage: fixes
+      max_retries: 2
+
+  - name: fixes
+    feedback_target: true
+    parallel: true
+    agents:
+      - team: engineering
+        role: backend_developer

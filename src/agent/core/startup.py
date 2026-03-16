@@ -7,6 +7,7 @@ into a single Application class used by ``agent start``.
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -71,6 +72,7 @@ class Application:
         self.workspace_manager: Any = None
         self.cost_tracker: Any = None
         self.sdk_service: Any = None  # ClaudeSDKService when backend=claude-sdk
+        self.controller: Any = None  # ControllerAgent when use_controller=True
         self.app: Any = None  # FastAPI app
 
         # Phase 4: Memory components
@@ -197,7 +199,7 @@ class Application:
             from agent.memory.vectors import VectorStore
 
             self.vector_store = VectorStore(
-                persist_dir=self.config.memory.markdown_dir + "chroma",
+                persist_dir=os.path.join(self.config.memory.markdown_dir, "chroma"),
             )
             await self.vector_store.initialize()
         except Exception as e:
@@ -234,7 +236,7 @@ class Application:
         try:
             from agent.desktop.platform_utils import get_capabilities_summary
             platform_capabilities = get_capabilities_summary()
-        except BaseException:
+        except Exception:
             pass
 
         self.agent_loop = AgentLoop(
@@ -255,6 +257,7 @@ class Application:
             skill_builder_enabled=self.config.skills.builder.enabled,
             orchestration_enabled=self.config.orchestration.enabled,
             platform_capabilities=platform_capabilities,
+            use_controller=self.config.orchestration.use_controller,
         )
 
         # 6.5. Claude SDK service (when backend=claude-sdk)
@@ -381,27 +384,29 @@ class Application:
         if self.config.orchestration.enabled:
             try:
                 from agent.core.orchestrator import SubAgentOrchestrator
-                from agent.core.subagent import AgentTeam, SubAgentRole
+                from agent.core.subagent import AgentTeam
+
+                # Build teams from config + teams/ directory
+                from agent.teams.loader import (
+                    config_to_team,
+                    load_projects_from_directory,
+                    load_teams_from_directory,
+                    merge_teams,
+                )
                 from agent.tools.builtins.orchestration import set_orchestrator
 
-                # Build teams from config
-                teams: list[AgentTeam] = []
-                for team_cfg in self.config.orchestration.teams:
-                    roles = [
-                        SubAgentRole(
-                            name=r.name,
-                            persona=r.persona,
-                            allowed_tools=r.allowed_tools,
-                            denied_tools=r.denied_tools,
-                            max_iterations=r.max_iterations,
-                        )
-                        for r in team_cfg.roles
-                    ]
-                    teams.append(AgentTeam(
-                        name=team_cfg.name,
-                        description=team_cfg.description,
-                        roles=roles,
-                    ))
+                config_teams: list[AgentTeam] = [
+                    config_to_team(t) for t in self.config.orchestration.teams
+                ]
+                file_teams = load_teams_from_directory(
+                    self.config.orchestration.teams_directory,
+                )
+                teams = merge_teams(file_teams, config_teams)
+
+                # Load projects from teams/projects/
+                projects = load_projects_from_directory(
+                    self.config.orchestration.teams_directory,
+                )
 
                 self.orchestrator = SubAgentOrchestrator(
                     agent_loop=self.agent_loop,
@@ -411,12 +416,124 @@ class Application:
                     teams=teams,
                     sdk_service=self.sdk_service,
                 )
+
+                # Register projects
+                for proj in projects:
+                    self.orchestrator.projects[proj.name] = proj
+
+                # Validate project agent references against loaded teams (GAP 18)
+                team_names = {t.name for t in teams}
+                team_roles: dict[str, set[str]] = {
+                    t.name: {r.name for r in t.roles} for t in teams
+                }
+                for proj in projects:
+                    for stage in proj.stages:
+                        for agent_ref in stage.agents:
+                            if agent_ref.team not in team_names:
+                                logger.warning(
+                                    "project_ref_invalid_team",
+                                    project=proj.name,
+                                    stage=stage.name,
+                                    team=agent_ref.team,
+                                )
+                            elif agent_ref.role not in team_roles.get(
+                                agent_ref.team, set()
+                            ):
+                                logger.warning(
+                                    "project_ref_invalid_role",
+                                    project=proj.name,
+                                    stage=stage.name,
+                                    team=agent_ref.team,
+                                    role=agent_ref.role,
+                                )
+                        # Validate discussion moderator reference
+                        if (
+                            stage.discussion
+                            and stage.discussion.moderator
+                        ):
+                            mod = stage.discussion.moderator
+                            if mod.team not in team_names:
+                                logger.warning(
+                                    "project_ref_invalid_team",
+                                    project=proj.name,
+                                    stage=stage.name,
+                                    team=mod.team,
+                                    context="discussion.moderator",
+                                )
+                            elif mod.role not in team_roles.get(
+                                mod.team, set()
+                            ):
+                                logger.warning(
+                                    "project_ref_invalid_role",
+                                    project=proj.name,
+                                    stage=stage.name,
+                                    team=mod.team,
+                                    role=mod.role,
+                                    context="discussion.moderator",
+                                )
+
+                # Validate team role tool names against actual registry
+                if registry is not None:
+                    registered_tools = {td.name for td in registry.list_tools()}
+                    for team in teams:
+                        for role in team.roles:
+                            for tool_name in role.allowed_tools:
+                                if tool_name not in registered_tools:
+                                    logger.warning(
+                                        "team_role_unknown_tool",
+                                        team=team.name,
+                                        role=role.name,
+                                        tool=tool_name,
+                                        msg="Tool in allowed_tools not found in registry",
+                                    )
+
                 set_orchestrator(self.orchestrator)
                 logger.info(
                     "orchestrator_ready",
                     teams=len(teams),
+                    projects=len(projects),
                     max_concurrent=self.config.orchestration.max_concurrent_agents,
                 )
+
+                # 7.8.1. Controller agent (when use_controller=True)
+                if self.config.orchestration.use_controller:
+                    try:
+                        from agent.core.controller import ControllerAgent
+                        from agent.tools.builtins.controller import set_controller
+
+                        self.controller = ControllerAgent(
+                            orchestrator=self.orchestrator,
+                            sdk_service=self.sdk_service,
+                            event_bus=self.event_bus,
+                            config=self.config.orchestration,
+                        )
+                        set_controller(self.controller)
+
+                        # Import controller tools to register them
+                        import agent.tools.builtins.controller  # noqa: F811
+
+                        # Hide orchestration tools from the main agent
+                        # (but keep them in the global registry so the
+                        # controller's ScopedToolRegistry can still see them).
+                        from agent.core.orchestrator import ScopedToolRegistry
+
+                        _orchestration_tools = {
+                            "spawn_subagent", "spawn_parallel_agents",
+                            "spawn_team", "list_agent_teams",
+                            "get_subagent_status", "cancel_subagent",
+                            "run_project", "list_projects",
+                            "consult_agent", "delegate_to_specialist",
+                        }
+                        self.agent_loop._default_tool_registry = ScopedToolRegistry(
+                            parent=registry,
+                            denied_tools=_orchestration_tools,
+                            exclude_dangerous=False,
+                        )
+
+                        logger.info("controller_agent_ready")
+                    except Exception as e:
+                        logger.warning("controller_init_failed", error=str(e))
+                        self.controller = None
             except Exception as e:
                 logger.warning("orchestrator_init_failed", error=str(e))
 
@@ -451,6 +568,7 @@ class Application:
             cost_tracker=self.cost_tracker,
             workspace_manager=self.workspace_manager,
             sdk_service=self.sdk_service,
+            orchestrator=self.orchestrator,
         )
 
         # 9. Telegram channel
@@ -547,6 +665,10 @@ class Application:
         # Start skill watcher for hot-reload
         if self.skill_manager:
             await self.skill_manager.start_watcher()
+
+        # Start controller agent
+        if self.controller:
+            await self.controller.start()
 
         # Start SDK idle reaper
         if self.sdk_service:
@@ -697,6 +819,22 @@ class Application:
 
         if self.skill_manager:
             await self.skill_manager.shutdown()
+
+        # Shut down controller agent
+        if self.controller:
+            await self.controller.stop()
+
+        # Shut down orchestrator (cancel running sub-agents and async futures)
+        if self.orchestrator:
+            await self.orchestrator.shutdown()
+
+        # Cancel outstanding background tasks (e.g. embedding warmup)
+        for task in list(self._background_tasks):
+            if not task.done():
+                task.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+            self._background_tasks.clear()
 
         # Stop SDK reaper and disconnect persistent clients
         if self.sdk_service:

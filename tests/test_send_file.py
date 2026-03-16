@@ -10,7 +10,8 @@ import pytest
 
 from agent.core.events import EventBus, Events
 from agent.tools.builtins.send_file import (
-    _global_context,
+    _channel_var,
+    _user_id_var,
     send_file,
     set_file_send_bus,
     set_file_send_context,
@@ -23,10 +24,12 @@ def _reset_globals():
     import agent.tools.builtins.send_file as mod
 
     original_bus = mod._global_event_bus
-    original_ctx = dict(mod._global_context)
+    original_channel = _channel_var.get()
+    original_user_id = _user_id_var.get()
     yield
     mod._global_event_bus = original_bus
-    mod._global_context.update(original_ctx)
+    _channel_var.set(original_channel)
+    _user_id_var.set(original_user_id)
 
 
 @pytest.fixture()
@@ -129,14 +132,14 @@ class TestSetContext:
     """Tests for context management functions."""
 
     def test_set_context_updates_globals(self):
-        """set_file_send_context updates the global context dict."""
+        """set_file_send_context updates the context vars."""
         set_file_send_context(channel="webchat", user_id="abc")
-        assert _global_context["channel"] == "webchat"
-        assert _global_context["user_id"] == "abc"
+        assert _channel_var.get() == "webchat"
+        assert _user_id_var.get() == "abc"
 
     def test_set_context_clears(self):
         """Setting None clears the context."""
         set_file_send_context(channel="telegram", user_id="123")
         set_file_send_context(channel=None, user_id=None)
-        assert _global_context["channel"] is None
-        assert _global_context["user_id"] is None
+        assert _channel_var.get() is None
+        assert _user_id_var.get() is None

@@ -123,17 +123,14 @@ def _tool_explanation(tool_name: str, arguments: dict[str, Any]) -> str:
 
     if tool_name in ("Bash", "shell_exec"):
         cmd = arguments.get("command", "unknown command")
-        if ai_desc:
-            intent = f"{ai_desc}"
-        else:
-            intent = "Run a shell command"
+        intent = ai_desc if ai_desc else "Run a shell command"
         detail = f"Command:\n<code>{cmd}</code>"
         risk = "This will execute a shell command on your machine."
 
     elif tool_name in ("Write", "file_write"):
         path = arguments.get("file_path") or arguments.get("path", "?")
         size = len(arguments.get("content", ""))
-        intent = ai_desc or f"Create or overwrite a file"
+        intent = ai_desc or "Create or overwrite a file"
         detail = f"File: <code>{path}</code> ({size} characters)"
         risk = "This will write to your filesystem — the file will be created or overwritten."
 
@@ -154,7 +151,7 @@ def _tool_explanation(tool_name: str, arguments: dict[str, Any]) -> str:
 
     elif tool_name == "file_delete":
         path = arguments.get("path", "?")
-        intent = ai_desc or f"Delete a file"
+        intent = ai_desc or "Delete a file"
         detail = f"File: <code>{path}</code>"
         risk = "This will permanently delete a file from disk."
 
@@ -168,7 +165,7 @@ def _tool_explanation(tool_name: str, arguments: dict[str, Any]) -> str:
     elif tool_name == "http_request":
         method = arguments.get("method", "GET")
         url = arguments.get("url", "?")
-        intent = ai_desc or f"Make an HTTP request"
+        intent = ai_desc or "Make an HTTP request"
         detail = f"{method} {url}"
         risk = "This sends a network request to an external server."
 
@@ -259,6 +256,12 @@ class TelegramChannel(BaseChannel):
         self._had_approvals: dict[str, bool] = {}  # per-user approval tracking
         # Background task tracking: user_id → list of (task, description)
         self._background_tasks: dict[str, list[tuple[asyncio.Task[Any], str]]] = {}
+        # Queued file sends: user_id → list of event data dicts.
+        # Files are queued (not sent immediately) so that buffered text
+        # messages are flushed to the chat *before* the file arrives.
+        self._pending_file_sends: dict[str, list[dict[str, Any]]] = {}
+        # Track which user spawned which orchestration task for status updates
+        self._task_user_map: dict[str, str] = {}
 
         if AIOGRAM_AVAILABLE and config.token:
             self._bot = Bot(token=config.token)
@@ -307,6 +310,41 @@ class TelegramChannel(BaseChannel):
         self.event_bus.on(Events.FILE_SEND, self._on_file_send)
         self.event_bus.on(Events.CHANNEL_POST, self._on_channel_post)
         self.event_bus.on(Events.CHANNEL_SEND_MESSAGE, self._on_send_message)
+
+        # Wire up task→user tracking for orchestration status notifications
+        from agent.tools.builtins.orchestration import set_task_user_callback
+        set_task_user_callback(self._register_task_user)
+
+        # Subscribe to orchestration events for real-time status updates
+        self.event_bus.on(Events.SUBAGENT_SPAWNED, self._on_subagent_spawned)
+        self.event_bus.on(Events.SUBAGENT_COMPLETED, self._on_subagent_completed)
+        self.event_bus.on(Events.SUBAGENT_FAILED, self._on_subagent_failed)
+        self.event_bus.on(Events.PROJECT_STARTED, self._on_project_started)
+        self.event_bus.on(
+            Events.PROJECT_STAGE_STARTED, self._on_project_stage_started,
+        )
+        self.event_bus.on(
+            Events.PROJECT_STAGE_COMPLETED, self._on_project_stage_completed,
+        )
+        self.event_bus.on(Events.PROJECT_COMPLETED, self._on_project_completed)
+        self.event_bus.on(Events.PROJECT_FAILED, self._on_project_failed)
+
+        # Subscribe to controller events
+        self.event_bus.on(
+            Events.CONTROLLER_TASK_STARTED, self._on_controller_task_started,
+        )
+        self.event_bus.on(
+            Events.CONTROLLER_TASK_PROGRESS, self._on_controller_task_progress,
+        )
+        self.event_bus.on(
+            Events.CONTROLLER_TASK_COMPLETED, self._on_controller_task_completed,
+        )
+        self.event_bus.on(
+            Events.CONTROLLER_TASK_FAILED, self._on_controller_task_failed,
+        )
+        self.event_bus.on(
+            Events.CONTROLLER_TASK_CANCELLED, self._on_controller_task_cancelled,
+        )
 
         self._running = True
         self._polling_task = asyncio.create_task(self._run_polling())
@@ -1021,14 +1059,6 @@ class TelegramChannel(BaseChannel):
         # Process through agent loop (same pattern as _handle_text)
         user_id = message.from_user.id
 
-        from agent.tools.builtins.scheduler import set_context
-        set_context(channel="telegram", user_id=str(user_id))
-
-        from agent.tools.builtins.send_file import set_file_send_context
-        set_file_send_context(channel="telegram", user_id=str(user_id))
-        from agent.tools.builtins.telegram_post import set_telegram_post_context
-        set_telegram_post_context(channel="telegram", user_id=str(user_id))
-
         agent_loop, session_store = self._resolve_components(str(user_id))
         session_id = self._make_session_id(str(user_id))
         session = await session_store.get_or_create(
@@ -1036,10 +1066,8 @@ class TelegramChannel(BaseChannel):
         )
 
         status_message = None
-        try:
+        with contextlib.suppress(Exception):
             status_message = await message.answer("\u23f3 Processing\u2026")
-        except Exception:
-            pass
 
         # Dispatch to background
         task = asyncio.create_task(
@@ -1066,7 +1094,7 @@ class TelegramChannel(BaseChannel):
             return
 
         lines = [f"\u2699\ufe0f <b>Running tasks ({len(active)}):</b>\n"]
-        for uid, desc in active:
+        for _uid, desc in active:
             lines.append(f"\u2022 {desc}")
         lines.append("\nUse /stop to cancel all running tasks.")
         await message.answer("\n".join(lines), parse_mode="HTML")
@@ -1130,7 +1158,7 @@ class TelegramChannel(BaseChannel):
         for task, _desc in tasks:
             if not task.done():
                 with contextlib.suppress(Exception, asyncio.CancelledError):
-                    await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+                    await asyncio.wait_for(task, timeout=1.0)
 
         # Clean up
         self._background_tasks.pop(user_id, None)
@@ -1150,12 +1178,6 @@ class TelegramChannel(BaseChannel):
             return
 
         user_id = message.from_user.id
-
-        # Set file-send context for voice messages
-        from agent.tools.builtins.send_file import set_file_send_context
-        set_file_send_context(channel="telegram", user_id=str(user_id))
-        from agent.tools.builtins.telegram_post import set_telegram_post_context
-        set_telegram_post_context(channel="telegram", user_id=str(user_id))
 
         try:
             file = await self._bot.get_file(message.voice.file_id)
@@ -1202,7 +1224,18 @@ class TelegramChannel(BaseChannel):
         message: Any,
     ) -> None:
         """Background coroutine that processes a voice message."""
+        # Set per-task context vars (safe for concurrent users in separate tasks)
+        from agent.tools.builtins.scheduler import set_context
+        set_context(channel="telegram", user_id=user_id)
+
+        from agent.tools.builtins.send_file import set_file_send_context
+        set_file_send_context(channel="telegram", user_id=user_id)
+
+        from agent.tools.builtins.telegram_post import set_telegram_post_context
+        set_telegram_post_context(channel="telegram", user_id=user_id)
+
         status_message = None
+        stream_state: dict[str, Any] = {"status_consumed": False}
         try:
             response_text: str
 
@@ -1218,15 +1251,14 @@ class TelegramChannel(BaseChannel):
                     await message.reply(transcription_msg, parse_mode="Markdown")
 
                 # Send status message and process via agent loop or SDK
-                try:
+                with contextlib.suppress(Exception):
                     status_message = await message.answer("\u23f3 Processing\u2026")
-                except Exception:
-                    pass
 
                 response_text = await self._dispatch_to_agent(
                     stt_result.text, session, agent_loop,
                     status_message=status_message,
                     user_id=user_id,
+                    stream_state=stream_state,
                 )
 
             else:
@@ -1268,7 +1300,10 @@ class TelegramChannel(BaseChannel):
                         file=tts_result.audio_data,
                         filename="response.ogg",
                     )
-                    if status_message is not None:
+                    if (
+                        status_message is not None
+                        and not stream_state["status_consumed"]
+                    ):
                         with contextlib.suppress(Exception):
                             await status_message.delete()
                     await message.reply_voice(
@@ -1283,8 +1318,11 @@ class TelegramChannel(BaseChannel):
                     return
 
             # Text-only reply
+            effective_status = (
+                None if stream_state["status_consumed"] else status_message
+            )
             await self._replace_status_with_response(
-                status_message, user_id, response_text
+                effective_status, user_id, response_text
             )
 
         except Exception as e:
@@ -1295,10 +1333,12 @@ class TelegramChannel(BaseChannel):
                     "Try sending it as text instead."
                 )
         finally:
+            with contextlib.suppress(Exception):
+                await self._drain_pending_files(user_id)
             self._unregister_background_task(user_id)
 
     async def _handle_photo(self, message: Any) -> None:
-        """Handle photo messages — download highest-res, base64-encode, send to LLM."""
+        """Handle photo messages — download, describe as text, dispatch to background."""
         if not self._check_message(message):
             return
         if self._paused:
@@ -1321,47 +1361,44 @@ class TelegramChannel(BaseChannel):
 
             caption = message.caption or ""
 
-            # Build multimodal message with image_url content block
-            multimodal_content: list[dict[str, Any]] = [
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/jpeg;base64,{image_b64}",
-                    },
-                },
-            ]
-            if caption:
-                multimodal_content.append({"type": "text", "text": caption})
+            # Resolve workspace-aware components
+            agent_loop, session_store = self._resolve_components(str(user_id))
 
             session_id = self._make_session_id(str(user_id))
-            session = await self.session_store.get_or_create(
+            session = await session_store.get_or_create(
                 session_id=session_id, channel="telegram"
             )
 
-            from agent.core.session import Message
+            # Store the image in session metadata for the LLM to access
+            session.metadata["pending_image"] = {
+                "base64": image_b64,
+                "media_type": "image/jpeg",
+            }
 
-            placeholder = f"[Photo]{f': {caption}' if caption else ''}"
-            session.add_message(Message(role="user", content=placeholder))
+            # Build text description for orchestrator dispatch
+            text_desc = "[Photo attached]"
+            if caption:
+                text_desc = f"[Photo attached] {caption}"
 
-            messages: list[dict[str, Any]] = [
-                {"role": "system", "content": self.agent_loop.system_prompt},
-            ]
-            messages.extend(session.get_history()[:-1])
-            messages.append({"role": "user", "content": multimodal_content})
+            status_message = None
+            with contextlib.suppress(Exception):
+                status_message = await message.answer("\u2699\ufe0f Processing photo\u2026")
 
-            response = await self.agent_loop.llm.completion(messages=messages)
-
-            session.add_message(
-                Message(role="assistant", content=response.content)
+            # Dispatch to background task like text/voice/document handlers
+            task = asyncio.create_task(
+                self._run_photo_task(
+                    text_desc=text_desc,
+                    session=session,
+                    image_b64=image_b64,
+                    caption=caption,
+                    status_message=status_message,
+                    user_id=str(user_id),
+                    message=message,
+                    agent_loop=agent_loop,
+                ),
+                name=f"photo:{user_id}",
             )
-
-            await self.send_message(
-                OutgoingMessage(
-                    content=response.content,
-                    channel_user_id=str(user_id),
-                    parse_mode="Markdown",
-                )
-            )
+            self._register_background_task(str(user_id), task, "[photo]")
 
         except Exception as e:
             logger.error("photo_handle_error", error=str(e), user_id=user_id)
@@ -1369,6 +1406,124 @@ class TelegramChannel(BaseChannel):
                 "Sorry, I couldn't process your photo. "
                 "Try describing it in text instead."
             )
+
+    async def _run_photo_task(
+        self,
+        text_desc: str,
+        session: Any,
+        image_b64: str,
+        caption: str,
+        status_message: Any | None,
+        user_id: str,
+        message: Any,
+        agent_loop: AgentLoop | None = None,
+    ) -> None:
+        """Background coroutine that processes a photo message."""
+        # Set per-task context vars (safe for concurrent users in separate tasks)
+        from agent.tools.builtins.scheduler import set_context
+        set_context(channel="telegram", user_id=user_id)
+
+        from agent.tools.builtins.send_file import set_file_send_context
+        set_file_send_context(channel="telegram", user_id=user_id)
+
+        from agent.tools.builtins.telegram_post import set_telegram_post_context
+        set_telegram_post_context(channel="telegram", user_id=user_id)
+
+        effective_loop = agent_loop or self.agent_loop
+
+        try:
+            stream_state: dict[str, Any] = {"status_consumed": False}
+
+            response_text = await self._dispatch_to_agent(
+                text=text_desc,
+                session=session,
+                agent_loop=effective_loop,
+                status_message=status_message,
+                user_id=user_id,
+                stream_state=stream_state,
+            )
+
+            # If dispatch didn't produce a result (no orchestrator, no SDK),
+            # fall back to direct multimodal LLM call
+            if not response_text or response_text == "[No response]":
+                if not effective_loop.llm:
+                    response_text = (
+                        "Sorry, I can't process photos right now "
+                        "(no LLM provider configured)."
+                    )
+                else:
+                    from agent.core.session import Message
+
+                    multimodal_content: list[dict[str, Any]] = [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_b64}",
+                            },
+                        },
+                    ]
+                    if caption:
+                        multimodal_content.append(
+                            {"type": "text", "text": caption}
+                        )
+
+                    placeholder = f"[Photo]{f': {caption}' if caption else ''}"
+                    session.add_message(
+                        Message(role="user", content=placeholder)
+                    )
+
+                    messages: list[dict[str, Any]] = [
+                        {
+                            "role": "system",
+                            "content": effective_loop.system_prompt,
+                        },
+                    ]
+                    messages.extend(session.get_history()[:-1])
+                    messages.append(
+                        {"role": "user", "content": multimodal_content}
+                    )
+
+                    response = await effective_loop.llm.completion(
+                        messages=messages
+                    )
+                    response_text = response.content
+
+                    session.add_message(
+                        Message(role="assistant", content=response_text)
+                    )
+
+            # Clean up status message
+            effective_status = (
+                None if stream_state["status_consumed"] else status_message
+            )
+            await self._replace_status_with_response(
+                effective_status, user_id, response_text,
+            )
+
+            # Clean up pending image
+            session.metadata.pop("pending_image", None)
+
+        except Exception as e:
+            # Clean up pending image even on error to avoid stale data
+            with contextlib.suppress(Exception):
+                session.metadata.pop("pending_image", None)
+            logger.error("photo_task_error", error=str(e), user_id=user_id)
+            if status_message:
+                with contextlib.suppress(Exception):
+                    await status_message.edit_text(
+                        "Sorry, I couldn't process your photo. "
+                        "Try describing it in text instead."
+                    )
+            else:
+                with contextlib.suppress(Exception):
+                    await message.answer(
+                        "Sorry, I couldn't process your photo. "
+                        "Try describing it in text instead."
+                    )
+        finally:
+            with contextlib.suppress(Exception):
+                await self._drain_pending_files(user_id)
+            self._unregister_background_task(user_id)
 
     async def _handle_document(self, message: Any) -> None:
         """Handle document uploads — save to data/uploads/, dispatch to background."""
@@ -1408,18 +1563,19 @@ class TelegramChannel(BaseChannel):
             if caption:
                 description += f"\nCaption: {caption}"
 
+            # Resolve workspace-aware components
+            agent_loop, session_store = self._resolve_components(str(user_id))
+
             session_id = self._make_session_id(str(user_id))
-            session = await self.session_store.get_or_create(
+            session = await session_store.get_or_create(
                 session_id=session_id, channel="telegram"
             )
 
             status_message = None
-            try:
+            with contextlib.suppress(Exception):
                 status_message = await message.answer(
                     "\u23f3 Processing document\u2026",
                 )
-            except Exception:
-                pass
 
             # Dispatch to background
             task = asyncio.create_task(
@@ -1429,6 +1585,7 @@ class TelegramChannel(BaseChannel):
                     status_message=status_message,
                     user_id=str(user_id),
                     message=message,
+                    agent_loop=agent_loop,
                 ),
                 name=f"doc:{user_id}:{filename[:30]}",
             )
@@ -1447,17 +1604,35 @@ class TelegramChannel(BaseChannel):
         status_message: Any | None,
         user_id: str,
         message: Any,
+        agent_loop: AgentLoop | None = None,
     ) -> None:
         """Background coroutine that processes a document upload."""
+        # Set per-task context vars (safe for concurrent users in separate tasks)
+        from agent.tools.builtins.scheduler import set_context
+        set_context(channel="telegram", user_id=user_id)
+
+        from agent.tools.builtins.send_file import set_file_send_context
+        set_file_send_context(channel="telegram", user_id=user_id)
+
+        from agent.tools.builtins.telegram_post import set_telegram_post_context
+        set_telegram_post_context(channel="telegram", user_id=user_id)
+
+        effective_loop = agent_loop or self.agent_loop
+
         try:
+            stream_state: dict[str, Any] = {"status_consumed": False}
             response_text = await self._dispatch_to_agent(
-                description, session, self.agent_loop,
+                description, session, effective_loop,
                 status_message=status_message,
                 user_id=user_id,
+                stream_state=stream_state,
             )
 
+            effective_status = (
+                None if stream_state["status_consumed"] else status_message
+            )
             await self._replace_status_with_response(
-                status_message, user_id, response_text
+                effective_status, user_id, response_text
             )
 
         except Exception as e:
@@ -1473,6 +1648,8 @@ class TelegramChannel(BaseChannel):
                         "Sorry, I couldn't process your document."
                     )
         finally:
+            with contextlib.suppress(Exception):
+                await self._drain_pending_files(user_id)
             self._unregister_background_task(user_id)
 
     # ------------------------------------------------------------------
@@ -1707,6 +1884,11 @@ class TelegramChannel(BaseChannel):
             session.clear()
             session.metadata.pop("sdk_session_id", None)
 
+        # Disconnect any persistent SDK client for this user
+        if self.orchestrator and self.orchestrator.sdk_service:
+            with contextlib.suppress(Exception):
+                await self.orchestrator.sdk_service.disconnect_client(session_id)
+
         await callback.message.edit_text("Session cleared. Your next message starts fresh.")
 
     async def _nav_session_new(self, callback: Any) -> None:
@@ -1717,6 +1899,11 @@ class TelegramChannel(BaseChannel):
         session = await self.session_store.get(session_id)
         if session:
             session.metadata.pop("sdk_session_id", None)
+
+        # Disconnect any persistent SDK client for this user
+        if self.orchestrator and self.orchestrator.sdk_service:
+            with contextlib.suppress(Exception):
+                await self.orchestrator.sdk_service.disconnect_client(session_id)
 
         await callback.message.edit_text(
             "New conversation started. Your next message begins a fresh session."
@@ -1907,11 +2094,15 @@ class TelegramChannel(BaseChannel):
         agent_loop: Any,
         status_message: Any | None = None,
         user_id: str | None = None,
+        stream_state: dict[str, Any] | None = None,
     ) -> str:
         """Route a message through Claude SDK or the LiteLLM agent loop.
 
         If status_message is provided, it will be edited with live status
         updates as the SDK processes the request (e.g. tool usage).
+
+        When *stream_state* is provided, intermediate text is flushed to
+        Telegram on tool_use events, and only the remainder is returned.
 
         Returns the response text.
         """
@@ -1919,11 +2110,19 @@ class TelegramChannel(BaseChannel):
             from agent.llm.claude_sdk import ClaudeSDKService
 
             sdk: ClaudeSDKService = self.sdk_service  # type: ignore[assignment]
-            accumulated = ""
             sdk_session_id = session.metadata.get("sdk_session_id")
             last_status_update = 0.0
             self._had_approvals[user_id or ""] = False
             import time as _time
+
+            # Streaming buffer state
+            pending_text = [""]
+            sent_text_total = [""]
+            status_deleted = [False]
+            try:
+                chat_id = int(user_id) if user_id else 0
+            except (ValueError, TypeError):
+                chat_id = 0
 
             # Permission callback: ask user via inline keyboard for dangerous tools
             on_permission = None
@@ -1948,40 +2147,81 @@ class TelegramChannel(BaseChannel):
                 task_id=session.id,
                 session_id=sdk_session_id,
                 on_permission=on_permission,
+                channel="telegram",
             ):
                 if event.type == "text":
                     # Only accumulate main agent text, not subagent output
                     if not (event.data and event.data.get("subagent")):
-                        accumulated += event.content
+                        pending_text[0] += event.content
                 elif event.type == "tool_use":
-                    # Update status message with current action
-                    if status_message is not None:
+                    if pending_text[0].strip():
+                        # Flush buffered text as intermediate message
+                        if (
+                            status_message is not None
+                            and not status_deleted[0]
+                        ):
+                            with contextlib.suppress(Exception):
+                                await status_message.delete()
+                            status_deleted[0] = True
+                        await self._send_intermediate_text(
+                            chat_id, pending_text[0],
+                        )
+                        sent_text_total[0] += pending_text[0]
+                        pending_text[0] = ""
+                    elif status_message is not None and not status_deleted[0]:
+                        # No pending text — update status with tool name
                         now = _time.monotonic()
-                        # Throttle edits to avoid Telegram rate limits
                         if now - last_status_update > 2.0:
                             tool_name = event.data.get("tool", "tool")
                             is_sub = event.data.get("subagent", False)
-                            prefix = "\U0001f50d Researching" if is_sub else "\u2699\ufe0f Working"
+                            prefix = (
+                                "\U0001f50d Researching"
+                                if is_sub
+                                else "\u2699\ufe0f Working"
+                            )
                             status_text = f"{prefix}\u2026 using {tool_name}"
                             with contextlib.suppress(Exception):
                                 await status_message.edit_text(status_text)
                             last_status_update = now
+                elif event.type == "error":
+                    raise RuntimeError(event.content)
                 elif event.type == "result":
                     sdk_sid = event.data.get("session_id")
                     if sdk_sid:
                         session.metadata["sdk_session_id"] = sdk_sid
-                    # Prefer the result content over accumulated text events
-                    # when available — the SDK sometimes sends the full answer
-                    # only in the ResultMessage.result field.
-                    if event.content and len(event.content) > len(accumulated):
-                        accumulated = event.content
-                elif event.type == "error":
-                    raise RuntimeError(event.content)
-            return accumulated or "[No response]"
+                    # Handle SDK result-override: if result content is longer
+                    # and starts with what we already sent, extract the tail
+                    if (
+                        event.content
+                        and sent_text_total[0]
+                        and event.content.startswith(sent_text_total[0])
+                    ):
+                        pending_text[0] = event.content[len(sent_text_total[0]):]
+                    elif event.content and len(event.content) > len(
+                        sent_text_total[0] + pending_text[0]
+                    ):
+                        # Fallback: prefer result content when it's longer
+                        pending_text[0] = event.content[len(sent_text_total[0]):]
+
+            # Drain any queued file sends (no orchestrator to drain them)
+            if user_id:
+                await self._drain_pending_files(user_id)
+
+            if sent_text_total[0]:
+                final = pending_text[0].strip()
+                if stream_state is not None:
+                    stream_state["status_consumed"] = status_deleted[0]
+                return final if final else ""
+            return pending_text[0] or "[No response]"
 
         response = await agent_loop.process_message(
             text, session, trigger="user_message"
         )
+
+        # Drain any queued file sends (no orchestrator to drain them)
+        if user_id:
+            await self._drain_pending_files(user_id)
+
         return response.content
 
     async def _dispatch_to_agent(
@@ -1991,6 +2231,7 @@ class TelegramChannel(BaseChannel):
         agent_loop: Any,
         status_message: Any | None = None,
         user_id: str | None = None,
+        stream_state: dict[str, Any] | None = None,
     ) -> str:
         """Dispatch a message through the orchestrator or fall back to direct processing.
 
@@ -1999,32 +2240,87 @@ class TelegramChannel(BaseChannel):
         tracking for free.  Otherwise it falls back to the direct
         ``_process_via_sdk_or_loop`` path.
 
+        When *stream_state* is provided, intermediate text (text that appears
+        before a tool_use event) is flushed to Telegram immediately, and
+        only the remaining (final) text is returned.
+
         Returns the response text.
         """
         if self.orchestrator is not None:
             from agent.core.subagent import SubAgentStatus
 
+            # Streaming state for buffer-and-flush
+            pending_text = [""]
+            sent_text_total = [""]
+            status_deleted = [False]
+            try:
+                chat_id = int(user_id) if user_id else 0
+            except (ValueError, TypeError):
+                chat_id = 0
+
             # Build on_progress callback for status message updates
             on_progress = None
-            if status_message is not None:
-                import time as _time
+            import time as _time
 
-                last_update = [0.0]
+            last_update = [0.0]
 
-                async def _on_progress(event: Any) -> None:
-                    if event.type == "tool_use":
+            async def _on_progress(event: Any) -> None:
+                if event.type == "text":
+                    # Buffer text events (skip subagent text)
+                    if not (event.data and event.data.get("subagent")):
+                        pending_text[0] += event.content
+                elif event.type == "tool_use":
+                    if pending_text[0].strip():
+                        # Flush buffered text as intermediate message
+                        if (
+                            status_message is not None
+                            and not status_deleted[0]
+                        ):
+                            with contextlib.suppress(Exception):
+                                await status_message.delete()
+                            status_deleted[0] = True
+                        await self._send_intermediate_text(
+                            chat_id, pending_text[0],
+                        )
+                        sent_text_total[0] += pending_text[0]
+                        pending_text[0] = ""
+                    elif status_message is not None and not status_deleted[0]:
+                        # No pending text — update status with tool name
                         now = _time.monotonic()
                         if now - last_update[0] > 2.0:
                             tool_name = event.data.get("tool", "tool")
                             is_sub = event.data.get("subagent", False)
-                            prefix = "\U0001f50d Researching" if is_sub else "\u2699\ufe0f Working"
+                            prefix = (
+                                "\U0001f50d Researching"
+                                if is_sub
+                                else "\u2699\ufe0f Working"
+                            )
                             with contextlib.suppress(Exception):
                                 await status_message.edit_text(
                                     f"{prefix}\u2026 using {tool_name}"
                                 )
                             last_update[0] = now
+                    # Drain queued file sends so they arrive after text
+                    if user_id:
+                        await self._drain_pending_files(user_id)
+                elif event.type == "result" and event.content:
+                    if (
+                        sent_text_total[0]
+                        and event.content.startswith(sent_text_total[0])
+                    ):
+                        # Handle SDK result-override: if result content is longer
+                        # and starts with what we already sent, extract the tail
+                        pending_text[0] = event.content[len(sent_text_total[0]):]
+                    elif not sent_text_total[0]:
+                        # No text was streamed yet — use result as pending
+                        pending_text[0] = event.content
+                    elif len(event.content) > len(
+                        sent_text_total[0] + pending_text[0]
+                    ):
+                        # Fallback: prefer result content when it's longer
+                        pending_text[0] = event.content[len(sent_text_total[0]):]
 
-                on_progress = _on_progress
+            on_progress = _on_progress
 
             # Build on_permission callback
             on_permission = None
@@ -2055,7 +2351,22 @@ class TelegramChannel(BaseChannel):
                 on_permission=on_permission,
             )
 
+            # Drain any remaining queued file sends before returning
+            if user_id:
+                await self._drain_pending_files(user_id)
+
             if result.status == SubAgentStatus.COMPLETED:
+                if sent_text_total[0]:
+                    # Intermediate text was sent — return only remainder
+                    final = pending_text[0].strip()
+                    if stream_state is not None:
+                        stream_state["status_consumed"] = status_deleted[0]
+                    return final if final else ""
+                # No intermediate text was streamed — check for buffered
+                # pending text that was never flushed (no tool_use event
+                # triggered a flush).
+                if pending_text[0].strip():
+                    return pending_text[0].strip()
                 return result.output or "[No response]"
             elif result.status == SubAgentStatus.CANCELLED:
                 return ""  # cancelled tasks don't need a response
@@ -2068,6 +2379,7 @@ class TelegramChannel(BaseChannel):
             text, session, agent_loop,
             status_message=status_message,
             user_id=user_id,
+            stream_state=stream_state,
         )
 
     async def _handle_text(self, message: Any) -> None:
@@ -2098,16 +2410,6 @@ class TelegramChannel(BaseChannel):
         if self._paused:
             await message.answer("I'm currently paused. Use /resume to re-enable me.")
             return
-
-        # Set scheduler context so set_reminder tool knows who to deliver to
-        from agent.tools.builtins.scheduler import set_context
-        set_context(channel="telegram", user_id=str(user_id))
-
-        # Set file-send context so send_file tool knows who to deliver to
-        from agent.tools.builtins.send_file import set_file_send_context
-        set_file_send_context(channel="telegram", user_id=str(user_id))
-        from agent.tools.builtins.telegram_post import set_telegram_post_context
-        set_telegram_post_context(channel="telegram", user_id=str(user_id))
 
         # Auto-detect natural language reminder requests
         reminder_confirmation = await self._try_extract_reminder(
@@ -2141,10 +2443,8 @@ class TelegramChannel(BaseChannel):
 
         # Send a placeholder message instead of typing indicator
         status_message = None
-        try:
+        with contextlib.suppress(Exception):
             status_message = await message.answer("\u23f3 Processing\u2026")
-        except Exception:
-            pass
 
         # Dispatch processing to a background task so the bot stays free
         task = asyncio.create_task(
@@ -2170,16 +2470,34 @@ class TelegramChannel(BaseChannel):
         message: Any,
     ) -> None:
         """Background coroutine that processes a text message and delivers the response."""
+        # Set per-task context vars (safe for concurrent users in separate tasks)
+        from agent.tools.builtins.scheduler import set_context
+        set_context(channel="telegram", user_id=user_id)
+
+        from agent.tools.builtins.send_file import set_file_send_context
+        set_file_send_context(channel="telegram", user_id=user_id)
+
+        from agent.tools.builtins.telegram_post import set_telegram_post_context
+        set_telegram_post_context(channel="telegram", user_id=user_id)
+
         try:
+            stream_state: dict[str, Any] = {"status_consumed": False}
             response_text = await self._dispatch_to_agent(
                 user_text, session, agent_loop,
                 status_message=status_message,
                 user_id=user_id,
+                stream_state=stream_state,
+            )
+
+            # If status was already deleted (intermediate text sent),
+            # don't pass it to _replace_status_with_response
+            effective_status = (
+                None if stream_state["status_consumed"] else status_message
             )
 
             # Deliver the response
             await self._replace_status_with_response(
-                status_message, user_id, response_text
+                effective_status, user_id, response_text
             )
 
         except Exception as e:
@@ -2188,17 +2506,19 @@ class TelegramChannel(BaseChannel):
                 error=str(e),
                 user_id=user_id,
             )
-            if status_message:
+            # If the status message was already deleted (intermediate text
+            # was streamed), we must fall back to message.answer instead.
+            error_text = "Sorry, something went wrong processing your message."
+            if status_message and not stream_state["status_consumed"]:
                 with contextlib.suppress(Exception):
-                    await status_message.edit_text(
-                        "Sorry, something went wrong processing your message."
-                    )
+                    await status_message.edit_text(error_text)
             else:
                 with contextlib.suppress(Exception):
-                    await message.answer(
-                        "Sorry, something went wrong processing your message."
-                    )
+                    await message.answer(error_text)
         finally:
+            # Drain any orphaned file sends before unregistering
+            with contextlib.suppress(Exception):
+                await self._drain_pending_files(user_id)
             self._unregister_background_task(user_id)
 
     # ------------------------------------------------------------------
@@ -2243,6 +2563,33 @@ class TelegramChannel(BaseChannel):
                 if not task.done():
                     result.append((uid, desc))
         return result
+
+    # ------------------------------------------------------------------
+    # Intermediate text helper
+    # ------------------------------------------------------------------
+
+    async def _send_intermediate_text(self, chat_id: int, text: str) -> None:
+        """Send intermediate/progress text as a new Telegram message.
+
+        Uses Markdown with fallback to plain text, and splits long messages.
+        """
+        if not self._bot or not text.strip():
+            return
+        chunks = self._split_message(text.strip())
+        for chunk in chunks:
+            try:
+                await self._bot.send_message(
+                    chat_id=chat_id, text=chunk, parse_mode="Markdown",
+                )
+            except Exception:
+                try:
+                    await self._bot.send_message(chat_id=chat_id, text=chunk)
+                except Exception as e:
+                    logger.warning(
+                        "intermediate_text_send_failed",
+                        chat_id=chat_id,
+                        error=str(e),
+                    )
 
     # ------------------------------------------------------------------
     # Status message helpers
@@ -2506,6 +2853,7 @@ class TelegramChannel(BaseChannel):
                     chat_id=chat_id,
                     video=input_file,
                     caption=caption or None,
+                    supports_streaming=True,
                 )
             else:
                 await self._bot.send_document(
@@ -2596,8 +2944,219 @@ class TelegramChannel(BaseChannel):
                 "telegram_message_failed", user_id=user_id, error=str(e),
             )
 
+    # ── Orchestration status event handlers ──────────────────────────
+
+    def _register_task_user(self, task_id: str, user_id: str) -> None:
+        """Register which user spawned a task (for status notifications)."""
+        self._task_user_map[task_id] = user_id
+
+    def _user_for_task(self, data: dict[str, Any]) -> str | None:
+        """Resolve the Telegram user_id for an orchestration event."""
+        task_id = data.get("task_id", "")
+        # Direct lookup
+        if task_id in self._task_user_map:
+            return self._task_user_map[task_id]
+        # Channel tasks use session_id = "telegram:<user_id>"
+        if task_id.startswith("telegram:"):
+            return task_id.split(":", 1)[1]
+        # Try parent_session_id (subagents spawned within a channel task)
+        parent = data.get("parent_session_id", "")
+        if parent.startswith("telegram:"):
+            user_id = parent.split(":", 1)[1]
+            # Cache for future lookups (completed/failed events)
+            if task_id:
+                self._task_user_map[task_id] = user_id
+            return user_id
+        return None
+
+    async def _notify_user(self, user_id: str, text: str) -> None:
+        """Send a status notification to a Telegram user."""
+        if not self._bot:
+            return
+        with contextlib.suppress(Exception):
+            await self._bot.send_message(
+                chat_id=int(user_id), text=text, parse_mode="HTML",
+            )
+
+    async def _on_subagent_spawned(self, data: dict[str, Any]) -> None:
+        """Notify user when a subagent starts working."""
+        user_id = self._user_for_task(data)
+        role = data.get("role", "agent")
+        # Skip channel-level task spawns (the main agent itself)
+        if role == "channel":
+            return
+        if user_id:
+            instruction = data.get("instruction", "")[:100]
+            await self._notify_user(
+                user_id,
+                f"\U0001f916 <b>{role}</b> started working"
+                f"{f': {instruction}...' if instruction else ''}",
+            )
+
+    async def _on_subagent_completed(self, data: dict[str, Any]) -> None:
+        """Notify user when a subagent finishes."""
+        user_id = self._user_for_task(data)
+        role = data.get("role", "agent")
+        if role == "channel":
+            return
+        if user_id:
+            duration = data.get("duration_ms", 0)
+            duration_s = f"{duration / 1000:.1f}s" if duration else ""
+            await self._notify_user(
+                user_id,
+                f"\u2705 <b>{role}</b> finished"
+                f"{f' ({duration_s})' if duration_s else ''}",
+            )
+
+    async def _on_subagent_failed(self, data: dict[str, Any]) -> None:
+        """Notify user when a subagent fails."""
+        user_id = self._user_for_task(data)
+        role = data.get("role", "agent")
+        if role == "channel":
+            return
+        if user_id:
+            error = data.get("error", "unknown error")[:200]
+            await self._notify_user(
+                user_id,
+                f"\u274c <b>{role}</b> failed: {error}",
+            )
+
+    async def _on_project_started(self, data: dict[str, Any]) -> None:
+        """Notify user when a project pipeline starts."""
+        # Project events don't have task_id in _task_user_map, but
+        # the project name is enough for context.
+        project = data.get("project", "?")
+        stages = data.get("stages", 0)
+        # Try all registered users (projects are typically single-user)
+        for uid in set(self._task_user_map.values()):
+            await self._notify_user(
+                uid,
+                f"\U0001f680 Project <b>{project}</b> started "
+                f"({stages} stages)",
+            )
+
+    async def _on_project_stage_started(self, data: dict[str, Any]) -> None:
+        """Notify user when a project stage begins."""
+        stage = data.get("stage", "?")
+        agents = data.get("agents", 0)
+        for uid in set(self._task_user_map.values()):
+            await self._notify_user(
+                uid,
+                f"\u25b6\ufe0f Stage <b>{stage}</b> started "
+                f"({agents} agent{'s' if agents != 1 else ''})",
+            )
+
+    async def _on_project_stage_completed(self, data: dict[str, Any]) -> None:
+        """Notify user when a project stage finishes."""
+        stage = data.get("stage", "?")
+        duration = data.get("duration_ms", 0)
+        duration_s = f"{duration / 1000:.1f}s" if duration else ""
+        for uid in set(self._task_user_map.values()):
+            await self._notify_user(
+                uid,
+                f"\u2705 Stage <b>{stage}</b> completed"
+                f"{f' ({duration_s})' if duration_s else ''}",
+            )
+
+    async def _on_project_completed(self, data: dict[str, Any]) -> None:
+        """Notify user when a project pipeline finishes."""
+        project = data.get("project", "?")
+        duration = data.get("duration_ms", 0)
+        duration_s = f"{duration / 1000:.1f}s" if duration else ""
+        for uid in set(self._task_user_map.values()):
+            await self._notify_user(
+                uid,
+                f"\U0001f389 Project <b>{project}</b> completed"
+                f"{f' in {duration_s}' if duration_s else ''}!",
+            )
+
+    async def _on_project_failed(self, data: dict[str, Any]) -> None:
+        """Notify user when a project pipeline fails."""
+        project = data.get("project", "?")
+        error = data.get("error", "unknown")[:200]
+        for uid in set(self._task_user_map.values()):
+            await self._notify_user(
+                uid,
+                f"\u274c Project <b>{project}</b> failed: {error}",
+            )
+
+    # ── Controller events ──────────────────────────────────────────
+
+    async def _on_controller_task_started(self, data: dict[str, Any]) -> None:
+        """Notify user when the controller starts working on a task."""
+        user_id = data.get("user_id")
+        if not user_id:
+            # Fall back to any known user
+            users = set(self._task_user_map.values())
+            user_id = next(iter(users), None) if users else None
+        if user_id:
+            instruction = data.get("instruction", "")[:100]
+            await self._notify_user(
+                user_id,
+                f"\U0001f4cb Controller started: {instruction}",
+            )
+
+    async def _on_controller_task_progress(self, data: dict[str, Any]) -> None:
+        """Notify user of controller progress updates."""
+        user_id = data.get("user_id")
+        if not user_id:
+            users = set(self._task_user_map.values())
+            user_id = next(iter(users), None) if users else None
+        if user_id:
+            status = data.get("status", "working")
+            await self._notify_user(
+                user_id,
+                f"\u2699\ufe0f Controller: {status}",
+            )
+
+    async def _on_controller_task_completed(self, data: dict[str, Any]) -> None:
+        """Notify user when the controller completes a task."""
+        user_id = data.get("user_id")
+        if not user_id:
+            users = set(self._task_user_map.values())
+            user_id = next(iter(users), None) if users else None
+        if user_id:
+            summary = data.get("summary", "Done")[:300]
+            await self._notify_user(
+                user_id,
+                f"\u2705 Controller completed: {summary}",
+            )
+
+    async def _on_controller_task_failed(self, data: dict[str, Any]) -> None:
+        """Notify user when the controller fails a task."""
+        user_id = data.get("user_id")
+        if not user_id:
+            users = set(self._task_user_map.values())
+            user_id = next(iter(users), None) if users else None
+        if user_id:
+            error = data.get("error", "unknown")[:200]
+            await self._notify_user(
+                user_id,
+                f"\u274c Controller failed: {error}",
+            )
+
+    async def _on_controller_task_cancelled(self, data: dict[str, Any]) -> None:
+        """Notify user when a controller task is cancelled."""
+        user_id = data.get("user_id")
+        if not user_id:
+            users = set(self._task_user_map.values())
+            user_id = next(iter(users), None) if users else None
+        if user_id:
+            order_id = data.get("order_id", "unknown")
+            await self._notify_user(
+                user_id,
+                f"\u26d4 Controller task cancelled: {order_id}",
+            )
+
+    # ── File send events ───────────────────────────────────────────
+
     async def _on_file_send(self, data: dict[str, Any]) -> None:
         """Handle FILE_SEND events from the send_file tool.
+
+        Files are queued rather than sent immediately so that any buffered
+        text messages (from the LLM stream) are flushed to the chat first.
+        The queue is drained by ``_drain_pending_files`` which is called
+        from the progress callback and after the orchestrator task finishes.
 
         Args:
             data: Event data with file_path, file_name, caption, channel, user_id.
@@ -2607,17 +3166,33 @@ class TelegramChannel(BaseChannel):
 
         user_id = data.get("user_id")
         file_path = data.get("file_path")
-        caption = data.get("caption", "")
 
         if not user_id or not file_path:
             logger.warning("file_send_missing_data", data=data)
             return
 
-        await self.send_file_auto(
-            channel_user_id=user_id,
-            file_path=file_path,
-            caption=caption,
-        )
+        self._pending_file_sends.setdefault(user_id, []).append(data)
+        logger.debug("file_send_queued", user_id=user_id, file_path=file_path)
+
+    async def _drain_pending_files(self, user_id: str) -> None:
+        """Send all queued files for a user, in order."""
+        files = self._pending_file_sends.pop(user_id, [])
+        for data in files:
+            file_path = data.get("file_path", "")
+            caption = data.get("caption", "")
+            try:
+                await self.send_file_auto(
+                    channel_user_id=user_id,
+                    file_path=file_path,
+                    caption=caption,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "drain_file_send_failed",
+                    user_id=user_id,
+                    file_path=file_path,
+                    error=str(exc),
+                )
 
     async def send_approval_request(
         self,

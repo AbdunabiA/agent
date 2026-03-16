@@ -104,6 +104,43 @@ workspaces:
       - channel: webchat
         workspace: default
 
+# Orchestration — multi-agent sub-agent delegation
+orchestration:
+  enabled: false
+  use_controller: false             # Enable controller sub-agent (project manager layer)
+  # controller_model: null          # Optional: lighter model for controller (e.g. claude-sonnet-4-6)
+  controller_max_turns: 30          # Max iterations for controller per work order
+  max_concurrent_agents: 15         # Max sub-agents running at once
+  subagent_timeout: 300             # Seconds before a sub-agent is killed
+  default_max_iterations: 5         # Default iteration limit per sub-agent
+  teams_directory: "teams"          # Directory for team YAML files (auto-discovered)
+  teams:                          # Inline teams (teams/ files take precedence)
+    # Pre-defined teams of sub-agents for common workflows
+    # - name: content
+    #   description: "Research and write content"
+    #   roles:
+    #     - name: researcher
+    #       persona: "You research topics thoroughly using web search."
+    #       allowed_tools: [web_search, read_file]
+    #       max_iterations: 5
+    #     - name: writer
+    #       persona: "You write clear, concise content based on research."
+    #       allowed_tools: [write_file, read_file]
+    #       max_iterations: 5
+
+    # - name: code_review
+    #   description: "Review code for bugs and style"
+    #   roles:
+    #     - name: reviewer
+    #       persona: "You review code for correctness, security, and style."
+    #       allowed_tools: [read_file, shell_exec]
+    #       denied_tools: [write_file]
+    #       max_iterations: 3
+    #     - name: fixer
+    #       persona: "You fix issues found during code review."
+    #       allowed_tools: [read_file, write_file, shell_exec]
+    #       max_iterations: 5
+
 # Desktop — screen capture, mouse, keyboard, app control
 desktop:
   enabled: true

@@ -1,0 +1,27 @@
+name: bug_fix
+description: "Investigate, fix, test, and document a bug"
+stages:
+  - name: investigation
+    parallel: true
+    agents:
+      - team: engineering
+        role: backend_developer
+      - team: quality
+        role: qa_engineer
+
+  - name: fix
+    feedback_target: true
+    agents:
+      - team: engineering
+        role: backend_developer
+
+  - name: verify
+    parallel: true
+    agents:
+      - team: quality
+        role: qa_engineer
+      - team: quality
+        role: security_reviewer
+    feedback:
+      fix_stage: fix
+      max_retries: 3

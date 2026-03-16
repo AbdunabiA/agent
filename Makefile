@@ -2,9 +2,11 @@
 
 install:
 	pip install -e .
+	python scripts/fix_editable_install.py
 
 dev:
 	pip install -e ".[dev]"
+	python scripts/fix_editable_install.py
 	pre-commit install
 
 test:

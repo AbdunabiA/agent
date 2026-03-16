@@ -218,6 +218,8 @@ def _init_agent_stack(cfg: AgentConfig) -> tuple[
         planner=planner,
         recovery=recovery,
         guardrails=guardrails,
+        orchestration_enabled=cfg.orchestration.enabled,
+        skill_builder_enabled=cfg.skills.builder.enabled,
     )
 
     return agent_loop, event_bus, audit, permissions, guardrails, recovery, planner
@@ -461,12 +463,60 @@ async def _chat_loop_sdk(cfg: AgentConfig) -> None:
     sdk_cfg = cfg.models.claude_sdk
     working_dir = sdk_cfg.working_dir or str(Path.cwd())
 
+    # Initialize memory components for SDK chat (personality + facts)
+    soul_loader = None
+    fact_store = None
+    vector_store = None
+    fact_extractor = None
+    db = None
+    try:
+        from agent.memory.soul import SoulLoader
+        soul_loader = SoulLoader(cfg.memory.soul_path)
+    except Exception as e:
+        logger.debug("soul_loader_init_failed", error=str(e))
+
+    try:
+        from agent.memory.database import Database
+        from agent.memory.store import FactStore
+
+        db = Database(cfg.memory.db_path)
+        await db.connect()
+        fact_store = FactStore(db)
+    except Exception as e:
+        logger.debug("fact_store_init_failed", error=str(e))
+
+    try:
+        from agent.memory.vectors import VectorStore
+        vector_store = VectorStore(
+            persist_dir=str(Path(cfg.memory.markdown_dir) / "chroma"),
+        )
+        await vector_store.initialize()
+    except Exception as e:
+        logger.debug("vector_store_init_failed", error=str(e))
+
+    if fact_store:
+        try:
+            from agent.llm.provider import LLMProvider
+            from agent.memory.extraction import FactExtractor
+
+            llm = LLMProvider(cfg.models)
+            fact_extractor = FactExtractor(
+                llm=llm, fact_store=fact_store,
+                enabled=cfg.memory.auto_extract,
+            )
+        except Exception as e:
+            logger.debug("fact_extractor_init_failed", error=str(e))
+
     sdk = ClaudeSDKService(
         working_dir=working_dir,
         max_turns=sdk_cfg.max_turns,
         permission_mode=sdk_cfg.permission_mode,
         model=sdk_cfg.model,
         claude_auth_dir=sdk_cfg.claude_auth_dir,
+        soul_loader=soul_loader,
+        fact_store=fact_store,
+        vector_store=vector_store,
+        fact_extractor=fact_extractor,
     )
 
     ok, msg = await sdk.check_available()
@@ -521,101 +571,111 @@ async def _chat_loop_sdk(cfg: AgentConfig) -> None:
     )
     console.print()
 
-    while True:
-        try:
-            user_input = console.input("[bold green]You > [/bold green]").strip()
-        except (KeyboardInterrupt, EOFError):
-            console.print("\n[dim]Goodbye![/dim]")
-            break
-
-        if not user_input:
-            continue
-
-        # Slash commands
-        if user_input.startswith("/"):
-            cmd = user_input.lower().split()[0]
-            if cmd in ("/exit", "/quit"):
-                console.print("[dim]Goodbye![/dim]")
+    try:
+        while True:
+            try:
+                user_input = console.input("[bold green]You > [/bold green]").strip()
+            except (KeyboardInterrupt, EOFError):
+                console.print("\n[dim]Goodbye![/dim]")
                 break
-            elif cmd == "/session":
-                console.print(f"[dim]Session: {session_id or 'none (new)'}[/dim]")
-                continue
-            elif cmd == "/new":
-                session_id = None
-                console.print("[dim]New session started.[/dim]")
-                continue
-            elif cmd == "/help":
-                table = Table(
-                    title="Commands (SDK Mode)", show_header=True,
-                    header_style="bold cyan",
-                )
-                table.add_column("Command", style="green")
-                table.add_column("Description")
-                table.add_row("/help", "Show this help")
-                table.add_row("/exit, /quit", "Exit chat")
-                table.add_row("/session", "Show current session ID")
-                table.add_row("/new", "Start a new session")
-                console.print(table)
-                continue
-            else:
-                console.print(f"[dim]Unknown command: {cmd}. Type /help for help.[/dim]")
+
+            if not user_input:
                 continue
 
-        # Send to Claude SDK
-        console.print()
-        result_text = ""
-        total_cost = 0.0
-        total_input = 0
-        total_output = 0
-
-        try:
-            async for event in sdk.run_task_stream(
-                prompt=user_input,
-                session_id=session_id,
-                working_dir=working_dir,
-                on_permission=on_permission,
-                on_question=on_question,
-            ):
-                if event.type == "text":
-                    is_subagent = event.data and event.data.get("subagent")
-                    if not is_subagent:
-                        console.print(event.content, end="")
-                        result_text += event.content
-                elif event.type == "thinking":
-                    console.print(f"[dim italic]{event.content}[/dim italic]", end="")
-                elif event.type == "tool_use":
-                    tool_name = event.data.get("tool", "?")
-                    console.print(
-                        f"\n[bold yellow]> {tool_name}[/bold yellow]", end=""
+            # Slash commands
+            if user_input.startswith("/"):
+                cmd = user_input.lower().split()[0]
+                if cmd in ("/exit", "/quit"):
+                    console.print("[dim]Goodbye![/dim]")
+                    break
+                elif cmd == "/session":
+                    console.print(f"[dim]Session: {session_id or 'none (new)'}[/dim]")
+                    continue
+                elif cmd == "/new":
+                    session_id = None
+                    console.print("[dim]New session started.[/dim]")
+                    continue
+                elif cmd == "/help":
+                    table = Table(
+                        title="Commands (SDK Mode)", show_header=True,
+                        header_style="bold cyan",
                     )
-                    if tool_name == "Bash":
-                        cmd = event.data.get("input", {}).get("command", "")
-                        if cmd:
-                            console.print(f" [dim]$ {cmd}[/dim]", end="")
-                    elif tool_name in ("Write", "Edit", "Read"):
-                        path = event.data.get("input", {}).get("file_path", "")
-                        if path:
-                            console.print(f" [dim]{path}[/dim]", end="")
-                    console.print()
-                elif event.type == "result":
-                    session_id = event.data.get("session_id")
-                    total_cost = event.data.get("cost_usd", 0.0)
-                    total_input = event.data.get("input_tokens", 0)
-                    total_output = event.data.get("output_tokens", 0)
-                elif event.type == "error":
-                    console.print(f"\n[red]Error:[/red] {event.content}")
+                    table.add_column("Command", style="green")
+                    table.add_column("Description")
+                    table.add_row("/help", "Show this help")
+                    table.add_row("/exit, /quit", "Exit chat")
+                    table.add_row("/session", "Show current session ID")
+                    table.add_row("/new", "Start a new session")
+                    console.print(table)
+                    continue
+                else:
+                    console.print(
+                        f"[dim]Unknown command: {cmd}. Type /help for help.[/dim]"
+                    )
+                    continue
 
+            # Send to Claude SDK
             console.print()
-            cost_str = f"${total_cost:.4f}" if total_cost else "N/A"
-            console.print(
-                f"[dim]Tokens: {total_input} in / {total_output} out | "
-                f"Cost: {cost_str} | "
-                f"Session: {session_id or 'N/A'}[/dim]"
-            )
-            console.print()
+            result_text = ""
+            total_cost = 0.0
+            total_input = 0
+            total_output = 0
 
-        except Exception as e:
-            console.print(f"\n[red]Error:[/red] {e}\n")
+            try:
+                async for event in sdk.run_task_stream(
+                    prompt=user_input,
+                    session_id=session_id,
+                    working_dir=working_dir,
+                    on_permission=on_permission,
+                    on_question=on_question,
+                ):
+                    if event.type == "text":
+                        is_subagent = event.data and event.data.get("subagent")
+                        if not is_subagent:
+                            console.print(event.content, end="")
+                            result_text += event.content
+                    elif event.type == "thinking":
+                        console.print(
+                            f"[dim italic]{event.content}[/dim italic]", end=""
+                        )
+                    elif event.type == "tool_use":
+                        tool_name = event.data.get("tool", "?")
+                        console.print(
+                            f"\n[bold yellow]> {tool_name}[/bold yellow]", end=""
+                        )
+                        if tool_name == "Bash":
+                            cmd = event.data.get("input", {}).get("command", "")
+                            if cmd:
+                                console.print(f" [dim]$ {cmd}[/dim]", end="")
+                        elif tool_name in ("Write", "Edit", "Read"):
+                            path = event.data.get("input", {}).get("file_path", "")
+                            if path:
+                                console.print(f" [dim]{path}[/dim]", end="")
+                        console.print()
+                    elif event.type == "result":
+                        session_id = event.data.get("session_id")
+                        total_cost = event.data.get("cost_usd", 0.0)
+                        total_input = event.data.get("input_tokens", 0)
+                        total_output = event.data.get("output_tokens", 0)
+                    elif event.type == "error":
+                        console.print(f"\n[red]Error:[/red] {event.content}")
+
+                console.print()
+                cost_str = f"${total_cost:.4f}" if total_cost else "N/A"
+                console.print(
+                    f"[dim]Tokens: {total_input} in / {total_output} out | "
+                    f"Cost: {cost_str} | "
+                    f"Session: {session_id or 'N/A'}[/dim]"
+                )
+                console.print()
+
+            except Exception as e:
+                console.print(f"\n[red]Error:[/red] {e}\n")
+    finally:
+        # Clean up memory resources
+        if db is not None:
+            with contextlib.suppress(Exception):
+                await db.close()
 
 
 def _print_available_models(cfg: AgentConfig) -> None:
@@ -1467,10 +1527,13 @@ def skills_enable(
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
 ) -> None:
     """Enable a disabled skill (removes from disabled list in config)."""
+    from agent.config import _save_config_to_disk
+
     cfg = _load_config(config)
     if name in cfg.skills.disabled:
         cfg.skills.disabled.remove(name)
-        console.print(f"[green]Skill '{name}' enabled.[/green]")
+        _save_config_to_disk(cfg)
+        console.print(f"[green]Skill '{name}' enabled and saved to config.[/green]")
     else:
         console.print(f"[dim]Skill '{name}' is already enabled.[/dim]")
 
@@ -1481,10 +1544,13 @@ def skills_disable(
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
 ) -> None:
     """Disable a skill (adds to disabled list in config)."""
+    from agent.config import _save_config_to_disk
+
     cfg = _load_config(config)
     if name not in cfg.skills.disabled:
         cfg.skills.disabled.append(name)
-        console.print(f"[yellow]Skill '{name}' disabled.[/yellow]")
+        _save_config_to_disk(cfg)
+        console.print(f"[yellow]Skill '{name}' disabled and saved to config.[/yellow]")
     else:
         console.print(f"[dim]Skill '{name}' is already disabled.[/dim]")
 
@@ -1634,25 +1700,43 @@ teams_app = typer.Typer(help="Sub-agent team commands.")
 app.add_typer(teams_app, name="teams")
 
 
+def _load_all_teams(cfg: Any) -> list[Any]:
+    """Load teams from both config and teams/ directory."""
+    from agent.teams.loader import (
+        config_to_team,
+        load_teams_from_directory,
+        merge_teams,
+    )
+
+    config_teams = [config_to_team(t) for t in cfg.orchestration.teams]
+    file_teams = load_teams_from_directory(cfg.orchestration.teams_directory)
+    return merge_teams(file_teams, config_teams)
+
+
 @teams_app.command("list")
 def teams_list(
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
 ) -> None:
     """List configured sub-agent teams."""
     cfg = _load_config(config)
+    teams = _load_all_teams(cfg)
 
-    if not cfg.orchestration.teams:
-        console.print("[dim]No teams configured. Add teams in agent.yaml.[/dim]")
+    if not teams:
+        console.print(
+            "[dim]No teams configured. "
+            "Add YAML files to teams/ or define inline in agent.yaml.[/dim]"
+        )
         return
 
     table = Table(title="Agent Teams")
     table.add_column("Name", style="cyan")
     table.add_column("Description")
     table.add_column("Roles")
+    table.add_column("#", justify="right")
 
-    for team in cfg.orchestration.teams:
+    for team in teams:
         roles = ", ".join(r.name for r in team.roles)
-        table.add_row(team.name, team.description, roles)
+        table.add_row(team.name, team.description, roles, str(len(team.roles)))
 
     console.print(table)
 
@@ -1664,8 +1748,9 @@ def teams_info(
 ) -> None:
     """Show details about a sub-agent team."""
     cfg = _load_config(config)
+    teams = _load_all_teams(cfg)
 
-    team = next((t for t in cfg.orchestration.teams if t.name == name), None)
+    team = next((t for t in teams if t.name == name), None)
     if not team:
         console.print(f"[red]Team '{name}' not found[/red]")
         raise typer.Exit(1)
@@ -1673,10 +1758,148 @@ def teams_info(
     console.print(Panel(f"[bold]{team.name}[/bold]\n{team.description}", title="Team"))
     for role in team.roles:
         tools = ", ".join(role.allowed_tools) if role.allowed_tools else "all safe+moderate"
+        denied = ", ".join(role.denied_tools) if role.denied_tools else "none"
         console.print(
             f"  [cyan]{role.name}[/cyan]: {role.persona}\n"
-            f"    Tools: {tools} | Max iterations: {role.max_iterations}"
+            f"    Allowed: {tools} | Denied: {denied} | Max iterations: {role.max_iterations}"
         )
+
+
+@teams_app.command("create")
+def teams_create(
+    name: str = typer.Argument(help="Team name"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+) -> None:
+    """Scaffold a new team YAML file in the teams/ directory."""
+    cfg = _load_config(config)
+    teams_dir = Path(cfg.orchestration.teams_directory)
+    teams_dir.mkdir(parents=True, exist_ok=True)
+
+    target = teams_dir / f"{name}.yaml"
+    if target.exists():
+        console.print(f"[red]Team file already exists: {target}[/red]")
+        raise typer.Exit(1)
+
+    template = (
+        f"name: {name}\n"
+        f"description: \"\"\n"
+        f"roles:\n"
+        f"  - name: agent\n"
+        f"    persona: \"You are a helpful assistant.\"\n"
+        f"    allowed_tools: []\n"
+        f"    denied_tools: []\n"
+        f"    max_iterations: 5\n"
+    )
+    target.write_text(template, encoding="utf-8")
+    console.print(f"[green]Created team file: {target}[/green]")
+    console.print("[dim]Edit the file to add roles and configure the team.[/dim]")
+
+
+# --- Project subcommands ---
+
+project_app = typer.Typer(help="Cross-team project pipeline commands.")
+app.add_typer(project_app, name="project")
+
+
+@project_app.command("list")
+def project_list(
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+) -> None:
+    """List available project pipelines."""
+    cfg = _load_config(config)
+
+    from agent.teams.loader import load_projects_from_directory
+
+    projects = load_projects_from_directory(cfg.orchestration.teams_directory)
+
+    if not projects:
+        console.print(
+            "[dim]No projects configured. "
+            "Add YAML files to teams/projects/ to define pipelines.[/dim]"
+        )
+        return
+
+    table = Table(title="Project Pipelines")
+    table.add_column("Name", style="cyan")
+    table.add_column("Description")
+    table.add_column("Stages")
+    table.add_column("Agents", justify="right")
+
+    for proj in projects:
+        stages = " → ".join(s.name for s in proj.stages)
+        total_agents = sum(len(s.agents) for s in proj.stages)
+        table.add_row(proj.name, proj.description, stages, str(total_agents))
+
+    console.print(table)
+
+
+@project_app.command("info")
+def project_info(
+    name: str = typer.Argument(help="Project name"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+) -> None:
+    """Show details about a project pipeline."""
+    cfg = _load_config(config)
+
+    from agent.teams.loader import load_projects_from_directory
+
+    projects = load_projects_from_directory(cfg.orchestration.teams_directory)
+    proj = next((p for p in projects if p.name == name), None)
+
+    if not proj:
+        console.print(f"[red]Project '{name}' not found[/red]")
+        raise typer.Exit(1)
+
+    console.print(Panel(f"[bold]{proj.name}[/bold]\n{proj.description}", title="Project"))
+    for i, stage in enumerate(proj.stages, 1):
+        agents_str = ", ".join(f"{a.team}/{a.role}" for a in stage.agents)
+        parallel_str = "parallel" if stage.parallel else "sequential"
+        console.print(
+            f"  [cyan]Stage {i}: {stage.name}[/cyan] ({parallel_str})\n"
+            f"    Agents: {agents_str}"
+        )
+
+
+@project_app.command("create")
+def project_create(
+    name: str = typer.Argument(help="Project name"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+) -> None:
+    """Scaffold a new project YAML file in teams/projects/."""
+    cfg = _load_config(config)
+    projects_dir = Path(cfg.orchestration.teams_directory) / "projects"
+    projects_dir.mkdir(parents=True, exist_ok=True)
+
+    target = projects_dir / f"{name}.yaml"
+    if target.exists():
+        console.print(f"[red]Project file already exists: {target}[/red]")
+        raise typer.Exit(1)
+
+    template = (
+        f"name: {name}\n"
+        f"description: \"\"\n"
+        f"stages:\n"
+        f"  - name: planning\n"
+        f"    parallel: true\n"
+        f"    agents:\n"
+        f"      - team: engineering\n"
+        f"        role: architect\n"
+        f"\n"
+        f"  - name: implementation\n"
+        f"    parallel: true\n"
+        f"    agents:\n"
+        f"      - team: engineering\n"
+        f"        role: backend_developer\n"
+        f"\n"
+        f"  - name: review\n"
+        f"    parallel: true\n"
+        f"    agents:\n"
+        f"      - team: quality\n"
+        f"        role: qa_engineer\n"
+    )
+    target.write_text(template, encoding="utf-8")
+    console.print(f"[green]Created project file: {target}[/green]")
+    console.print("[dim]Edit the file to define stages and agents.[/dim]")
 
 
 # --- Memory subcommands ---

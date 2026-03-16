@@ -240,7 +240,7 @@ class TestResumeSessionTracking:
         call_count = 0
 
         async def fake_impl(
-            prompt, *, task_id, session_id, working_dir, on_permission, on_question
+            prompt, *, task_id, session_id, working_dir, on_permission, on_question, **kwargs
         ):
             nonlocal call_count
             call_count += 1
@@ -272,7 +272,7 @@ class TestResumeSessionTracking:
         """If no session_id and error occurs, should NOT retry."""
 
         async def fake_impl(
-            prompt, *, task_id, session_id, working_dir, on_permission, on_question
+            prompt, *, task_id, session_id, working_dir, on_permission, on_question, **kwargs
         ):
             from agent.llm.claude_sdk import SDKStreamEvent
 
@@ -738,7 +738,7 @@ class TestQueryLockSerialization:
         execution_order: list[str] = []
 
         async def fake_impl(
-            prompt, *, task_id, session_id, working_dir, on_permission, on_question
+            prompt, *, task_id, session_id, working_dir, on_permission, on_question, **kwargs
         ):
             from agent.llm.claude_sdk import SDKStreamEvent
 
@@ -775,7 +775,7 @@ class TestQueryLockSerialization:
         execution_order: list[str] = []
 
         async def fake_impl(
-            prompt, *, task_id, session_id, working_dir, on_permission, on_question
+            prompt, *, task_id, session_id, working_dir, on_permission, on_question, **kwargs
         ):
             from agent.llm.claude_sdk import SDKStreamEvent
 

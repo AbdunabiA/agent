@@ -153,29 +153,61 @@ class TestVoice:
 class TestPhoto:
     """Photo message handling tests."""
 
-    async def test_photo_with_caption(
-        self, channel: TelegramChannel, mock_agent_loop: MagicMock
+    def _setup_photo_mocks(
+        self, channel: TelegramChannel, msg: MagicMock, file_path: str = "photos/file.jpg"
     ) -> None:
-        """Photo with caption should include both image and text in multimodal content."""
-        msg = _make_message(caption="What's in this image?")
-        photo_mock = MagicMock()
-        photo_mock.file_id = "photo123"
-        msg.photo = [MagicMock(), photo_mock]  # last is highest res
-
+        """Common setup for photo tests: mock bot file download + dispatch."""
         file_mock = MagicMock()
-        file_mock.file_path = "photos/file.jpg"
+        file_mock.file_path = file_path
         channel._bot.get_file.return_value = file_mock
 
         async def fake_download(path: str, buf: BytesIO) -> None:
             buf.write(b"fake-jpeg-data")
 
         channel._bot.download_file.side_effect = fake_download
+        # Mock _replace_status_with_response to avoid send_message issues
+        channel._replace_status_with_response = AsyncMock()
+
+    async def test_photo_with_caption_dispatched(
+        self, channel: TelegramChannel, mock_agent_loop: MagicMock
+    ) -> None:
+        """Photo with caption dispatches through _dispatch_to_agent with text description."""
+        msg = _make_message(caption="What's in this image?")
+        photo_mock = MagicMock()
+        photo_mock.file_id = "photo123"
+        msg.photo = [MagicMock(), photo_mock]  # last is highest res
+        self._setup_photo_mocks(channel, msg)
+
+        # Mock _dispatch_to_agent to return a response (orchestrator path)
+        channel._dispatch_to_agent = AsyncMock(return_value="I see a cat.")
+
+        await channel._handle_photo(msg)
+        await _drain_background_tasks(channel)
+
+        channel._dispatch_to_agent.assert_awaited_once()
+        call_kwargs = channel._dispatch_to_agent.call_args[1]
+        assert "[Photo attached]" in call_kwargs["text"]
+        assert "What's in this image?" in call_kwargs["text"]
+
+    async def test_photo_fallback_to_multimodal(
+        self, channel: TelegramChannel, mock_agent_loop: MagicMock
+    ) -> None:
+        """When dispatch returns empty, falls back to direct multimodal LLM call."""
+        msg = _make_message(caption="What's in this image?")
+        photo_mock = MagicMock()
+        photo_mock.file_id = "photo123"
+        msg.photo = [MagicMock(), photo_mock]
+        self._setup_photo_mocks(channel, msg)
+
+        # Mock dispatch to return empty (triggers fallback)
+        channel._dispatch_to_agent = AsyncMock(return_value="")
 
         llm_response = MagicMock()
         llm_response.content = "I see a cat."
         mock_agent_loop.llm.completion.return_value = llm_response
 
         await channel._handle_photo(msg)
+        await _drain_background_tasks(channel)
 
         mock_agent_loop.llm.completion.assert_awaited_once()
         call_args = mock_agent_loop.llm.completion.call_args
@@ -183,7 +215,6 @@ class TestPhoto:
         last_msg = messages[-1]
         content = last_msg["content"]
         assert isinstance(content, list)
-        # Should have image_url and text blocks
         types = [block["type"] for block in content]
         assert "image_url" in types
         assert "text" in types
@@ -191,26 +222,22 @@ class TestPhoto:
     async def test_photo_without_caption(
         self, channel: TelegramChannel, mock_agent_loop: MagicMock
     ) -> None:
-        """Photo without caption should have only image_url block."""
+        """Photo without caption should have only image_url block in fallback path."""
         msg = _make_message()
         photo_mock = MagicMock()
         photo_mock.file_id = "photo789"
         msg.photo = [photo_mock]
+        self._setup_photo_mocks(channel, msg, file_path="photos/file2.jpg")
 
-        file_mock = MagicMock()
-        file_mock.file_path = "photos/file2.jpg"
-        channel._bot.get_file.return_value = file_mock
-
-        async def fake_download(path: str, buf: BytesIO) -> None:
-            buf.write(b"fake-jpeg-data")
-
-        channel._bot.download_file.side_effect = fake_download
+        # Mock dispatch to return empty (triggers fallback)
+        channel._dispatch_to_agent = AsyncMock(return_value="")
 
         llm_response = MagicMock()
         llm_response.content = "Nice photo."
         mock_agent_loop.llm.completion.return_value = llm_response
 
         await channel._handle_photo(msg)
+        await _drain_background_tasks(channel)
 
         call_args = mock_agent_loop.llm.completion.call_args
         messages = call_args.kwargs.get("messages", call_args.args[0] if call_args.args else None)

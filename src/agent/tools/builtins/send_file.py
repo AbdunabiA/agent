@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,14 @@ logger = structlog.get_logger(__name__)
 
 # Global state set by the channel before processing a message
 _global_event_bus: EventBus | None = None
-_global_context: dict[str, str | None] = {"channel": None, "user_id": None}
+
+# Per-task context vars — safe for concurrent asyncio tasks (GAP 15)
+_channel_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "send_file_channel", default=None,
+)
+_user_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "send_file_user_id", default=None,
+)
 
 
 def set_file_send_bus(event_bus: EventBus) -> None:
@@ -37,8 +45,8 @@ def set_file_send_context(
         channel: Channel name (e.g. "telegram").
         user_id: User ID within the channel.
     """
-    _global_context["channel"] = channel
-    _global_context["user_id"] = user_id
+    _channel_var.set(channel)
+    _user_id_var.set(user_id)
 
 
 def _resolve_path(path: str) -> Path:
@@ -107,8 +115,8 @@ async def send_file(path: str, caption: str = "") -> str:
             "[ERROR] File sending not available — event bus not initialized."
         )
 
-    channel = _global_context.get("channel")
-    user_id = _global_context.get("user_id")
+    channel = _channel_var.get()
+    user_id = _user_id_var.get()
 
     if not channel or not user_id:
         return (

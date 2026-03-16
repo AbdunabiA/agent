@@ -1,0 +1,32 @@
+name: build_app
+description: "End-to-end application development — plan, build, review, document"
+stages:
+  - name: planning
+    parallel: true
+    agents:
+      - team: product
+        role: product_manager
+      - team: engineering
+        role: architect
+
+  - name: implementation
+    parallel: true
+    agents:
+      - team: engineering
+        role: backend_developer
+      - team: engineering
+        role: frontend_developer
+
+  - name: review
+    parallel: true
+    agents:
+      - team: quality
+        role: qa_engineer
+      - team: quality
+        role: security_reviewer
+
+  - name: documentation
+    parallel: true
+    agents:
+      - team: content
+        role: technical_writer

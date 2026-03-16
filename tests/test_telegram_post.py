@@ -23,11 +23,13 @@ def _reset_globals():
     """Reset module-level globals before each test."""
     telegram_post._global_event_bus = None
     telegram_post._global_scheduler = None
-    telegram_post._global_context = {"channel": None, "user_id": None}
+    telegram_post._channel_var.set(None)
+    telegram_post._user_id_var.set(None)
     yield
     telegram_post._global_event_bus = None
     telegram_post._global_scheduler = None
-    telegram_post._global_context = {"channel": None, "user_id": None}
+    telegram_post._channel_var.set(None)
+    telegram_post._user_id_var.set(None)
 
 
 def _make_event_bus() -> AsyncMock:

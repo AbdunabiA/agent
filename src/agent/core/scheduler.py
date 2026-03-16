@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -330,16 +330,22 @@ class TaskScheduler:
                     created_at=datetime.fromisoformat(row["created_at"]),
                 )
                 if row["last_run"]:
-                    task.last_run = datetime.fromisoformat(row["last_run"])
+                    _lr = datetime.fromisoformat(row["last_run"])
+                    task.last_run = (
+                        _lr if _lr.tzinfo else _lr.replace(tzinfo=UTC)
+                    )
                 if row["next_run"]:
-                    task.next_run = datetime.fromisoformat(row["next_run"])
+                    _nr = datetime.fromisoformat(row["next_run"])
+                    task.next_run = (
+                        _nr if _nr.tzinfo else _nr.replace(tzinfo=UTC)
+                    )
 
                 self._tasks[task.id] = task
 
                 # Re-schedule
                 if self._scheduler:
                     if task.type == "reminder" and task.next_run:
-                        if task.next_run > datetime.now():
+                        if task.next_run > datetime.now(tz=UTC):
                             self._scheduler.add_job(
                                 self._execute_task,
                                 "date",
@@ -434,7 +440,7 @@ class TaskScheduler:
             return
 
         task.status = "running"
-        task.last_run = datetime.now()
+        task.last_run = datetime.now(tz=UTC)
 
         try:
             # Deliver the reminder to the user via channel

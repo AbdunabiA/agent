@@ -40,6 +40,7 @@ _SDK_AVAILABLE: bool | None = None
 _SDK_PATCHED: bool = False
 
 
+
 def _patch_sdk_permission_protocol() -> None:
     """Patch claude-code-sdk to use the new permission response format.
 
@@ -254,6 +255,9 @@ class ClaudeSDKService:
         self._idle_timeout: int = 1800  # overridden by config in startup
         self._reaper_task: asyncio.Task[None] | None = None
 
+        # Track fire-and-forget background tasks for clean shutdown
+        self._background_tasks: set[asyncio.Task[Any]] = set()
+
         # Issue 4: Resume on crash — last known session_id per task
         self._last_session_ids: dict[str, str] = {}
 
@@ -262,6 +266,10 @@ class ClaudeSDKService:
 
         # Issue 1: System prompt fingerprint tracking
         self._prompt_fingerprints: dict[str, str] = {}
+        self._cached_facts: dict[str, list[Any]] = {}
+
+        # Sub-agent execution metrics (tool calls, iterations per task_id)
+        self._subagent_metrics: dict[str, dict[str, int | float | None]] = {}
 
         # Per-task lock to serialize concurrent queries on the same client
         self._query_locks: dict[str, asyncio.Lock] = {}
@@ -296,13 +304,19 @@ class ClaudeSDKService:
         logger.info("sdk_reaper_started", idle_timeout=self._idle_timeout)
 
     async def stop_reaper(self) -> None:
-        """Stop the idle-client reaper."""
+        """Stop the idle-client reaper and cancel background tasks."""
         if self._reaper_task is not None:
             self._reaper_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._reaper_task
             self._reaper_task = None
             logger.info("sdk_reaper_stopped")
+        # Cancel any lingering background tasks (fact extraction, event emission)
+        for bg in list(self._background_tasks):
+            bg.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+            self._background_tasks.clear()
 
     async def _reap_idle_clients(self) -> None:
         """Periodically disconnect clients that have been idle too long."""
@@ -325,7 +339,6 @@ class ClaudeSDKService:
     def _compute_prompt_fingerprint(
         self,
         facts: list[Any] | None = None,
-        vector_results: list[Any] | None = None,
     ) -> str:
         """Hash soul + facts into a fingerprint for drift detection."""
         parts: list[str] = []
@@ -345,6 +358,7 @@ class ClaudeSDKService:
         working_dir: str | None = None,
         on_permission: PermissionCallback | None = None,
         on_question: QuestionCallback | None = None,
+        channel: str | None = None,
     ) -> AsyncGenerator[SDKStreamEvent, None]:
         """Run a task via SDK and stream events.
 
@@ -360,6 +374,7 @@ class ClaudeSDKService:
                 Signature: (tool_name, details, tool_input) -> bool
             on_question: Async callback for questions from Claude.
                 Signature: (question_text, options) -> str
+            channel: Channel name (e.g. "telegram", "webchat") for context.
 
         Yields:
             SDKStreamEvent objects as they occur.
@@ -378,6 +393,7 @@ class ClaudeSDKService:
                 working_dir=working_dir,
                 on_permission=on_permission,
                 on_question=on_question,
+                channel=channel,
             ):
                 if event.type == "error":
                     logger.warning(
@@ -399,6 +415,7 @@ class ClaudeSDKService:
                     working_dir=working_dir,
                     on_permission=on_permission,
                     on_question=on_question,
+                    channel=channel,
                 ):
                     yield retry_event
             else:
@@ -412,8 +429,223 @@ class ClaudeSDKService:
                 working_dir=working_dir,
                 on_permission=on_permission,
                 on_question=on_question,
+                channel=channel,
             ):
                 yield event
+
+    async def run_subagent(
+        self,
+        prompt: str,
+        *,
+        task_id: str,
+        role_persona: str,
+        scoped_registry: Any,
+        model: str | None = None,
+        max_turns: int = 10,
+        task_context: str = "",
+        tool_executor: Any | None = None,
+        nesting_depth: int = 0,
+    ) -> str:
+        """Run a sub-agent task via a temporary SDK client.
+
+        Creates a short-lived ClaudeSDKClient with a scoped tool registry
+        and focused sub-agent prompt. The client is disconnected after use.
+
+        Args:
+            prompt: The task instruction for the sub-agent.
+            task_id: Unique task identifier.
+            role_persona: The sub-agent's persona description.
+            scoped_registry: Filtered tool registry for this sub-agent.
+            model: Optional model override.
+            max_turns: Maximum agent turns (default 10).
+            task_context: Optional context to include in the prompt.
+            tool_executor: Optional ToolExecutor for safety routing
+                through permissions, guardrails, and audit.
+
+        Returns:
+            The sub-agent's text response.
+        """
+        import contextlib as _contextlib
+        import os as _os
+        from pathlib import Path as _Path
+
+        from claude_code_sdk import (
+            AssistantMessage,
+            ClaudeCodeOptions,
+            ClaudeSDKClient,
+            ResultMessage,
+        )
+        from claude_code_sdk.types import (
+            PermissionResultAllow,
+            PermissionResultDeny,
+        )
+
+        logger.info(
+            "sdk_subagent_starting",
+            task_id=task_id,
+            role=role_persona[:80],
+            model=model or self.model,
+        )
+
+        # Build scoped MCP server (route through executor for audit/safety)
+        mcp_servers: dict[str, Any] = {}
+        mcp_result = self._build_mcp_server(
+            registry=scoped_registry,
+            tool_executor=tool_executor,
+            session_id=f"subagent:{task_id}",
+        )
+        if mcp_result:
+            server_config, _ = mcp_result
+            mcp_servers["agent-tools"] = server_config
+
+        # Collect safe tool names from scoped registry for auto-approval
+        from agent.tools.registry import ToolTier
+
+        agent_safe_tools: set[str] = set()
+        all_agent_tools: set[str] = set()
+        if scoped_registry is not None:
+            for td in scoped_registry.list_tools():
+                all_agent_tools.add(td.name)
+                if td.enabled and td.tier == ToolTier.SAFE:
+                    agent_safe_tools.add(td.name)
+
+        # Build sub-agent system prompt
+        system_prompt = self._build_subagent_prompt(
+            role_persona=role_persona,
+            task_context=task_context,
+            nesting_depth=nesting_depth,
+        )
+
+        # Permission callback — auto-approve safe tools + Claude Code read tools
+        async def can_use_tool(
+            tool_name: str,
+            tool_input: dict[str, Any],
+            context: Any,
+        ) -> Any:
+            safe_tools = {
+                "Read", "Glob", "Grep", "WebFetch", "WebSearch",
+                "LS", "TaskGet", "TaskList", "TaskOutput", "ToolSearch",
+            }
+            if tool_name in safe_tools or tool_name in agent_safe_tools:
+                return PermissionResultAllow(updated_input=tool_input)
+
+            # Auto-approve all tools from scoped registry (already filtered)
+            if tool_name in all_agent_tools:
+                return PermissionResultAllow(updated_input=tool_input)
+
+            return PermissionResultDeny(
+                message="Tool not in sub-agent scope", interrupt=False
+            )
+
+        resolved_cwd = str(_Path(_os.path.expanduser(self.working_dir)).resolve())  # noqa: ASYNC240
+
+        options_kwargs: dict[str, Any] = {
+            "cwd": resolved_cwd,
+            "max_turns": max_turns,
+            "model": model or self.model,
+            "permission_mode": self.permission_mode,
+            "can_use_tool": can_use_tool,
+            "system_prompt": system_prompt,
+            "env": {
+                "GIT_TERMINAL_PROMPT": "0",
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8",
+            },
+        }
+        if mcp_servers:
+            options_kwargs["mcp_servers"] = mcp_servers
+
+        # Ensure conflicting env vars are not inherited by the subprocess.
+        # Instead of mutating os.environ under a lock, pass a clean env dict
+        # via ClaudeCodeOptions.env so parallel sub-agents can start concurrently.
+        # Note: ANTHROPIC_API_KEY is NOT blanked — the subprocess needs it for auth.
+        # Only blank vars that control Claude Code CLI behavior to avoid conflicts.
+        _env_overrides = dict(options_kwargs.get("env", {}))
+        for key in (
+            "CLAUDECODE", "CLAUDE_CODE_SSE_PORT", "CLAUDE_CODE_ENTRYPOINT",
+        ):
+            if key in _os.environ and key not in _env_overrides:
+                _env_overrides[key] = ""
+        options_kwargs["env"] = _env_overrides
+
+        options = ClaudeCodeOptions(**options_kwargs)
+
+        client: Any = None
+        try:
+            client = ClaudeSDKClient(options=options)
+            await client.connect()
+            logger.info(
+                "sdk_subagent_connected",
+                task_id=task_id,
+                model=model or self.model,
+            )
+
+            # Send query and collect response
+            await client.query(prompt)
+
+            accumulated = ""
+            last_assistant_text = ""
+            result_text = ""
+            tool_calls = 0
+            iterations = 0
+            total_cost: float | None = None
+            async for message in self._safe_receive(client):
+                if isinstance(message, AssistantMessage):
+                    iterations += 1
+                    # Track only the latest assistant text block — earlier
+                    # blocks are intermediate reasoning between tool calls.
+                    current_text = ""
+                    for block in message.content:
+                        if hasattr(block, "text"):
+                            current_text += block.text
+                        elif hasattr(block, "tool_use_id") or hasattr(block, "name"):
+                            tool_calls += 1
+                    if current_text:
+                        last_assistant_text = current_text
+                    accumulated += current_text
+                elif isinstance(message, ResultMessage):
+                    # ResultMessage contains authoritative metrics
+                    iterations = message.num_turns
+                    total_cost = message.total_cost_usd
+                    if message.result:
+                        result_text = message.result
+
+            # Prefer ResultMessage.result (authoritative final output),
+            # then last assistant text, then full accumulated text.
+            final_text = result_text or last_assistant_text or accumulated
+            if not final_text:
+                final_text = "[No response from sub-agent]"
+
+            # Store metrics for the orchestrator to read
+            self._subagent_metrics[task_id] = {
+                "tool_calls": tool_calls,
+                "iterations": iterations,
+                "total_cost_usd": total_cost,
+            }
+
+            logger.info(
+                "sdk_subagent_completed",
+                task_id=task_id,
+                response_len=len(final_text),
+                tool_calls=tool_calls,
+                iterations=iterations,
+            )
+
+            return final_text
+
+        except Exception as e:
+            logger.error(
+                "sdk_subagent_error",
+                task_id=task_id,
+                error=str(e),
+            )
+            raise
+
+        finally:
+            if client is not None:
+                with _contextlib.suppress(Exception):
+                    await client.disconnect()
+                logger.info("sdk_subagent_disconnected", task_id=task_id)
 
     async def _query_memory(
         self, user_message: str,
@@ -451,6 +683,7 @@ class ClaudeSDKService:
         self,
         facts: list[Any] | None = None,
         vector_results: list[Any] | None = None,
+        channel: str | None = None,
     ) -> str | None:
         """Build system prompt from soul.md + memory context.
 
@@ -458,6 +691,11 @@ class ClaudeSDKService:
         Wraps the soul content with identity override instructions so the
         agent adopts the persona defined in soul.md rather than defaulting
         to Claude/Anthropic identity.
+
+        Args:
+            facts: Known facts to inject.
+            vector_results: Semantic search results to inject.
+            channel: Channel name (e.g. "telegram", "webchat", "cli").
         """
         parts: list[str] = []
 
@@ -497,7 +735,87 @@ class ClaudeSDKService:
                 + "\n---\n".join(vr_lines)
             )
 
+        # Orchestration mandate — only when orchestration is enabled
+        from agent.config import get_config
+        _cfg = get_config()
+        if _cfg.orchestration.enabled:
+            parts.append(
+                "WORK DELEGATION RULE:\n"
+                "You MUST delegate all substantive work (coding, file creation, "
+                "research, commands, multi-step tasks) to sub-agents. You are the "
+                "orchestrator — stay free for conversation and coordination. "
+                "Only handle simple conversational replies and clarifying questions yourself.\n\n"
+                "CHOOSING THE RIGHT WORKFLOW:\n"
+                "- Vague/broad requests (\"build me an app\", \"create a website\"): "
+                "First ask the user clarifying questions (purpose, features, tech stack, "
+                "scope). Once clear, use run_project build_app.\n"
+                "- Bug reports: use run_project bug_fix.\n"
+                "- Code review requests: use run_project code_review.\n"
+                "- Complex features with clear requirements: use run_project full_feature.\n"
+                "- Specific single tasks: use spawn_subagent with the right role.\n"
+                "- Multiple independent tasks: use spawn_parallel_agents.\n"
+                "Use list_projects to see all available pipelines.\n\n"
+                "DISCOVERY:\n"
+                "When a request is too vague, YOU ask clarifying questions directly — "
+                "do NOT delegate discovery. Gather requirements, confirm scope, "
+                "then launch the right project or sub-agent with full context."
+            )
+
+        # Runtime context (channel awareness, capabilities)
+        from agent.llm.prompts import build_runtime_context
+
+        runtime_ctx = build_runtime_context(
+            channel=channel or "cli",
+            model_name=self.model,
+            has_memory=self.fact_store is not None,
+            has_orchestration=_cfg.orchestration.enabled,
+        )
+        parts.append(runtime_ctx)
+
         return "\n\n".join(parts) if parts else None
+
+    def _build_subagent_prompt(
+        self,
+        role_persona: str,
+        task_context: str = "",
+        nesting_depth: int = 0,
+    ) -> str:
+        """Build a focused system prompt for sub-agents.
+
+        Unlike the full system prompt, this omits identity override,
+        orchestration mandate, memory facts, and soul.md. Sub-agents
+        are workers — they should execute, not delegate.
+
+        Args:
+            role_persona: The sub-agent's role persona description.
+            task_context: Optional task context to include.
+            nesting_depth: How deep in the sub-agent chain this agent is.
+        """
+        parts: list[str] = []
+
+        # Role persona as primary identity
+        parts.append(f"ROLE:\n{role_persona}")
+
+        # Worker instruction — prevent recursive delegation
+        delegation_note = ""
+        if nesting_depth >= 1:
+            delegation_note = (
+                f" You are a nested sub-agent (depth {nesting_depth}). "
+                "You MUST NOT use consult_agent, delegate_to_specialist, "
+                "spawn_subagent, or any orchestration tools."
+            )
+        parts.append(
+            "INSTRUCTIONS:\n"
+            "You are a focused worker agent. Complete the task directly using "
+            "the tools available to you. Do NOT delegate work to sub-agents. "
+            "Do NOT spawn additional agents. Execute the task yourself."
+            + delegation_note
+        )
+
+        if task_context:
+            parts.append(f"CONTEXT:\n{task_context}")
+
+        return "\n\n".join(parts)
 
     @staticmethod
     async def _safe_receive(client: Any) -> AsyncGenerator[Any, None]:
@@ -559,23 +877,38 @@ class ClaudeSDKService:
         except Exception as e:
             logger.debug("sdk_fact_extraction_failed", error=str(e))
 
-    def _build_mcp_server(self) -> tuple[Any, list[str]] | None:
+    def _build_mcp_server(
+        self, registry: Any | None = None,
+        tool_executor: Any | None = None,
+        session_id: str = "sdk",
+    ) -> tuple[Any, list[str]] | None:
         """Build an in-process MCP server exposing agent tools to the SDK.
 
         Creates SDK-compatible tool wrappers for each enabled tool in the
         registry, bundles them into an MCP server, and returns the server
         config + list of tool names.
 
+        When ``tool_executor`` is provided, tool calls are routed through
+        the executor for permission checks, guardrails, and audit logging.
+        Otherwise falls back to direct function invocation.
+
+        Args:
+            registry: Optional tool registry override. Falls back to
+                ``self.tool_registry`` when not provided.
+            tool_executor: Optional ToolExecutor for safety routing.
+            session_id: Session ID for audit logging when using executor.
+
         Returns:
             Tuple of (McpSdkServerConfig, tool_name_list) or None if no tools.
         """
-        if not self.tool_registry:
+        effective_registry = registry or self.tool_registry
+        if not effective_registry:
             return None
 
         from claude_code_sdk import create_sdk_mcp_server
         from claude_code_sdk import tool as sdk_tool
 
-        tools = self.tool_registry.list_tools()
+        tools = effective_registry.list_tools()
         enabled_tools = [t for t in tools if t.enabled]
         if not enabled_tools:
             return None
@@ -585,14 +918,48 @@ class ClaudeSDKService:
 
         for tool_def in enabled_tools:
             # Capture tool_def in closure via default arg
-            def _make_handler(td: Any) -> Any:
+            def _make_handler(
+                td: Any, executor: Any = tool_executor, sid: str = session_id,
+            ) -> Any:
                 async def handler(args: dict[str, Any]) -> dict[str, Any]:
                     from agent.tools.executor import MultimodalToolOutput
 
+                    # Route through executor for permission/audit/guardrails
+                    if executor is not None:
+                        from uuid import uuid4
+
+                        from agent.core.session import ToolCall
+
+                        tc = ToolCall(
+                            id=str(uuid4())[:8],
+                            name=td.name,
+                            arguments=args,
+                        )
+                        result = await executor.execute(
+                            tool_call=tc,
+                            session_id=sid,
+                            trigger="sdk_mcp",
+                        )
+                        if result.images:
+                            content_blocks: list[dict[str, Any]] = [
+                                {"type": "text", "text": result.output},
+                            ]
+                            for img in result.images:
+                                content_blocks.append({
+                                    "type": "image",
+                                    "data": img.base64_data,
+                                    "mimeType": img.media_type,
+                                })
+                            return {"content": content_blocks}
+                        return {
+                            "content": [{"type": "text", "text": result.output}],
+                        }
+
+                    # Direct call fallback (no executor)
                     try:
                         result = await td.function(**args)
                         if isinstance(result, MultimodalToolOutput):
-                            content_blocks: list[dict[str, Any]] = [
+                            content_blocks = [
                                 {"type": "text", "text": result.text},
                             ]
                             for img in result.images:
@@ -634,6 +1001,7 @@ class ClaudeSDKService:
         on_permission: PermissionCallback | None = None,
         on_question: QuestionCallback | None = None,
         session_id: str | None = None,
+        channel: str | None = None,
     ) -> Any:
         """Get or create a persistent SDK client for a task/user.
 
@@ -649,9 +1017,12 @@ class ClaudeSDKService:
                 await self.disconnect_client(task_id)
 
         # Issue 1: Check if system prompt drifted → reconnect
+        # Compare the stored fingerprint (from connect time) against
+        # a freshly computed one.  We pass facts=None so the fingerprint
+        # reflects the current soul.md content.  When run_task_impl later
+        # queries memory it will get up-to-date facts for the new client.
         if task_id in self._clients:
-            facts, _ = await self._query_memory("")
-            new_fp = self._compute_prompt_fingerprint(facts)
+            new_fp = self._compute_prompt_fingerprint(None)
             old_fp = self._prompt_fingerprints.get(task_id)
             if old_fp and old_fp != new_fp:
                 logger.info("sdk_reconnect_prompt_drift", task_id=task_id)
@@ -748,7 +1119,10 @@ class ClaudeSDKService:
 
         # Query memory for system prompt
         facts, vector_results = await self._query_memory("")
-        system_prompt = self._build_system_prompt(facts, vector_results)
+        self._cached_facts[task_id] = facts or []
+        system_prompt = self._build_system_prompt(
+            facts, vector_results, channel=channel,
+        )
 
         # Issue 4: Use stored session_id for resume if not explicitly provided
         resume_id = session_id or self._last_session_ids.get(task_id)
@@ -772,38 +1146,47 @@ class ClaudeSDKService:
         if resume_id:
             options_kwargs["resume"] = resume_id
 
-        options = ClaudeCodeOptions(**options_kwargs)
-
-        # Clear env vars that interfere with SDK subprocess
-        _removed_env: dict[str, str] = {}
+        # Prevent conflicting env vars from leaking into the subprocess
+        # by overriding them in the options.env dict (no process-wide mutation).
+        _env_overrides = dict(options_kwargs.get("env", {}))
+        # Note: ANTHROPIC_API_KEY is NOT blanked — the subprocess needs it
+        # for auth.  Only blank vars that control Claude Code CLI behavior
+        # to avoid conflicts (consistent with run_subagent).
         for key in (
-            "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
             "CLAUDECODE", "CLAUDE_CODE_SSE_PORT", "CLAUDE_CODE_ENTRYPOINT",
         ):
-            val = os.environ.pop(key, None)
-            if val is not None:
-                _removed_env[key] = val
+            if key in os.environ and key not in _env_overrides:
+                _env_overrides[key] = ""
+        options_kwargs["env"] = _env_overrides
 
+        options = ClaudeCodeOptions(**options_kwargs)
+
+        client = ClaudeSDKClient(options=options)
         try:
-            client = ClaudeSDKClient(options=options)
             await client.connect()
-            self._clients[task_id] = client
-            self._last_activity[task_id] = time.monotonic()
+        except Exception:
+            with contextlib.suppress(Exception):
+                await client.disconnect()
+            raise
 
-            # Store fingerprint + tool generation at connect time
-            self._prompt_fingerprints[task_id] = self._compute_prompt_fingerprint(facts)
-            if self.tool_registry:
-                self._tool_generations[task_id] = self.tool_registry._generation
+        self._clients[task_id] = client
+        self._last_activity[task_id] = time.monotonic()
 
-            logger.info(
-                "sdk_client_connected",
-                task_id=task_id,
-                cwd=resolved_cwd,
-                model=self.model,
-                resume=resume_id[:16] + "..." if resume_id else None,
-            )
-        finally:
-            os.environ.update(_removed_env)
+        # Store soul-only fingerprint at connect time.  We intentionally
+        # exclude facts so drift detection in _get_or_create_client (which
+        # doesn't have the prompt to query memory) stays consistent.
+        self._prompt_fingerprints[task_id] = self._compute_prompt_fingerprint(None)
+        if self.tool_registry:
+            self._tool_generations[task_id] = self.tool_registry._generation
+
+        logger.info(
+            "sdk_client_connected",
+            task_id=task_id,
+            cwd=resolved_cwd,
+            model=self.model,
+            resume=resume_id[:16] + "..." if resume_id else None,
+        )
 
         return client
 
@@ -815,11 +1198,17 @@ class ClaudeSDKService:
                 await client.disconnect()
             logger.info("sdk_client_disconnected", task_id=task_id)
         self._cancel_events.pop(task_id, None)
+        self._permission_events.pop(task_id, None)
+        self._permission_responses.pop(task_id, None)
+        self._question_events.pop(task_id, None)
+        self._question_responses.pop(task_id, None)
         self._status.pop(task_id, None)
         self._last_activity.pop(task_id, None)
         self._tool_generations.pop(task_id, None)
         self._prompt_fingerprints.pop(task_id, None)
+        self._cached_facts.pop(task_id, None)
         self._query_locks.pop(task_id, None)
+        self._subagent_metrics.pop(task_id, None)
         # Keep _last_session_ids — needed for resume on next connect
 
     def _get_query_lock(self, task_id: str) -> asyncio.Lock:
@@ -837,20 +1226,13 @@ class ClaudeSDKService:
         working_dir: str | None = None,
         on_permission: PermissionCallback | None = None,
         on_question: QuestionCallback | None = None,
+        channel: str | None = None,
     ) -> AsyncGenerator[SDKStreamEvent, None]:
         """Send a message to a persistent SDK client and stream the response.
 
         Uses a per-task lock to prevent concurrent queries on the same client,
         which would cause out-of-order responses.
         """
-        from claude_code_sdk import (
-            AssistantMessage,
-            ResultMessage,
-            TextBlock,
-            ThinkingBlock,
-            ToolUseBlock,
-        )
-
         # Serialize queries per task — the SDK client cannot handle concurrent
         # query()+receive_response() calls on the same connection.
         lock = self._get_query_lock(task_id)
@@ -862,6 +1244,7 @@ class ClaudeSDKService:
                 working_dir=working_dir,
                 on_permission=on_permission,
                 on_question=on_question,
+                channel=channel,
             ):
                 yield event
 
@@ -874,6 +1257,7 @@ class ClaudeSDKService:
         working_dir: str | None = None,
         on_permission: PermissionCallback | None = None,
         on_question: QuestionCallback | None = None,
+        channel: str | None = None,
     ) -> AsyncGenerator[SDKStreamEvent, None]:
         """Inner implementation — must be called under _query_locks[task_id]."""
         from claude_code_sdk import (
@@ -892,6 +1276,7 @@ class ClaudeSDKService:
                 on_permission=on_permission,
                 on_question=on_question,
                 session_id=session_id,
+                channel=channel,
             )
 
             # Issue 3: Record activity
@@ -987,14 +1372,16 @@ class ClaudeSDKService:
                             session_id=task_id,
                         )
 
-                    # Fire-and-forget: extract facts
+                    # Fire-and-forget: extract facts (tracked for clean shutdown)
                     if self.fact_extractor and result_text:
                         bg_task = asyncio.create_task(
                             self._safe_extract_facts(prompt, result_text)
                         )
+                        self._background_tasks.add(bg_task)
+                        bg_task.add_done_callback(self._background_tasks.discard)
                         bg_task.add_done_callback(_log_task_exception)
 
-                    # Emit outgoing event
+                    # Emit outgoing event (tracked for clean shutdown)
                     if self.event_bus:
                         from agent.core.events import Events
 
@@ -1009,6 +1396,8 @@ class ClaudeSDKService:
                                 },
                             )
                         )
+                        self._background_tasks.add(emit_task)
+                        emit_task.add_done_callback(self._background_tasks.discard)
                         emit_task.add_done_callback(_log_task_exception)
 
                     # Use the longer of result_text (from TextBlocks) and

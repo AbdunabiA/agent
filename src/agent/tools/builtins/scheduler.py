@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import re
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
@@ -12,7 +13,14 @@ if TYPE_CHECKING:
     from agent.core.scheduler import TaskScheduler
 
 _global_scheduler: TaskScheduler | None = None
-_global_context: dict[str, str | None] = {"channel": None, "user_id": None}
+
+# Per-task context vars — safe for concurrent asyncio tasks (GAP 15)
+_channel_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "scheduler_channel", default=None,
+)
+_user_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "scheduler_user_id", default=None,
+)
 
 
 def set_scheduler(
@@ -29,8 +37,8 @@ def set_scheduler(
     """
     global _global_scheduler
     _global_scheduler = scheduler
-    _global_context["channel"] = channel
-    _global_context["user_id"] = user_id
+    _channel_var.set(channel)
+    _user_id_var.set(user_id)
 
 
 def set_context(channel: str | None = None, user_id: str | None = None) -> None:
@@ -40,8 +48,8 @@ def set_context(channel: str | None = None, user_id: str | None = None) -> None:
         channel: Channel name (e.g. "telegram").
         user_id: User ID within the channel.
     """
-    _global_context["channel"] = channel
-    _global_context["user_id"] = user_id
+    _channel_var.set(channel)
+    _user_id_var.set(user_id)
 
 
 def get_scheduler() -> TaskScheduler:
@@ -146,8 +154,8 @@ async def set_reminder(
     task = await scheduler.add_reminder(
         description=description,
         run_at=run_at,
-        channel=_global_context.get("channel"),
-        user_id=_global_context.get("user_id"),
+        channel=_channel_var.get(),
+        user_id=_user_id_var.get(),
     )
 
     return (

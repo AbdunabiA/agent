@@ -255,15 +255,15 @@ class TestScopedToolRegistry:
         assert "read_file" in schema_names
         assert "danger_tool" not in schema_names
 
-    def test_enable_tool_delegates_for_allowed(self) -> None:
-        """enable_tool forwards to parent for allowed tools."""
+    def test_enable_tool_is_noop(self) -> None:
+        """enable_tool is a no-op — sub-agents cannot modify the global registry."""
         tool = _make_tool_def("read_file", ToolTier.SAFE)
         parent = _make_parent_registry([tool])
 
         scoped = ScopedToolRegistry(parent)
         scoped.enable_tool("read_file")
 
-        parent.enable_tool.assert_called_once_with("read_file")
+        parent.enable_tool.assert_not_called()
 
     def test_enable_tool_noop_for_denied(self) -> None:
         """enable_tool does nothing for denied tools."""
@@ -275,25 +275,25 @@ class TestScopedToolRegistry:
 
         parent.enable_tool.assert_not_called()
 
-    def test_disable_tool_always_delegates(self) -> None:
-        """disable_tool always delegates to parent."""
+    def test_disable_tool_is_noop(self) -> None:
+        """disable_tool is a no-op — sub-agents cannot modify global registry."""
         tool = _make_tool_def("read_file", ToolTier.SAFE)
         parent = _make_parent_registry([tool])
 
         scoped = ScopedToolRegistry(parent)
         scoped.disable_tool("read_file")
 
-        parent.disable_tool.assert_called_once_with("read_file")
+        parent.disable_tool.assert_not_called()
 
-    def test_unregister_tool_delegates(self) -> None:
-        """unregister_tool delegates to parent."""
+    def test_unregister_tool_is_noop(self) -> None:
+        """unregister_tool is a no-op — sub-agents cannot modify global registry."""
         tool = _make_tool_def("read_file", ToolTier.SAFE)
         parent = _make_parent_registry([tool])
 
         scoped = ScopedToolRegistry(parent)
         scoped.unregister_tool("read_file")
 
-        parent.unregister_tool.assert_called_once_with("read_file")
+        parent.unregister_tool.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -979,3 +979,402 @@ class TestSubAgentOrchestrator:
         assert stored is not None
         assert stored.status == SubAgentStatus.FAILED
         assert "bad input" in stored.error
+
+
+# ---------------------------------------------------------------------------
+# SDK sub-agent routing tests
+# ---------------------------------------------------------------------------
+
+
+class TestSubAgentSDKRouting:
+    """Tests for SDK-first sub-agent routing in the orchestrator."""
+
+    @pytest.fixture
+    def config(self) -> OrchestrationConfig:
+        return OrchestrationConfig(
+            enabled=True,
+            max_concurrent_agents=3,
+            subagent_timeout=10,
+            default_max_iterations=5,
+        )
+
+    @pytest.fixture
+    def event_bus(self) -> EventBus:
+        return EventBus()
+
+    @pytest.fixture
+    def tool_registry(self) -> MagicMock:
+        tools = [
+            _make_tool_def("read_file", ToolTier.SAFE),
+            _make_tool_def("write_file", ToolTier.MODERATE),
+        ]
+        return _make_parent_registry(tools)
+
+    @pytest.fixture
+    def mock_agent_loop(self) -> MagicMock:
+        loop = MagicMock()
+        loop.llm = MagicMock()
+        loop.tool_executor = MagicMock()
+        loop.tool_executor.config = None
+        loop.cost_tracker = None
+        loop.process_message = AsyncMock(
+            return_value=_make_llm_response("Loop fallback.")
+        )
+        return loop
+
+    @pytest.fixture
+    def mock_sdk_service(self) -> MagicMock:
+        sdk = MagicMock()
+        sdk.run_subagent = AsyncMock(return_value="SDK sub-agent done.")
+        return sdk
+
+    async def test_execute_subagent_uses_sdk_when_available(
+        self,
+        mock_agent_loop: MagicMock,
+        config: OrchestrationConfig,
+        event_bus: EventBus,
+        tool_registry: MagicMock,
+        mock_sdk_service: MagicMock,
+    ) -> None:
+        """When sdk_service is set, sub-agents route through the SDK."""
+        orchestrator = SubAgentOrchestrator(
+            agent_loop=mock_agent_loop,
+            config=config,
+            event_bus=event_bus,
+            tool_registry=tool_registry,
+            sdk_service=mock_sdk_service,
+        )
+
+        task = _make_task(task_id="sdk-1")
+        result = await orchestrator.spawn_subagent(task)
+
+        assert result.status == SubAgentStatus.COMPLETED
+        assert result.output == "SDK sub-agent done."
+        mock_sdk_service.run_subagent.assert_awaited_once()
+
+    @patch(_PATCH_BUILD_PROMPT, return_value="system")
+    @patch(_PATCH_TOOL_EXECUTOR)
+    @patch(_PATCH_AGENT_LOOP)
+    async def test_execute_subagent_falls_back_to_loop(
+        self,
+        mock_loop_cls: MagicMock,
+        mock_executor_cls: MagicMock,
+        _mock_prompt: MagicMock,
+        mock_agent_loop: MagicMock,
+        config: OrchestrationConfig,
+        event_bus: EventBus,
+        tool_registry: MagicMock,
+    ) -> None:
+        """When sdk_service is None, sub-agents use the AgentLoop path."""
+        sub_loop = AsyncMock()
+        sub_loop.process_message = AsyncMock(
+            return_value=_make_llm_response("Loop result.")
+        )
+        mock_loop_cls.return_value = sub_loop
+
+        orchestrator = SubAgentOrchestrator(
+            agent_loop=mock_agent_loop,
+            config=config,
+            event_bus=event_bus,
+            tool_registry=tool_registry,
+            sdk_service=None,
+        )
+
+        task = _make_task(task_id="loop-1")
+        result = await orchestrator.spawn_subagent(task)
+
+        assert result.status == SubAgentStatus.COMPLETED
+        assert result.output == "Loop result."
+        sub_loop.process_message.assert_awaited_once()
+
+    async def test_subagent_sdk_client_disconnects_after_use(
+        self,
+        mock_agent_loop: MagicMock,
+        config: OrchestrationConfig,
+        event_bus: EventBus,
+        tool_registry: MagicMock,
+        mock_sdk_service: MagicMock,
+    ) -> None:
+        """The SDK run_subagent method is called (client lifecycle is internal)."""
+        orchestrator = SubAgentOrchestrator(
+            agent_loop=mock_agent_loop,
+            config=config,
+            event_bus=event_bus,
+            tool_registry=tool_registry,
+            sdk_service=mock_sdk_service,
+        )
+
+        task = _make_task(task_id="disconnect-1")
+        result = await orchestrator.spawn_subagent(task)
+
+        assert result.status == SubAgentStatus.COMPLETED
+        # run_subagent was called exactly once (it handles connect/disconnect internally)
+        mock_sdk_service.run_subagent.assert_awaited_once()
+        call_kwargs = mock_sdk_service.run_subagent.call_args.kwargs
+        assert call_kwargs["task_id"] == "disconnect-1"
+
+    async def test_subagent_sdk_prompt_no_orchestration_mandate(
+        self,
+    ) -> None:
+        """The sub-agent prompt should not contain orchestration mandate."""
+        from agent.llm.claude_sdk import ClaudeSDKService
+
+        # We can't instantiate ClaudeSDKService without the SDK, so test
+        # the method directly via the unbound function logic
+        prompt = ClaudeSDKService._build_subagent_prompt(
+            None,  # type: ignore[arg-type]
+            role_persona="You are a code reviewer.",
+            task_context="Review the PR.",
+        )
+
+        assert "focused worker agent" in prompt
+        assert "Do NOT delegate" in prompt
+        assert "WORK DELEGATION RULE" not in prompt
+        assert "orchestrator" not in prompt.lower()
+        assert "ROLE:\nYou are a code reviewer." in prompt
+        assert "CONTEXT:\nReview the PR." in prompt
+
+    async def test_subagent_sdk_respects_model_override(
+        self,
+        mock_agent_loop: MagicMock,
+        config: OrchestrationConfig,
+        event_bus: EventBus,
+        tool_registry: MagicMock,
+        mock_sdk_service: MagicMock,
+    ) -> None:
+        """Model override from the role is passed to run_subagent."""
+        orchestrator = SubAgentOrchestrator(
+            agent_loop=mock_agent_loop,
+            config=config,
+            event_bus=event_bus,
+            tool_registry=tool_registry,
+            sdk_service=mock_sdk_service,
+        )
+
+        role = _make_role(name="fast-worker")
+        task = _make_task(role=role, task_id="model-1")
+        await orchestrator.spawn_subagent(task)
+
+        call_kwargs = mock_sdk_service.run_subagent.call_args.kwargs
+        assert call_kwargs["role_persona"] == "You are a test agent."
+        assert call_kwargs["max_turns"] == 3  # from _make_role default
+
+    async def test_subagent_sdk_failure_returns_failed_result(
+        self,
+        mock_agent_loop: MagicMock,
+        config: OrchestrationConfig,
+        event_bus: EventBus,
+        tool_registry: MagicMock,
+        mock_sdk_service: MagicMock,
+    ) -> None:
+        """When SDK run_subagent raises, result status is FAILED."""
+        mock_sdk_service.run_subagent = AsyncMock(
+            side_effect=RuntimeError("SDK connection lost")
+        )
+        orchestrator = SubAgentOrchestrator(
+            agent_loop=mock_agent_loop,
+            config=config,
+            event_bus=event_bus,
+            tool_registry=tool_registry,
+            sdk_service=mock_sdk_service,
+        )
+
+        task = _make_task(task_id="sdk-fail")
+        result = await orchestrator.spawn_subagent(task)
+
+        assert result.status == SubAgentStatus.FAILED
+        assert "SDK connection lost" in result.error
+        assert result.duration_ms >= 0
+
+    async def test_subagent_sdk_failure_emits_failed_event(
+        self,
+        mock_agent_loop: MagicMock,
+        config: OrchestrationConfig,
+        event_bus: EventBus,
+        tool_registry: MagicMock,
+        mock_sdk_service: MagicMock,
+    ) -> None:
+        """SDK path emits SUBAGENT_FAILED when run_subagent raises."""
+        mock_sdk_service.run_subagent = AsyncMock(
+            side_effect=ValueError("bad prompt")
+        )
+        orchestrator = SubAgentOrchestrator(
+            agent_loop=mock_agent_loop,
+            config=config,
+            event_bus=event_bus,
+            tool_registry=tool_registry,
+            sdk_service=mock_sdk_service,
+        )
+
+        failed_events: list[dict] = []
+
+        async def on_failed(data: dict) -> None:
+            failed_events.append(data)
+
+        event_bus.on(Events.SUBAGENT_FAILED, on_failed)
+
+        task = _make_task(task_id="sdk-fail-event")
+        await orchestrator.spawn_subagent(task)
+
+        assert len(failed_events) >= 1
+        assert any("bad prompt" in e.get("error", "") for e in failed_events)
+
+    async def test_subagent_sdk_emits_started_and_completed_events(
+        self,
+        mock_agent_loop: MagicMock,
+        config: OrchestrationConfig,
+        event_bus: EventBus,
+        tool_registry: MagicMock,
+        mock_sdk_service: MagicMock,
+    ) -> None:
+        """SDK path emits SPAWNED, STARTED, and COMPLETED events on success."""
+        orchestrator = SubAgentOrchestrator(
+            agent_loop=mock_agent_loop,
+            config=config,
+            event_bus=event_bus,
+            tool_registry=tool_registry,
+            sdk_service=mock_sdk_service,
+        )
+
+        events_seen: list[str] = []
+
+        async def on_spawned(data: dict) -> None:
+            events_seen.append("spawned")
+
+        async def on_started(data: dict) -> None:
+            events_seen.append("started")
+
+        async def on_completed(data: dict) -> None:
+            events_seen.append("completed")
+
+        event_bus.on(Events.SUBAGENT_SPAWNED, on_spawned)
+        event_bus.on(Events.SUBAGENT_STARTED, on_started)
+        event_bus.on(Events.SUBAGENT_COMPLETED, on_completed)
+
+        task = _make_task(task_id="sdk-events")
+        await orchestrator.spawn_subagent(task)
+
+        assert "spawned" in events_seen
+        assert "started" in events_seen
+        assert "completed" in events_seen
+
+    async def test_subagent_sdk_with_context(
+        self,
+        mock_agent_loop: MagicMock,
+        config: OrchestrationConfig,
+        event_bus: EventBus,
+        tool_registry: MagicMock,
+        mock_sdk_service: MagicMock,
+    ) -> None:
+        """Context is prepended in the prompt passed to SDK run_subagent."""
+        orchestrator = SubAgentOrchestrator(
+            agent_loop=mock_agent_loop,
+            config=config,
+            event_bus=event_bus,
+            tool_registry=tool_registry,
+            sdk_service=mock_sdk_service,
+        )
+
+        task = _make_task(
+            instruction="Analyze the logs.",
+            context="Server is returning 500 errors.",
+            task_id="sdk-ctx",
+        )
+        await orchestrator.spawn_subagent(task)
+
+        call_kwargs = mock_sdk_service.run_subagent.call_args.kwargs
+        # prompt may be positional or keyword
+        call_args = mock_sdk_service.run_subagent.call_args
+        prompt_arg = call_args.args[0] if call_args.args else call_kwargs["prompt"]
+        assert "Server is returning 500 errors." in prompt_arg
+        assert "Analyze the logs." in prompt_arg
+        # task_context is also passed separately
+        assert call_kwargs["task_context"] == "Server is returning 500 errors."
+
+    async def test_subagent_prompt_no_context_section_when_empty(
+        self,
+    ) -> None:
+        """Sub-agent prompt omits CONTEXT section when task_context is empty."""
+        from agent.llm.claude_sdk import ClaudeSDKService
+
+        prompt = ClaudeSDKService._build_subagent_prompt(
+            None,  # type: ignore[arg-type]
+            role_persona="You are a coder.",
+            task_context="",
+        )
+
+        assert "ROLE:\nYou are a coder." in prompt
+        assert "CONTEXT:" not in prompt
+
+    async def test_subagent_prompt_includes_context_when_provided(
+        self,
+    ) -> None:
+        """Sub-agent prompt includes CONTEXT section when task_context is given."""
+        from agent.llm.claude_sdk import ClaudeSDKService
+
+        prompt = ClaudeSDKService._build_subagent_prompt(
+            None,  # type: ignore[arg-type]
+            role_persona="You are a researcher.",
+            task_context="The project uses FastAPI.",
+        )
+
+        assert "CONTEXT:\nThe project uses FastAPI." in prompt
+
+
+class TestBuildMcpServerRegistry:
+    """Tests for _build_mcp_server registry override."""
+
+    async def test_build_mcp_server_uses_override_registry(self) -> None:
+        """When registry is passed, it is used instead of self.tool_registry."""
+        from agent.llm.claude_sdk import ClaudeSDKService
+
+        # Create a service with a mock self.tool_registry
+        sdk = object.__new__(ClaudeSDKService)
+        sdk.tool_registry = MagicMock()
+        sdk.tool_registry.list_tools = MagicMock(return_value=[])
+
+        # Pass an override registry with tools
+        override = MagicMock()
+        override.list_tools = MagicMock(return_value=[])
+
+        sdk._build_mcp_server(registry=override)
+
+        # Override was used, not self.tool_registry
+        override.list_tools.assert_called_once()
+        sdk.tool_registry.list_tools.assert_not_called()
+
+    async def test_build_mcp_server_falls_back_to_self_registry(self) -> None:
+        """When registry is None, self.tool_registry is used."""
+        from agent.llm.claude_sdk import ClaudeSDKService
+
+        sdk = object.__new__(ClaudeSDKService)
+        sdk.tool_registry = MagicMock()
+        sdk.tool_registry.list_tools = MagicMock(return_value=[])
+
+        sdk._build_mcp_server(registry=None)
+
+        sdk.tool_registry.list_tools.assert_called_once()
+
+    async def test_build_mcp_server_returns_none_no_registry(self) -> None:
+        """Returns None when both registry arg and self.tool_registry are None."""
+        from agent.llm.claude_sdk import ClaudeSDKService
+
+        sdk = object.__new__(ClaudeSDKService)
+        sdk.tool_registry = None
+
+        result = sdk._build_mcp_server(registry=None)
+        assert result is None
+
+    async def test_build_mcp_server_returns_none_no_enabled_tools(self) -> None:
+        """Returns None when registry has tools but none are enabled."""
+        from agent.llm.claude_sdk import ClaudeSDKService
+
+        disabled_tool = _make_tool_def("disabled_tool", enabled=False)
+        sdk = object.__new__(ClaudeSDKService)
+        sdk.tool_registry = None
+
+        override = MagicMock()
+        override.list_tools = MagicMock(return_value=[disabled_tool])
+
+        result = sdk._build_mcp_server(registry=override)
+        assert result is None
