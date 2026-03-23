@@ -30,6 +30,7 @@ sqlite3 data/agent.db "SELECT version FROM schema_version"
 | **v6** | Added `cost_entries` table for LLM cost tracking |
 | **v7** | Added `request_id` column to `audit_log` table for request tracing |
 | **v8** | Added `agent_messages` table for inter-agent message bus. Added `validated_by`, `validated_at`, `status` columns to `working_memory` for finding validation |
+| **v9** | Added emotional/contextual metadata columns to `facts`: `tone`, `emotion`, `priority`, `topic`, `context_snippet`, `temporal_reference`, `next_action_date`. Added indexes on `priority`, `topic`, `temporal_reference` |
 
 ## Database Location
 

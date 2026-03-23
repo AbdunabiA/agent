@@ -65,6 +65,25 @@ POST /api/v1/memory/facts  {"key": "...", "value": "..."}
 DELETE /api/v1/memory/facts/{id}
 ```
 
+### Emotional & Contextual Metadata
+
+Facts automatically capture emotional context from conversations:
+
+| Field | Description | Example |
+|-------|-------------|---------|
+| `tone` | Emotional tone | positive, neutral, negative, urgent |
+| `emotion` | Emotion tags | excited, concerned, frustrated, grateful |
+| `priority` | Importance | high, normal, low |
+| `topic` | Topic cluster | deployment, design, personal |
+| `context_snippet` | Surrounding context | "User was discussing deploy pipeline" |
+| `temporal_reference` | Deadline/schedule | ISO datetime or cron expression |
+
+These are extracted automatically alongside facts. The agent uses them to:
+- Prioritize urgent facts in context
+- Track active discussion topics for disambiguation
+- Detect approaching deadlines for proactive alerts
+- Understand the user's emotional state
+
 ### Confidence Decay
 
 Facts have a confidence score (0.0-1.0) that decays over time. Stale facts eventually fall below the threshold and are excluded from context. Accessing or confirming a fact resets its confidence.
@@ -103,7 +122,8 @@ On each LLM call, the context assembler:
 1. Loads soul.md content (always)
 2. Queries SQLite for relevant facts (up to `max_facts_in_context`)
 3. Queries ChromaDB for similar conversation chunks (up to `max_vectors_in_context`)
-4. Combines into the system prompt
+4. Queries active discussion topics and emotional context
+5. Combines into the system prompt (capped at 3000 chars for memory context)
 
 Configuration:
 
