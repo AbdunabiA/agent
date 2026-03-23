@@ -157,6 +157,35 @@ async def _on_project_failed(self: TelegramChannel, data: dict[str, Any]) -> Non
         )
 
 
+# ── Task completion notification (async project results) ──────
+
+
+async def _on_task_completed_notify(self: TelegramChannel, data: dict[str, Any]) -> None:
+    """Send the full project result summary to the user."""
+    user_id = data.get("user_id")
+    if not user_id:
+        users = set(self._task_user_map.values())
+        user_id = next(iter(users), None) if users else None
+    if not user_id:
+        return
+
+    summary = data.get("summary", data.get("result", ""))
+    duration = data.get("duration_seconds", 0)
+
+    # Truncate for Telegram (max 4096 chars)
+    if len(summary) > 3800:
+        summary = summary[:3800] + "\n\n...(truncated)"
+
+    header = "\U0001f4e6 <b>Task completed</b>"
+    if duration:
+        header += f" ({duration}s)"
+
+    await self._notify_user(
+        user_id,
+        f"{header}\n\n{summary}",
+    )
+
+
 # ── Controller events ──────────────────────────────────────────
 
 

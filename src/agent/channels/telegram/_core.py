@@ -328,6 +328,10 @@ class TelegramChannel(BaseChannel):
         )
         self.event_bus.on(Events.PROJECT_COMPLETED, self._on_project_completed)
         self.event_bus.on(Events.PROJECT_FAILED, self._on_project_failed)
+        self.event_bus.on(
+            Events.TASK_COMPLETED_NOTIFY,
+            self._on_task_completed_notify,
+        )
 
         # Subscribe to controller events
         self.event_bus.on(
@@ -1461,6 +1465,7 @@ from agent.channels.telegram._events import (  # noqa: E402
     _on_subagent_completed,
     _on_subagent_failed,
     _on_subagent_spawned,
+    _on_task_completed_notify,
     _register_task_user,
     _user_for_task,
 )
@@ -1476,6 +1481,7 @@ TelegramChannel._on_project_stage_started = _on_project_stage_started  # type: i
 TelegramChannel._on_project_stage_completed = _on_project_stage_completed  # type: ignore[assignment]
 TelegramChannel._on_project_completed = _on_project_completed  # type: ignore[assignment]
 TelegramChannel._on_project_failed = _on_project_failed  # type: ignore[assignment]
+TelegramChannel._on_task_completed_notify = _on_task_completed_notify  # type: ignore[assignment]
 TelegramChannel._on_controller_task_started = _on_controller_task_started  # type: ignore[assignment]
 TelegramChannel._on_controller_task_progress = _on_controller_task_progress  # type: ignore[assignment]
 TelegramChannel._on_controller_task_completed = _on_controller_task_completed  # type: ignore[assignment]
