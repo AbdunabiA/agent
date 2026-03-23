@@ -521,6 +521,11 @@ class ClaudeSDKService:
                 "TaskList",
                 "TaskOutput",
                 "ToolSearch",
+                # Allow write/edit/bash for sub-agents with those tools
+                "Edit",
+                "Write",
+                "Bash",
+                "NotebookEdit",
             }
             if tool_name in safe_tools or tool_name in agent_safe_tools:
                 return PermissionResultAllow(updated_input=tool_input)
