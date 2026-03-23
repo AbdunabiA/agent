@@ -591,16 +591,25 @@ class ClaudeSDKService:
                 model=model or self.model,
             )
 
-            # Send query and collect response
+            # Send query — append explicit output requirement to the prompt
+            # (not just the system prompt) because Claude Code SDK may not
+            # fully pass through system_prompt to the inner model.
+            enhanced_prompt = (
+                f"{prompt}\n\n"
+                "IMPORTANT: You MUST write your complete analysis/report as a "
+                "text response. Do NOT just make tool calls and exit. After "
+                "using tools, write a detailed text summary of what you found "
+                "and what you did. This text IS your deliverable."
+            )
             logger.info(
                 "sdk_subagent_query",
                 task_id=task_id,
-                prompt_len=len(prompt),
-                prompt_preview=prompt[:200],
+                prompt_len=len(enhanced_prompt),
+                prompt_preview=enhanced_prompt[:200],
                 system_prompt_len=len(system_prompt) if system_prompt else 0,
                 system_prompt_has_output_req="OUTPUT REQUIREMENTS" in (system_prompt or ""),
             )
-            await client.query(prompt)
+            await client.query(enhanced_prompt)
 
             accumulated = ""
             last_assistant_text = ""
