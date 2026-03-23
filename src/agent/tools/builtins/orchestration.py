@@ -151,12 +151,17 @@ async def spawn_subagent_tool(
 
     # Look up the role in the registry — use the detailed persona
     # from teams/*.yaml instead of the generic one the controller passes.
+    # Normalize: hyphens → underscores ("backend-developer" → "backend_developer")
     registry_role: SubAgentRole | None = None
-    try:
-        if hasattr(orchestrator, "_role_registry"):
-            registry_role = orchestrator._role_registry.get_role(role_name)  # type: ignore[union-attr]
-    except Exception:
-        pass
+    normalized_name = role_name.replace("-", "_")
+    for _lookup in (role_name, normalized_name):
+        try:
+            if hasattr(orchestrator, "_role_registry"):
+                registry_role = orchestrator._role_registry.get_role(_lookup)  # type: ignore[union-attr]
+                if registry_role is not None:
+                    break
+        except Exception:
+            pass
 
     # Also try via controller's registry
     if registry_role is None:
@@ -165,8 +170,11 @@ async def spawn_subagent_tool(
 
             controller = get_controller()
             if controller.role_registry is not None:
-                clean_name = role_name.split("/")[-1] if "/" in role_name else role_name
-                registry_role = controller.role_registry.get_role(clean_name)
+                for _lookup in (role_name, normalized_name):
+                    clean = _lookup.split("/")[-1] if "/" in _lookup else _lookup
+                    registry_role = controller.role_registry.get_role(clean)
+                    if registry_role is not None:
+                        break
         except Exception:
             pass
 
