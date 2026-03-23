@@ -80,6 +80,7 @@ class PipelineController:
         stage_results: list[ProjectStageResult] = []
         all_stage_errors: list[str] = []
         total_feedback_iterations = 0
+        max_total_feedback = 5  # Hard cap across all stages
 
         while self.current_stage_index < len(runnable):
             stage = runnable[self.current_stage_index]
@@ -194,6 +195,14 @@ class PipelineController:
                             stage.feedback.max_retries + 1,
                         ):
                             total_feedback_iterations += 1
+                            if total_feedback_iterations > max_total_feedback:
+                                logger.warning(
+                                    "feedback_hard_cap_reached",
+                                    total=total_feedback_iterations,
+                                    cap=max_total_feedback,
+                                )
+                                feedback_passed = True
+                                break
 
                             await self.event_bus.emit(
                                 Events.PROJECT_FEEDBACK_ITERATION,

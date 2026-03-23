@@ -76,60 +76,77 @@ async def _process_via_sdk_or_loop(
 
             on_permission = _on_permission
 
-        async for event in sdk.run_task_stream(
-            prompt=text,
-            task_id=session.id,
-            session_id=sdk_session_id,
-            on_permission=on_permission,
-            channel="telegram",
-        ):
-            if event.type == "text":
-                # Only accumulate main agent text, not subagent output
-                if not (event.data and event.data.get("subagent")):
-                    pending_text[0] += event.content
-            elif event.type == "tool_use":
-                if pending_text[0].strip():
-                    # Flush buffered text as intermediate message
-                    if status_message is not None and not status_deleted[0]:
-                        with contextlib.suppress(Exception):
-                            await status_message.delete()
-                        status_deleted[0] = True
-                    await self._send_intermediate_text(
-                        chat_id,
-                        pending_text[0],
-                    )
-                    sent_text_total[0] += pending_text[0]
-                    pending_text[0] = ""
-                elif status_message is not None and not status_deleted[0]:
-                    # No pending text — update status with tool name
-                    now = _time.monotonic()
-                    if now - last_status_update > 2.0:
-                        tool_name = event.data.get("tool", "tool")
-                        is_sub = event.data.get("subagent", False)
-                        prefix = "\U0001f50d Researching" if is_sub else "\u2699\ufe0f Working"
-                        status_text = f"{prefix}\u2026 using {tool_name}"
-                        with contextlib.suppress(Exception):
-                            await status_message.edit_text(status_text)
-                        last_status_update = now
-            elif event.type == "error":
-                raise RuntimeError(event.content)
-            elif event.type == "result":
-                sdk_sid = event.data.get("session_id")
-                if sdk_sid:
-                    session.metadata["sdk_session_id"] = sdk_sid
-                # Handle SDK result-override: if result content is longer
-                # and starts with what we already sent, extract the tail
-                if (
-                    event.content
-                    and sent_text_total[0]
-                    and event.content.startswith(sent_text_total[0])
+        # Timeout: don't block Telegram handler for more than 5 minutes
+        sdk_stream_timeout = 300  # 5 minutes max per message
+
+        try:
+            async with asyncio.timeout(sdk_stream_timeout):
+                async for event in sdk.run_task_stream(
+                    prompt=text,
+                    task_id=session.id,
+                    session_id=sdk_session_id,
+                    on_permission=on_permission,
+                    channel="telegram",
                 ):
-                    pending_text[0] = event.content[len(sent_text_total[0]) :]
-                elif event.content and len(event.content) > len(
-                    sent_text_total[0] + pending_text[0]
-                ):
-                    # Fallback: prefer result content when it's longer
-                    pending_text[0] = event.content[len(sent_text_total[0]) :]
+                    if event.type == "text":
+                        # Only accumulate main agent text, not subagent output
+                        if not (event.data and event.data.get("subagent")):
+                            pending_text[0] += event.content
+                    elif event.type == "tool_use":
+                        if pending_text[0].strip():
+                            # Flush buffered text as intermediate message
+                            if status_message is not None and not status_deleted[0]:
+                                with contextlib.suppress(Exception):
+                                    await status_message.delete()
+                                status_deleted[0] = True
+                            await self._send_intermediate_text(
+                                chat_id,
+                                pending_text[0],
+                            )
+                            sent_text_total[0] += pending_text[0]
+                            pending_text[0] = ""
+                        elif status_message is not None and not status_deleted[0]:
+                            # No pending text — update status with tool name
+                            now = _time.monotonic()
+                            if now - last_status_update > 2.0:
+                                tool_name = event.data.get("tool", "tool")
+                                is_sub = event.data.get("subagent", False)
+                                prefix = (
+                                    "\U0001f50d Researching" if is_sub else "\u2699\ufe0f Working"
+                                )
+                                status_text = f"{prefix}\u2026 using {tool_name}"
+                                with contextlib.suppress(Exception):
+                                    await status_message.edit_text(status_text)
+                                last_status_update = now
+                    elif event.type == "error":
+                        raise RuntimeError(event.content)
+                    elif event.type == "result":
+                        sdk_sid = event.data.get("session_id")
+                        if sdk_sid:
+                            session.metadata["sdk_session_id"] = sdk_sid
+                        # Handle SDK result-override
+                        if (
+                            event.content
+                            and sent_text_total[0]
+                            and event.content.startswith(sent_text_total[0])
+                        ):
+                            pending_text[0] = event.content[len(sent_text_total[0]) :]
+                        elif event.content and len(event.content) > len(
+                            sent_text_total[0] + pending_text[0]
+                        ):
+                            # Fallback: prefer result content when it's longer
+                            pending_text[0] = event.content[len(sent_text_total[0]) :]
+
+        except TimeoutError:
+            logger.warning(
+                "sdk_stream_timeout",
+                task_id=session.id,
+                timeout=sdk_stream_timeout,
+            )
+            pending_text[0] += (
+                "\n\n⏰ Task is taking too long. "
+                "Work continues in the background — I'll notify you when done."
+            )
 
         # Drain any queued file sends (no orchestrator to drain them)
         if user_id:
