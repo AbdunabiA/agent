@@ -122,15 +122,29 @@ async def _on_project_stage_started(self: TelegramChannel, data: dict[str, Any])
 
 
 async def _on_project_stage_completed(self: TelegramChannel, data: dict[str, Any]) -> None:
-    """Notify user when a project stage finishes."""
+    """Notify user when a project stage finishes with summary."""
     stage = data.get("stage", "?")
     duration = data.get("duration_ms", 0)
     duration_s = f"{duration / 1000:.1f}s" if duration else ""
+    output = data.get("output", "")
+    agents_count = data.get("agents", 0)
+
+    # Build informative message
+    msg = f"\u2705 Stage <b>{stage}</b> completed"
+    if duration_s:
+        msg += f" ({duration_s})"
+    if agents_count:
+        msg += f" — {agents_count} agent{'s' if agents_count != 1 else ''}"
+
+    # Include brief output summary if available
+    if output and len(output) > 10:
+        preview = output[:300].strip()
+        if len(output) > 300:
+            preview += "..."
+        msg += f"\n\n{preview}"
+
     for uid in set(self._task_user_map.values()):
-        await self._notify_user(
-            uid,
-            f"\u2705 Stage <b>{stage}</b> completed" f"{f' ({duration_s})' if duration_s else ''}",
-        )
+        await self._notify_user(uid, msg)
 
 
 async def _on_project_completed(self: TelegramChannel, data: dict[str, Any]) -> None:

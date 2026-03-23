@@ -592,6 +592,14 @@ class ClaudeSDKService:
             )
 
             # Send query and collect response
+            logger.info(
+                "sdk_subagent_query",
+                task_id=task_id,
+                prompt_len=len(prompt),
+                prompt_preview=prompt[:200],
+                system_prompt_len=len(system_prompt) if system_prompt else 0,
+                system_prompt_has_output_req="OUTPUT REQUIREMENTS" in (system_prompt or ""),
+            )
             await client.query(prompt)
 
             accumulated = ""
@@ -603,8 +611,6 @@ class ClaudeSDKService:
             async for message in self._safe_receive(client):
                 if isinstance(message, AssistantMessage):
                     iterations += 1
-                    # Track only the latest assistant text block — earlier
-                    # blocks are intermediate reasoning between tool calls.
                     current_text = ""
                     for block in message.content:
                         if hasattr(block, "text"):
@@ -614,12 +620,31 @@ class ClaudeSDKService:
                     if current_text:
                         last_assistant_text = current_text
                     accumulated += current_text
+                    logger.info(
+                        "sdk_subagent_message",
+                        task_id=task_id,
+                        msg_type="assistant",
+                        iteration=iterations,
+                        text_len=len(current_text),
+                        text_preview=current_text[:100],
+                        tool_calls_in_msg=sum(
+                            1
+                            for b in message.content
+                            if hasattr(b, "tool_use_id") or hasattr(b, "name")
+                        ),
+                    )
                 elif isinstance(message, ResultMessage):
-                    # ResultMessage contains authoritative metrics
                     iterations = message.num_turns
                     total_cost = message.total_cost_usd
                     if message.result:
                         result_text = message.result
+                    logger.info(
+                        "sdk_subagent_result_msg",
+                        task_id=task_id,
+                        num_turns=message.num_turns,
+                        result_len=len(message.result) if message.result else 0,
+                        result_preview=(message.result or "")[:100],
+                    )
 
             # Prefer ResultMessage.result (authoritative final output),
             # then last assistant text, then full accumulated text.

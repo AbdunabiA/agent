@@ -738,7 +738,9 @@ async def _run_stage(
             "stage": stage.name,
             "agents_completed": sum(1 for r in results if r.status == SubAgentStatus.COMPLETED),
             "agents_failed": sum(1 for r in results if r.status == SubAgentStatus.FAILED),
+            "agents": len(results),
             "duration_ms": stage_duration,
+            "output": stage_result.combined_output[:500] if stage_result.combined_output else "",
         },
     )
 
