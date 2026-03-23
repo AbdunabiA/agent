@@ -327,3 +327,70 @@ class TestProactiveInitiative:
         assert "## URGENT ITEMS" not in heartbeat_message
         assert "## APPROACHING DEADLINES" not in heartbeat_message
         assert "## ACTIVE TOPICS" not in heartbeat_message
+
+    async def test_tick_fact_store_throws(
+        self,
+        config: AgentPersonaConfig,
+        event_bus: EventBus,
+    ) -> None:
+        """If fact_store throws on every query, tick still completes."""
+        fact_store = MagicMock()
+        fact_store.get_by_priority = AsyncMock(side_effect=RuntimeError("db error"))
+        fact_store.get_temporal_due_soon = AsyncMock(side_effect=RuntimeError("db error"))
+        fact_store.get_active_topics = AsyncMock(side_effect=RuntimeError("db error"))
+        fact_store.get_emotional_summary = AsyncMock(side_effect=RuntimeError("db error"))
+        fact_store.get_relevant = AsyncMock(side_effect=RuntimeError("db error"))
+
+        agent_loop = AsyncMock()
+        agent_loop.fact_store = fact_store
+        response = AsyncMock()
+        response.content = "HEARTBEAT_OK"
+        agent_loop.process_message.return_value = response
+
+        daemon = HeartbeatDaemon(
+            agent_loop=agent_loop,
+            config=config,
+            event_bus=event_bus,
+            fact_store=fact_store,
+        )
+
+        with patch.object(daemon, "_read_heartbeat_md", return_value="- Check stuff"):
+            await daemon._tick()
+
+        # Should still complete and call process_message
+        agent_loop.process_message.assert_called_once()
+        assert daemon._consecutive_failures == 0
+
+    async def test_tick_context_truncated_when_large(
+        self,
+        config: AgentPersonaConfig,
+        event_bus: EventBus,
+    ) -> None:
+        """Very large context is truncated to prevent token explosion."""
+        # Create a fact store that returns very large data
+        large_facts = [_make_fact(f"key.{i}", "x" * 500, priority="high") for i in range(20)]
+        fact_store = _make_fact_store_mock(urgent=large_facts)
+
+        agent_loop = AsyncMock()
+        agent_loop.fact_store = fact_store
+        response = AsyncMock()
+        response.content = "HEARTBEAT_OK"
+        agent_loop.process_message.return_value = response
+
+        daemon = HeartbeatDaemon(
+            agent_loop=agent_loop,
+            config=config,
+            event_bus=event_bus,
+            fact_store=fact_store,
+        )
+
+        with patch.object(daemon, "_read_heartbeat_md", return_value="- Check stuff"):
+            await daemon._tick()
+
+        heartbeat_message = agent_loop.process_message.call_args[0][0]
+        from agent.core.heartbeat import _MAX_HEARTBEAT_CONTEXT_CHARS
+
+        # Message should be capped (with truncation marker)
+        assert len(heartbeat_message) <= _MAX_HEARTBEAT_CONTEXT_CHARS + len(
+            "\n...(context truncated)"
+        )

@@ -27,6 +27,8 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger(__name__)
 
+_MAX_HEARTBEAT_CONTEXT_CHARS = 5000
+
 
 class HeartbeatDaemon:
     """Periodic heartbeat that wakes the agent for proactive actions.
@@ -205,7 +207,12 @@ class HeartbeatDaemon:
                     except Exception:
                         pass
 
-                heartbeat_message = "\n".join(context_parts)
+                full_context = "\n\n".join(context_parts)
+                if len(full_context) > _MAX_HEARTBEAT_CONTEXT_CHARS:
+                    full_context = (
+                        full_context[:_MAX_HEARTBEAT_CONTEXT_CHARS] + "\n...(context truncated)"
+                    )
+                heartbeat_message = full_context
 
                 # Choose LLM backend: prefer LiteLLM, fall back to SDK
                 try:

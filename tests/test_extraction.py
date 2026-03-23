@@ -240,3 +240,92 @@ class TestFactExtractor:
         assert call_kwargs["priority"] == "normal"
         assert call_kwargs["topic"] == ""
         assert call_kwargs["context_snippet"] == ""
+
+
+class TestExtractionEdgeCases:
+    """Edge case tests for extraction with new memory fields."""
+
+    @pytest.fixture
+    async def real_db(self, tmp_path):
+        """Create a temporary database for integration-style tests."""
+        from agent.memory.database import Database
+
+        db_path = str(tmp_path / "extraction_edge_test.db")
+        database = Database(db_path)
+        await database.connect()
+        yield database
+        await database.close()
+
+    @pytest.fixture
+    def real_fact_store(self, real_db):
+        from agent.memory.store import FactStore
+
+        return FactStore(real_db)
+
+    @pytest.mark.asyncio
+    async def test_extraction_with_empty_optional_fields(self, real_fact_store) -> None:
+        """LLM returns facts with empty tone/emotion -- stored with defaults."""
+        facts_json = json.dumps(
+            [
+                {
+                    "key": "user.name",
+                    "value": "Alice",
+                    "category": "user",
+                    "tone": "",
+                    "emotion": "",
+                    "priority": "",
+                    "topic": "",
+                    "context_snippet": "",
+                }
+            ]
+        )
+
+        mock_llm = MagicMock()
+        mock_llm.completion = AsyncMock(return_value=MagicMock(content=facts_json))
+
+        extractor = FactExtractor(mock_llm, real_fact_store)
+        facts = await extractor.extract_from_messages(
+            [
+                {"role": "user", "content": "My name is Alice"},
+            ]
+        )
+
+        assert facts is not None
+        assert len(facts) == 1
+        assert facts[0].key == "user.name"
+        assert facts[0].value == "Alice"
+        # Empty optional fields stored as empty strings
+        assert facts[0].tone == ""
+        assert facts[0].emotion == ""
+        assert facts[0].priority == ""
+        assert facts[0].topic == ""
+
+    @pytest.mark.asyncio
+    async def test_extraction_with_long_context_snippet(self, real_fact_store) -> None:
+        """Long context_snippet is truncated before storage."""
+        long_snippet = "z" * 500
+        facts_json = json.dumps(
+            [
+                {
+                    "key": "user.hobby",
+                    "value": "chess",
+                    "category": "user",
+                    "context_snippet": long_snippet,
+                }
+            ]
+        )
+
+        mock_llm = MagicMock()
+        mock_llm.completion = AsyncMock(return_value=MagicMock(content=facts_json))
+
+        extractor = FactExtractor(mock_llm, real_fact_store)
+        facts = await extractor.extract_from_messages(
+            [
+                {"role": "user", "content": "I love playing chess"},
+            ]
+        )
+
+        assert facts is not None
+        assert len(facts) == 1
+        # context_snippet should be truncated to 200 chars by store.set()
+        assert len(facts[0].context_snippet) <= 200

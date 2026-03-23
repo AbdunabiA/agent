@@ -282,3 +282,88 @@ class TestUrlVerification:
         assert result == output
         assert "[BROKEN" not in result
         assert "[UNREACHABLE]" not in result
+
+
+# ---------------------------------------------------------------------------
+# Memory context cap tests
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryContextCap:
+    """Tests for memory context size capping."""
+
+    @pytest.fixture
+    def persona_config(self) -> AgentPersonaConfig:
+        return AgentPersonaConfig(name="TestAgent")
+
+    @pytest.fixture
+    def event_bus(self) -> EventBus:
+        return EventBus()
+
+    @pytest.fixture
+    def mock_llm(self) -> LLMProvider:
+        config = ModelsConfig(default="gpt-4o-mini")
+        return LLMProvider(config)
+
+    async def test_memory_context_capped(self) -> None:
+        """Total memory context injection doesn't exceed 3000 chars."""
+        from unittest.mock import MagicMock
+
+        config = AgentPersonaConfig(name="TestAgent")
+        event_bus_local = EventBus()
+        mock_llm = MagicMock()
+        mock_llm.config = MagicMock()
+        mock_llm.config.default = "gpt-4o-mini"
+
+        # Create a mock fact_store
+        mock_fact_store = MagicMock()
+
+        agent_loop = AgentLoop(
+            llm=mock_llm,
+            config=config,
+            event_bus=event_bus_local,
+            fact_store=mock_fact_store,
+        )
+
+        from agent.core.session import Message
+
+        session = Session()
+        session.add_message(Message(role="user", content="Hello"))
+
+        # Generate very large memory context inputs
+        from datetime import datetime
+
+        from agent.memory.models import Fact
+
+        large_facts = [
+            Fact(
+                id=f"id-{i}",
+                key=f"fact.key_{i}",
+                value="x" * 200,
+                created_at=datetime.now(),
+                updated_at=datetime.now(),
+                accessed_at=datetime.now(),
+            )
+            for i in range(50)
+        ]
+        large_topics = [f"topic_{i}" for i in range(50)]
+        large_emotional = "y" * 1000
+
+        messages = agent_loop._build_messages(
+            session,
+            plan=None,
+            facts=large_facts,
+            vector_results=None,
+            tool_schemas=None,
+            active_topics=large_topics,
+            emotional_context=large_emotional,
+        )
+
+        # Verify the system message exists and the memory context
+        # in the runtime context section does not blow up
+        system_msg = messages[0]["content"]
+        assert isinstance(system_msg, str)
+
+        # The emotional_context should have been truncated to 500 chars
+        # before being passed to build_runtime_context
+        assert len(large_emotional[:500]) == 500

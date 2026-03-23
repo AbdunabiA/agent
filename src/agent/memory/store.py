@@ -93,6 +93,9 @@ class FactStore:
         Returns:
             The created or updated Fact.
         """
+        if context_snippet and len(context_snippet) > 200:
+            context_snippet = context_snippet[:200]
+
         now = datetime.now().isoformat()
         fact_id = str(uuid4())
 
@@ -356,7 +359,10 @@ class FactStore:
                 emotions.extend(r[1].split(","))
         tone_summary = max(set(tones), key=tones.count) if tones else "neutral"
         emotion_tags = ", ".join(sorted(set(e.strip() for e in emotions if e.strip())))
-        return f"Tone: {tone_summary}" + (f", emotions: {emotion_tags}" if emotion_tags else "")
+        result = f"Tone: {tone_summary}" + (f", emotions: {emotion_tags}" if emotion_tags else "")
+        if len(result) > 500:
+            result = result[:500]
+        return result
 
     async def get_temporal_due_soon(self, hours: int = 24) -> list[Fact]:
         """Get facts with temporal_reference within the next N hours."""

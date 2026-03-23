@@ -49,6 +49,7 @@ logger = structlog.get_logger(__name__)
 
 _MAX_BACKGROUND_TASKS = 20
 _BACKGROUND_TASK_TIMEOUT = 60
+_MAX_MEMORY_CONTEXT_CHARS = 3000
 
 
 @dataclass
@@ -554,6 +555,10 @@ class AgentLoop:
                 ]
 
         tool_names = set(enabled_tools)
+        # Cap emotional_context before injecting
+        if emotional_context and len(emotional_context) > 500:
+            emotional_context = emotional_context[:500]
+
         runtime_ctx = build_runtime_context(
             channel=channel,
             model_name=model,
@@ -568,6 +573,33 @@ class AgentLoop:
             active_topics=active_topics,
             emotional_context=emotional_context,
         )
+
+        # Build memory context string and cap total size
+        memory_parts: list[str] = []
+        if facts:
+            memory_parts.append("\n".join(f"- {f.key}: {f.value}" for f in facts))
+        if active_topics:
+            memory_parts.append(f"Topics: {', '.join(active_topics)}")
+        if emotional_context:
+            memory_parts.append(emotional_context)
+        memory_context = "\n".join(memory_parts)
+        if len(memory_context) > _MAX_MEMORY_CONTEXT_CHARS:
+            memory_context = (
+                memory_context[:_MAX_MEMORY_CONTEXT_CHARS] + "\n...(memory context truncated)"
+            )
+            # Re-derive truncated facts list for build_messages
+            # by limiting the facts passed downstream
+            if facts and len(memory_context) > _MAX_MEMORY_CONTEXT_CHARS:
+                # Truncate facts list to fit budget
+                truncated_facts = []
+                char_count = 0
+                for f in facts:
+                    entry = f"- {f.key}: {f.value}"
+                    if char_count + len(entry) > _MAX_MEMORY_CONTEXT_CHARS:
+                        break
+                    truncated_facts.append(f)
+                    char_count += len(entry) + 1
+                facts = truncated_facts
 
         system_with_context = f"{self.system_prompt}\n\n{runtime_ctx}"
 

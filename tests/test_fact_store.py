@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC
+
 import pytest
 
 from agent.memory.database import Database
@@ -250,3 +252,107 @@ class TestFactStore:
         keys = {f.key for f in due_soon}
         assert "task.soon" in keys
         assert "task.later" not in keys
+
+    # --- Edge cases for new memory features ---
+
+    async def test_get_by_priority_empty(self, store: FactStore) -> None:
+        """No high-priority facts returns empty list."""
+        await store.set("task.normal", "do stuff", priority="normal")
+        high = await store.get_by_priority("high")
+        assert high == []
+
+    async def test_get_by_priority_wrong_value(self, store: FactStore) -> None:
+        """Invalid priority value returns empty list."""
+        await store.set("task.a", "val", priority="high")
+        result = await store.get_by_priority("INVALID_PRIORITY")
+        assert result == []
+
+    async def test_get_active_topics_no_topics(self, store: FactStore) -> None:
+        """No facts with topics returns empty list."""
+        await store.set("a", "1", topic="")
+        await store.set("b", "2")
+        topics = await store.get_active_topics(limit=5)
+        assert topics == []
+
+    async def test_get_active_topics_empty_string_topic(self, store: FactStore) -> None:
+        """Facts with empty string topic are excluded."""
+        await store.set("a", "1", topic="")
+        await store.set("b", "2", topic="real_topic")
+        topics = await store.get_active_topics(limit=5)
+        assert "" not in topics
+        assert "real_topic" in topics
+
+    async def test_get_emotional_summary_no_tones(self, store: FactStore) -> None:
+        """No facts with tone returns empty string."""
+        await store.set("a", "1", tone="")
+        await store.set("b", "2")
+        summary = await store.get_emotional_summary(limit=5)
+        assert summary == ""
+
+    async def test_get_emotional_summary_mixed_tones(self, store: FactStore) -> None:
+        """Multiple tones returns most common one."""
+        await store.set("a", "1", tone="positive", emotion="happy")
+        await store.set("b", "2", tone="positive", emotion="excited")
+        await store.set("c", "3", tone="negative", emotion="frustrated")
+        summary = await store.get_emotional_summary(limit=10)
+        assert "positive" in summary
+
+    async def test_get_temporal_due_soon_no_temporal(self, store: FactStore) -> None:
+        """No facts with temporal_reference returns empty."""
+        await store.set("a", "1")
+        await store.set("b", "2", temporal_reference=None)
+        result = await store.get_temporal_due_soon(hours=24)
+        assert result == []
+
+    async def test_get_temporal_due_soon_past_dates(self, store: FactStore) -> None:
+        """Past dates are not returned (only future within window)."""
+        from datetime import datetime, timedelta
+
+        # Use UTC since SQLite's datetime('now') uses UTC
+        past_time = (datetime.now(UTC) - timedelta(hours=5)).strftime("%Y-%m-%d %H:%M:%S")
+        await store.set("task.past", "old task", temporal_reference=past_time)
+        result = await store.get_temporal_due_soon(hours=24)
+        keys = {f.key for f in result}
+        assert "task.past" not in keys
+
+    async def test_set_truncates_long_context_snippet(self, store: FactStore) -> None:
+        """context_snippet > 200 chars gets truncated."""
+        long_snippet = "x" * 300
+        fact = await store.set("a", "1", context_snippet=long_snippet)
+        assert len(fact.context_snippet) <= 200
+
+    async def test_set_with_all_new_fields(self, store: FactStore) -> None:
+        """Store fact with all 7 new fields and retrieve correctly."""
+        fact = await store.set(
+            "project.deploy",
+            "Friday release",
+            tone="urgent",
+            emotion="concerned,anxious",
+            priority="high",
+            topic="deployment",
+            context_snippet="User mentioned Friday deadline",
+            temporal_reference="2026-03-27T17:00:00",
+            next_action_date="2026-03-26T09:00:00",
+        )
+        assert fact.tone == "urgent"
+        assert fact.emotion == "concerned,anxious"
+        assert fact.priority == "high"
+        assert fact.topic == "deployment"
+        assert fact.context_snippet == "User mentioned Friday deadline"
+        assert fact.temporal_reference == "2026-03-27T17:00:00"
+        assert fact.next_action_date == "2026-03-26T09:00:00"
+
+        # Verify retrieval returns the same data
+        retrieved = await store.get("project.deploy")
+        assert retrieved is not None
+        assert retrieved.tone == "urgent"
+        assert retrieved.priority == "high"
+        assert retrieved.topic == "deployment"
+
+    async def test_set_with_none_temporal(self, store: FactStore) -> None:
+        """temporal_reference=None stores correctly."""
+        fact = await store.set("a", "1", temporal_reference=None)
+        assert fact.temporal_reference is None
+        retrieved = await store.get("a")
+        assert retrieved is not None
+        assert retrieved.temporal_reference is None
