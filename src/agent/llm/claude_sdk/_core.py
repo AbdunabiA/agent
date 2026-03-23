@@ -548,7 +548,11 @@ class ClaudeSDKService:
             "cwd": resolved_cwd,
             "max_turns": max_turns,
             "model": model or self.model,
-            "permission_mode": self.permission_mode,
+            # Sub-agents use bypassPermissions because tool access is
+            # already controlled by the scoped registry + can_use_tool callback.
+            # Using the parent's permission_mode (e.g., acceptEdits) causes
+            # sub-agents to silently stop when they try to write.
+            "permission_mode": "bypassPermissions",
             "can_use_tool": can_use_tool,
             "system_prompt": system_prompt,
             "env": {
