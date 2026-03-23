@@ -134,16 +134,9 @@ async def _on_project_stage_completed(self: TelegramChannel, data: dict[str, Any
 
 
 async def _on_project_completed(self: TelegramChannel, data: dict[str, Any]) -> None:
-    """Notify user when a project pipeline finishes."""
+    """Log project completion. User notification handled by TASK_COMPLETED_NOTIFY."""
     project = data.get("project", "?")
-    duration = data.get("duration_ms", 0)
-    duration_s = f"{duration / 1000:.1f}s" if duration else ""
-    for uid in set(self._task_user_map.values()):
-        await self._notify_user(
-            uid,
-            f"\U0001f389 Project <b>{project}</b> completed"
-            f"{f' in {duration_s}' if duration_s else ''}!",
-        )
+    logger.info("project_completed_notification_skipped", project=project)
 
 
 async def _on_project_failed(self: TelegramChannel, data: dict[str, Any]) -> None:
