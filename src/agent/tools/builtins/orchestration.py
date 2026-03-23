@@ -603,7 +603,7 @@ async def run_project_tool(
     project_name: str,
     instruction: str,
     context: str = "",
-    mode: str = "sync",
+    mode: str = "auto",
 ) -> str:
     """Run a project pipeline.
 
@@ -629,6 +629,11 @@ async def run_project_tool(
         return f"Unknown project: '{project_name}'. Available: {available}"
 
     _register_task_user(task_id)
+
+    # Auto mode: use async for multi-stage projects to avoid blocking
+    if mode == "auto":
+        stage_count = len([s for s in proj.stages if not s.feedback_target])
+        mode = "async" if stage_count > 1 else "sync"
 
     if mode == "sync":
         project_result = await orchestrator.run_project(
