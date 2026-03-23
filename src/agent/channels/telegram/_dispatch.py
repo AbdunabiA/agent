@@ -157,7 +157,32 @@ async def _process_via_sdk_or_loop(
             if stream_state is not None:
                 stream_state["status_consumed"] = status_deleted[0]
             return final if final else ""
-        return pending_text[0] or "[No response]"
+        # If no text produced, retry once — first query after connect
+        # sometimes returns empty due to SDK session initialization.
+        if not pending_text[0].strip():
+            logger.info("sdk_empty_response_retrying", task_id=session.id)
+            try:
+                async with asyncio.timeout(sdk_stream_timeout):
+                    async for event in sdk.run_task_stream(
+                        prompt=text,
+                        task_id=session.id,
+                        session_id=sdk_session_id,
+                        on_permission=on_permission,
+                        channel="telegram",
+                    ):
+                        if event.type == "text":
+                            if not (event.data and event.data.get("subagent")):
+                                pending_text[0] += event.content
+                        elif event.type == "result":
+                            sdk_sid = event.data.get("session_id")
+                            if sdk_sid:
+                                session.metadata["sdk_session_id"] = sdk_sid
+                            if event.content:
+                                pending_text[0] = event.content
+            except TimeoutError:
+                pass
+
+        return pending_text[0] or ""
 
     response = await agent_loop.process_message(text, session, trigger="user_message")
 
@@ -303,7 +328,7 @@ async def _dispatch_to_agent(
             # triggered a flush).
             if pending_text[0].strip():
                 return pending_text[0].strip()
-            return result.output or "[No response]"
+            return result.output or ""
         elif result.status == SubAgentStatus.CANCELLED:
             return ""  # cancelled tasks don't need a response
         else:
