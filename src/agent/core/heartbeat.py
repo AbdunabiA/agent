@@ -139,8 +139,50 @@ class HeartbeatDaemon:
                     f"Check the following items and take action ONLY if needed. "
                     f"If nothing needs to be done, respond with exactly 'HEARTBEAT_OK'.\n"
                     f"If you need to notify the user, prefix your response with [NOTIFY].\n",
-                    f"Checklist:\n{checklist}",
                 ]
+
+                # 1. URGENT ITEMS (high priority facts)
+                fact_store = self._get_fact_store()
+                if fact_store:
+                    try:
+                        urgent = await fact_store.get_by_priority("high", limit=5)
+                        if urgent:
+                            lines = [f"  - {f.key}: {f.value}" for f in urgent]
+                            context_parts.append("## URGENT ITEMS\n" + "\n".join(lines))
+                    except Exception:
+                        pass
+
+                    # 2. APPROACHING DEADLINES
+                    try:
+                        temporal = await fact_store.get_temporal_due_soon(hours=24)
+                        if temporal:
+                            lines = [
+                                f"  - {f.key}: {f.value} (due: {f.temporal_reference})"
+                                for f in temporal
+                            ]
+                            context_parts.append("## APPROACHING DEADLINES\n" + "\n".join(lines))
+                    except Exception:
+                        pass
+
+                    # 3. ACTIVE TOPICS
+                    try:
+                        topics = await fact_store.get_active_topics(limit=3)
+                        if topics:
+                            context_parts.append(
+                                f"## ACTIVE TOPICS\nUser is working on: {', '.join(topics)}"
+                            )
+                    except Exception:
+                        pass
+
+                    # 4. EMOTIONAL CONTEXT
+                    try:
+                        emotional = await fact_store.get_emotional_summary(limit=5)
+                        if emotional:
+                            context_parts.append(f"## USER CONTEXT\n{emotional}")
+                    except Exception:
+                        pass
+
+                context_parts.append(f"Checklist:\n{checklist}")
 
                 # Add pending scheduled tasks
                 if self.scheduler:
@@ -305,6 +347,10 @@ class HeartbeatDaemon:
                 result_parts.append(event.content)
 
         return "".join(result_parts) or "HEARTBEAT_OK"
+
+    def _get_fact_store(self) -> FactStore | None:
+        """Get the fact store from the agent loop."""
+        return getattr(self.agent_loop, "fact_store", None)
 
     def _read_heartbeat_md(self) -> str:
         """Read the HEARTBEAT.md file.

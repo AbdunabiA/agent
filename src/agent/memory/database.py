@@ -17,7 +17,7 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 SCHEMA_SQL = """
 -- Facts table: structured key-value memory
@@ -208,6 +208,10 @@ class Database:
             await self._migrate_v8()
             current = 8
 
+        if current < 9:
+            await self._migrate_v9()
+            current = 9
+
         if starting_version < SCHEMA_VERSION:
             await self._db.execute(
                 "INSERT OR REPLACE INTO schema_version (version) VALUES (?)",
@@ -339,6 +343,35 @@ class Database:
 
         await self._db.commit()
         logger.info("database_migrated_v8")
+
+    async def _migrate_v9(self) -> None:
+        """Migration v8 -> v9: Emotional/contextual metadata on facts."""
+        async with self._db.execute("PRAGMA table_info(facts)") as cursor:
+            columns = {row[1] for row in await cursor.fetchall()}
+
+        new_columns = {
+            "tone": "TEXT DEFAULT ''",
+            "emotion": "TEXT DEFAULT ''",
+            "priority": "TEXT DEFAULT 'normal'",
+            "topic": "TEXT DEFAULT ''",
+            "context_snippet": "TEXT DEFAULT ''",
+            "temporal_reference": "TEXT",
+            "next_action_date": "TEXT",
+        }
+        for col, col_type in new_columns.items():
+            if col not in columns:
+                await self._db.execute(f"ALTER TABLE facts ADD COLUMN {col} {col_type}")
+
+        await self._db.executescript("""
+            CREATE INDEX IF NOT EXISTS idx_facts_priority
+                ON facts(priority);
+            CREATE INDEX IF NOT EXISTS idx_facts_topic
+                ON facts(topic);
+            CREATE INDEX IF NOT EXISTS idx_facts_temporal
+                ON facts(temporal_reference);
+        """)
+        await self._db.commit()
+        logger.info("database_migrated_v9")
 
     async def checkpoint(self) -> None:
         """Run WAL checkpoint to keep WAL file size manageable."""

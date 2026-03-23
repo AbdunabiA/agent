@@ -24,6 +24,11 @@ Summarize the following conversation in 2-3 sentences. Focus on:
 - Decisions made or actions taken
 - Important information shared by the user
 
+Also note:
+- Overall emotional tone of the conversation (positive/neutral/concerned/urgent)
+- Any time-sensitive decisions or deadlines mentioned
+- Key topics discussed (as comma-separated tags)
+
 CONVERSATION:
 {messages}
 
@@ -102,6 +107,8 @@ class ConversationSummarizer:
                 "type": "summary",
                 "message_count": session.message_count,
                 "created_at": datetime.now().isoformat(),
+                "emotional_tone": "neutral",
+                "topics": "",
             },
         )
 

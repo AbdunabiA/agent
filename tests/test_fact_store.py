@@ -183,3 +183,70 @@ class TestFactStore:
         assert f1.source == "user"
         assert f2.source == "extracted"
         assert f3.source == "inferred"
+
+    async def test_get_by_priority(self, store: FactStore) -> None:
+        """get_by_priority() should return facts with the given priority."""
+        await store.set("task.urgent", "deploy now", priority="high", topic="deployment")
+        await store.set("task.normal", "update docs", priority="normal")
+        await store.set("task.also_high", "fix bug", priority="high", topic="bugs")
+
+        high = await store.get_by_priority("high")
+        assert len(high) == 2
+        keys = {f.key for f in high}
+        assert keys == {"task.urgent", "task.also_high"}
+
+        normal = await store.get_by_priority("normal")
+        assert len(normal) == 1
+        assert normal[0].key == "task.normal"
+
+    async def test_get_active_topics(self, store: FactStore) -> None:
+        """get_active_topics() should return most accessed topic clusters."""
+        await store.set("a", "1", topic="deployment")
+        await store.set("b", "2", topic="deployment")
+        await store.set("c", "3", topic="design")
+        await store.set("d", "4", topic="")  # empty topic should be excluded
+
+        # Access deployment facts to boost their counts
+        await store.get("a")
+        await store.get("b")
+
+        topics = await store.get_active_topics(limit=5)
+        assert isinstance(topics, list)
+        assert len(topics) >= 1
+        assert "deployment" in topics
+
+    async def test_get_emotional_summary(self, store: FactStore) -> None:
+        """get_emotional_summary() should return a summary string."""
+        await store.set("proj.deploy", "Friday release", tone="urgent", emotion="concerned")
+        await store.set("user.feedback", "loves the UI", tone="positive", emotion="excited")
+
+        summary = await store.get_emotional_summary(limit=10)
+        assert isinstance(summary, str)
+        assert len(summary) > 0
+
+    async def test_get_temporal_due_soon(self, store: FactStore) -> None:
+        """get_temporal_due_soon() should return facts due within the time window."""
+        from datetime import datetime, timedelta
+
+        # Set a fact with a temporal reference in the near future
+        future_time = (datetime.now() + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
+        await store.set(
+            "task.soon",
+            "review PR",
+            temporal_reference=future_time,
+            priority="high",
+        )
+
+        # Set a fact with a temporal reference far in the future (beyond 24h)
+        far_future = (datetime.now() + timedelta(hours=48)).strftime("%Y-%m-%d %H:%M:%S")
+        await store.set(
+            "task.later",
+            "plan sprint",
+            temporal_reference=far_future,
+        )
+
+        due_soon = await store.get_temporal_due_soon(hours=24)
+        assert isinstance(due_soon, list)
+        keys = {f.key for f in due_soon}
+        assert "task.soon" in keys
+        assert "task.later" not in keys

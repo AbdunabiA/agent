@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -11,6 +11,7 @@ from agent.config import AgentPersonaConfig
 from agent.core.events import EventBus
 from agent.core.heartbeat import HeartbeatDaemon
 from agent.core.session import TokenUsage
+from agent.memory.models import Fact
 
 
 @pytest.fixture
@@ -88,6 +89,7 @@ class TestHeartbeatDaemon:
         mock_agent_loop.process_message.return_value = action_response
 
         events_received = []
+
         async def handler(data):
             events_received.append(data)
 
@@ -166,3 +168,162 @@ class TestHeartbeatDaemon:
             # Should contain either our content or default
             assert isinstance(content, str)
             assert len(content) > 0
+
+
+def _make_fact(key: str, value: str, **kwargs) -> Fact:
+    """Helper to create a Fact with defaults."""
+    return Fact(id="test-id", key=key, value=value, **kwargs)
+
+
+def _make_fact_store_mock(**overrides) -> MagicMock:
+    """Create a mock FactStore with all proactive methods stubbed."""
+    store = MagicMock()
+    store.get_by_priority = AsyncMock(return_value=overrides.get("urgent", []))
+    store.get_temporal_due_soon = AsyncMock(return_value=overrides.get("temporal", []))
+    store.get_active_topics = AsyncMock(return_value=overrides.get("topics", []))
+    store.get_emotional_summary = AsyncMock(return_value=overrides.get("emotional", ""))
+    store.get_relevant = AsyncMock(return_value=[])
+    return store
+
+
+class TestProactiveInitiative:
+    """Tests for proactive initiative features in the heartbeat."""
+
+    async def test_tick_includes_urgent_facts(
+        self,
+        config: AgentPersonaConfig,
+        event_bus: EventBus,
+    ) -> None:
+        """Verify that urgent (high-priority) facts appear in the heartbeat context."""
+        fact_store = _make_fact_store_mock(
+            urgent=[
+                _make_fact("deploy.deadline", "Production deploy tonight", priority="high"),
+                _make_fact("bug.critical", "Auth service down", priority="high"),
+            ],
+        )
+
+        agent_loop = AsyncMock()
+        agent_loop.fact_store = fact_store
+        response = AsyncMock()
+        response.content = "HEARTBEAT_OK"
+        agent_loop.process_message.return_value = response
+
+        daemon = HeartbeatDaemon(
+            agent_loop=agent_loop,
+            config=config,
+            event_bus=event_bus,
+            fact_store=fact_store,
+        )
+
+        with patch.object(daemon, "_read_heartbeat_md", return_value="- Check stuff"):
+            await daemon._tick()
+
+        fact_store.get_by_priority.assert_called_once_with("high", limit=5)
+
+        heartbeat_message = agent_loop.process_message.call_args[0][0]
+        assert "## URGENT ITEMS" in heartbeat_message
+        assert "deploy.deadline" in heartbeat_message
+        assert "Production deploy tonight" in heartbeat_message
+        assert "bug.critical" in heartbeat_message
+
+    async def test_tick_includes_deadlines(
+        self,
+        config: AgentPersonaConfig,
+        event_bus: EventBus,
+    ) -> None:
+        """Verify that approaching deadlines appear in the heartbeat context."""
+        fact_store = _make_fact_store_mock(
+            temporal=[
+                _make_fact(
+                    "project.milestone",
+                    "MVP demo ready",
+                    temporal_reference="2026-03-24T10:00:00",
+                ),
+            ],
+        )
+
+        agent_loop = AsyncMock()
+        agent_loop.fact_store = fact_store
+        response = AsyncMock()
+        response.content = "HEARTBEAT_OK"
+        agent_loop.process_message.return_value = response
+
+        daemon = HeartbeatDaemon(
+            agent_loop=agent_loop,
+            config=config,
+            event_bus=event_bus,
+            fact_store=fact_store,
+        )
+
+        with patch.object(daemon, "_read_heartbeat_md", return_value="- Check stuff"):
+            await daemon._tick()
+
+        fact_store.get_temporal_due_soon.assert_called_once_with(hours=24)
+
+        heartbeat_message = agent_loop.process_message.call_args[0][0]
+        assert "## APPROACHING DEADLINES" in heartbeat_message
+        assert "project.milestone" in heartbeat_message
+        assert "MVP demo ready" in heartbeat_message
+        assert "2026-03-24T10:00:00" in heartbeat_message
+
+    async def test_tick_includes_active_topics(
+        self,
+        config: AgentPersonaConfig,
+        event_bus: EventBus,
+    ) -> None:
+        """Verify that active topics appear in the heartbeat context."""
+        fact_store = _make_fact_store_mock(
+            topics=["deployment", "API refactor", "testing"],
+        )
+
+        agent_loop = AsyncMock()
+        agent_loop.fact_store = fact_store
+        response = AsyncMock()
+        response.content = "HEARTBEAT_OK"
+        agent_loop.process_message.return_value = response
+
+        daemon = HeartbeatDaemon(
+            agent_loop=agent_loop,
+            config=config,
+            event_bus=event_bus,
+            fact_store=fact_store,
+        )
+
+        with patch.object(daemon, "_read_heartbeat_md", return_value="- Check stuff"):
+            await daemon._tick()
+
+        fact_store.get_active_topics.assert_called_once_with(limit=3)
+
+        heartbeat_message = agent_loop.process_message.call_args[0][0]
+        assert "## ACTIVE TOPICS" in heartbeat_message
+        assert "deployment" in heartbeat_message
+        assert "API refactor" in heartbeat_message
+        assert "testing" in heartbeat_message
+
+    async def test_tick_handles_no_fact_store(
+        self,
+        config: AgentPersonaConfig,
+        event_bus: EventBus,
+    ) -> None:
+        """Verify heartbeat works without a fact_store (no crash)."""
+        # Ensure agent_loop has no fact_store attribute
+        agent_loop_spec = MagicMock(spec=[])
+        agent_loop_spec.llm = MagicMock()
+        response = MagicMock()
+        response.content = "HEARTBEAT_OK"
+        agent_loop_spec.process_message = AsyncMock(return_value=response)
+
+        daemon = HeartbeatDaemon(
+            agent_loop=agent_loop_spec,
+            config=config,
+            event_bus=event_bus,
+        )
+
+        with patch.object(daemon, "_read_heartbeat_md", return_value="- Check stuff"):
+            await daemon._tick()
+
+        agent_loop_spec.process_message.assert_called_once()
+        heartbeat_message = agent_loop_spec.process_message.call_args[0][0]
+        assert "## URGENT ITEMS" not in heartbeat_message
+        assert "## APPROACHING DEADLINES" not in heartbeat_message
+        assert "## ACTIVE TOPICS" not in heartbeat_message

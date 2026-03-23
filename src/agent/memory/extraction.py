@@ -29,6 +29,13 @@ Return a JSON array of objects with these fields:
 - "value": the fact value as a string
 - "category": one of "user", "preference", "project", "system", "general"
 
+For each fact, also provide these optional fields:
+- "tone": overall tone (positive/neutral/negative/urgent)
+- "emotion": emotion tags if evident, comma-separated (excited, concerned, frustrated, grateful)
+- "priority": importance level (high/normal/low)
+- "topic": topic cluster keyword (e.g., "deployment", "design", "personal", "project")
+- "context_snippet": one sentence of surrounding context
+
 Rules:
 - Only extract facts that are clearly stated or strongly implied
 - Use dot-notation keys for namespacing (e.g. "user.name", "user.location")
@@ -125,8 +132,13 @@ class FactExtractor:
                     key=key,
                     value=value,
                     category=category,
-                    source="extracted",
                     confidence=0.8,
+                    source="extracted",
+                    tone=item.get("tone", ""),
+                    emotion=item.get("emotion", ""),
+                    priority=item.get("priority", "normal"),
+                    topic=item.get("topic", ""),
+                    context_snippet=item.get("context_snippet", ""),
                 )
                 stored_facts.append(fact)
             except Exception as e:

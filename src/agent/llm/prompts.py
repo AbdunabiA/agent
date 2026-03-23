@@ -68,7 +68,7 @@ def build_system_prompt(
             "can see, use the shell_exec tool with Windows commands:\n"
             "- Open a URL in browser: `start https://example.com`\n"
             "- Open a program: `start notepad` or `start calc`\n"
-            "- Open a file: `start \"\" \"C:\\path\\to\\file.txt\"`\n"
+            '- Open a file: `start "" "C:\\path\\to\\file.txt"`\n'
             "- Play music in browser: `start https://youtube.com/watch?v=...`\n"
             "The `start` command opens things visibly for the user. "
             "Only use the browser tool (Playwright) when you need to scrape or interact "
@@ -159,8 +159,8 @@ def build_system_prompt(
             "instruction with all the context it needs.\n\n"
             "### Choosing the right workflow\n"
             "Pick the delegation method based on the request:\n\n"
-            "**Vague / broad requests** (e.g. \"build me an app\", \"create a website\", "
-            "\"make a tool that does X\"):\n"
+            '**Vague / broad requests** (e.g. "build me an app", "create a website", '
+            '"make a tool that does X"):\n'
             "1. FIRST ask the user clarifying questions yourself — do NOT delegate yet.\n"
             "   Ask about: purpose, target users, key features, tech stack preferences, "
             "   scope constraints, and any existing code or APIs to integrate with.\n"
@@ -168,10 +168,10 @@ def build_system_prompt(
             "   comprehensive instruction that includes all gathered requirements.\n"
             "   The build_app project runs a full pipeline: planning → implementation "
             "   → review → documentation.\n\n"
-            "**Specific single tasks** (e.g. \"add a login page\", \"fix the search bug\", "
-            "\"write tests for the API\"):\n"
+            '**Specific single tasks** (e.g. "add a login page", "fix the search bug", '
+            '"write tests for the API"):\n'
             "Use `spawn_subagent` with the most appropriate role.\n\n"
-            "**Multiple independent tasks** (e.g. \"update the docs and fix the CSS\"):\n"
+            '**Multiple independent tasks** (e.g. "update the docs and fix the CSS"):\n'
             "Use `spawn_parallel_agents` with one agent per task.\n\n"
             "**Bug reports**:\n"
             "Use `run_project bug_fix` — it runs investigation → fix → verification.\n\n"
@@ -189,7 +189,7 @@ def build_system_prompt(
             "### Your workflow\n"
             "1. User sends a request\n"
             "2. If vague → ask clarifying questions, wait for answers\n"
-            "3. Once clear → acknowledge briefly (\"On it!\")\n"
+            '3. Once clear → acknowledge briefly ("On it!")\n'
             "4. Choose the right workflow (project pipeline or individual agents)\n"
             "5. Spawn with detailed instructions including all gathered context\n"
             "6. Sub-agents do the work independently\n"
@@ -205,6 +205,16 @@ def build_system_prompt(
     # Skill extensions
     if skill_extensions:
         parts.append("## Available Skills\n" + "\n\n".join(skill_extensions))
+
+    # Short message disambiguation guidance
+    parts.append(
+        "## Understanding Short Messages\n"
+        "When the user sends a brief message (under 10 words):\n"
+        '1. Check active discussion topics — "fix it" likely refers to the current topic\n'
+        '2. Check recent tool results — "try again" means re-run the last action\n'
+        "3. Infer from last 2-3 messages in conversation\n"
+        "4. If still ambiguous, ask one clarifying question (don't guess)"
+    )
 
     # Timestamp for time awareness
     parts.append(f"Current time: {datetime.now().isoformat()}")
@@ -248,6 +258,8 @@ def build_runtime_context(
     has_desktop: bool = False,
     has_skills: bool = False,
     has_orchestration: bool = False,
+    active_topics: list[str] | None = None,
+    emotional_context: str = "",
 ) -> str:
     """Build a runtime context block describing the current session.
 
@@ -301,6 +313,11 @@ def build_runtime_context(
         capabilities.append("Sub-agent orchestration")
     if has_heartbeat:
         capabilities.append("Proactive heartbeat (periodic autonomous check-ins)")
+        capabilities.append(
+            "Proactive monitoring: You monitor deadlines, project health, and "
+            "time-sensitive items. When you notice something important, bring it up "
+            "without being asked"
+        )
 
     if capabilities:
         cap_list = "\n".join(f"- {c}" for c in capabilities)
@@ -309,5 +326,15 @@ def build_runtime_context(
     # Model in use
     if model_name:
         parts.append(f"Model: {model_name}")
+
+    # Active discussion topics for disambiguation
+    if active_topics:
+        topic_list = ", ".join(active_topics)
+        parts.append(f"\n## Active Discussion Topics\n" f"You've been discussing: {topic_list}")
+        parts.append("(Use this to disambiguate short messages like 'fix it' or 'check that')")
+
+    # Emotional / user context
+    if emotional_context:
+        parts.append(f"\n## User Context\n{emotional_context}")
 
     return "\n\n".join(parts)

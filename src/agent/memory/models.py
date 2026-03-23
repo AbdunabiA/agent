@@ -39,3 +39,11 @@ class Fact:
     updated_at: datetime = field(default_factory=datetime.now)
     accessed_at: datetime = field(default_factory=datetime.now)
     access_count: int = 0
+    # Emotional/contextual metadata (extracted from conversations)
+    tone: str = ""  # positive, neutral, negative, urgent
+    emotion: str = ""  # comma-separated: excited, concerned, frustrated, grateful
+    priority: str = "normal"  # high, normal, low
+    topic: str = ""  # topic cluster: deployment, design, personal, etc.
+    context_snippet: str = ""  # brief surrounding conversation context
+    temporal_reference: str | None = None  # ISO datetime or cron for deadlines
+    next_action_date: str | None = None  # when to act on this fact

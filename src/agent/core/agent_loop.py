@@ -181,7 +181,9 @@ class AgentLoop:
         )
 
         # Query memory for context injection (parallel)
-        relevant_facts, vector_results = await self._query_memory(user_message)
+        relevant_facts, vector_results, active_topics, emotional_context = await self._query_memory(
+            user_message
+        )
 
         # Check if we should plan
         plan = None
@@ -206,7 +208,13 @@ class AgentLoop:
 
             # Build messages
             messages = self._build_messages(
-                session, plan, relevant_facts, vector_results, tool_schemas
+                session,
+                plan,
+                relevant_facts,
+                vector_results,
+                tool_schemas,
+                active_topics=active_topics,
+                emotional_context=emotional_context,
             )
 
             # Call LLM
@@ -365,6 +373,8 @@ class AgentLoop:
                 relevant_facts,
                 vector_results,
                 tool_schemas,
+                active_topics=active_topics,
+                emotional_context=emotional_context,
             )
         )
         await self._add_and_persist(
@@ -494,6 +504,8 @@ class AgentLoop:
         facts: list | None = None,
         vector_results: list | None = None,
         tool_schemas: list[dict] | None = None,
+        active_topics: list[str] | None = None,
+        emotional_context: str = "",
     ) -> list[dict]:
         """Build the messages list for the LLM call.
 
@@ -553,6 +565,8 @@ class AgentLoop:
             has_desktop=bool(tool_names & {"screen_capture", "desktop_capabilities"}),
             has_skills=self._skill_builder_enabled,
             has_orchestration=self._orchestration_enabled,
+            active_topics=active_topics,
+            emotional_context=emotional_context,
         )
 
         system_with_context = f"{self.system_prompt}\n\n{runtime_ctx}"
@@ -620,14 +634,16 @@ class AgentLoop:
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
-    async def _query_memory(self, user_message: str) -> tuple[list | None, list | None]:
-        """Query fact store and vector store in parallel.
+    async def _query_memory(
+        self, user_message: str
+    ) -> tuple[list | None, list | None, list[str], str]:
+        """Query fact store, vector store, active topics, and emotional context in parallel.
 
         Args:
             user_message: The user's message for semantic search.
 
         Returns:
-            Tuple of (relevant_facts, vector_results).
+            Tuple of (relevant_facts, vector_results, active_topics, emotional_context).
         """
         relevant_facts = None
         vector_results = None
@@ -651,7 +667,20 @@ class AgentLoop:
                 return None
 
         relevant_facts, vector_results = await asyncio.gather(_get_facts(), _get_vectors())
-        return relevant_facts, vector_results
+
+        # Query active topics
+        active_topics: list[str] = []
+        if self.fact_store:
+            with contextlib.suppress(Exception):
+                active_topics = await self.fact_store.get_active_topics(limit=5)
+
+        # Query emotional context
+        emotional_context = ""
+        if self.fact_store:
+            with contextlib.suppress(Exception):
+                emotional_context = await self.fact_store.get_emotional_summary(limit=5)
+
+        return relevant_facts, vector_results, active_topics, emotional_context
 
     async def process_message_stream(
         self,
@@ -683,7 +712,9 @@ class AgentLoop:
         )
 
         # Query memory in parallel
-        relevant_facts, vector_results = await self._query_memory(user_message)
+        relevant_facts, vector_results, active_topics, emotional_context = await self._query_memory(
+            user_message
+        )
 
         # Check if we should plan
         plan = None
@@ -707,7 +738,13 @@ class AgentLoop:
             iteration += 1
 
             messages = self._build_messages(
-                session, plan, relevant_facts, vector_results, tool_schemas
+                session,
+                plan,
+                relevant_facts,
+                vector_results,
+                tool_schemas,
+                active_topics=active_topics,
+                emotional_context=emotional_context,
             )
 
             try:
@@ -885,6 +922,8 @@ class AgentLoop:
                 relevant_facts,
                 vector_results,
                 tool_schemas,
+                active_topics=active_topics,
+                emotional_context=emotional_context,
             )
         ):
             if chunk.done:

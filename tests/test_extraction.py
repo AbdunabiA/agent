@@ -182,3 +182,61 @@ class TestFactExtractor:
 
         assert len(result) == 1
         assert mock_fact_store.set.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_new_fields_passed_to_fact_store(
+        self, mock_llm: MagicMock, mock_fact_store: MagicMock
+    ) -> None:
+        """New emotional/contextual fields are passed to fact_store.set()."""
+        facts_json = json.dumps(
+            [
+                {
+                    "key": "project.deadline",
+                    "value": "Friday deploy",
+                    "category": "project",
+                    "tone": "urgent",
+                    "emotion": "concerned,excited",
+                    "priority": "high",
+                    "topic": "deployment",
+                    "context_snippet": "User mentioned a critical Friday deployment deadline.",
+                },
+            ]
+        )
+        mock_llm.completion.return_value = MagicMock(content=facts_json)
+        mock_fact_store.set.return_value = MagicMock()
+
+        extractor = FactExtractor(mock_llm, mock_fact_store)
+        result = await extractor.extract_from_messages(
+            [{"role": "user", "content": "We need to deploy by Friday, it's critical"}]
+        )
+
+        assert len(result) == 1
+        call_kwargs = mock_fact_store.set.call_args_list[0].kwargs
+        assert call_kwargs["tone"] == "urgent"
+        assert call_kwargs["emotion"] == "concerned,excited"
+        assert call_kwargs["priority"] == "high"
+        assert call_kwargs["topic"] == "deployment"
+        assert call_kwargs["context_snippet"] == (
+            "User mentioned a critical Friday deployment deadline."
+        )
+        assert call_kwargs["source"] == "extracted"
+        assert call_kwargs["confidence"] == 0.8
+
+    @pytest.mark.asyncio
+    async def test_new_fields_default_when_missing(
+        self, mock_llm: MagicMock, mock_fact_store: MagicMock
+    ) -> None:
+        """New fields default gracefully when LLM omits them."""
+        facts_json = json.dumps([{"key": "user.name", "value": "Alice", "category": "user"}])
+        mock_llm.completion.return_value = MagicMock(content=facts_json)
+        mock_fact_store.set.return_value = MagicMock()
+
+        extractor = FactExtractor(mock_llm, mock_fact_store)
+        await extractor.extract_from_messages([{"role": "user", "content": "My name is Alice"}])
+
+        call_kwargs = mock_fact_store.set.call_args_list[0].kwargs
+        assert call_kwargs["tone"] == ""
+        assert call_kwargs["emotion"] == ""
+        assert call_kwargs["priority"] == "normal"
+        assert call_kwargs["topic"] == ""
+        assert call_kwargs["context_snippet"] == ""
