@@ -49,10 +49,31 @@ pytest -k "test_name"         # Run specific test
 pytest --cov=agent            # With coverage
 ```
 
+## Commit Messages
+
+Follow [Conventional Commits](https://www.conventionalcommits.org/):
+
+```
+<type>(<scope>): <description>
+
+[optional body]
+```
+
+Types: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, `perf`, `security`
+
+Examples:
+```
+feat(orchestration): add discussion mode for multi-agent consensus
+fix(memory): prevent race condition in fact store set()
+docs(config): add missing voice and desktop sections
+security(guardrails): fix rm -rf regex bypass
+test(session): add cache eviction persistence tests
+```
+
 ## Pull Request Process
 
 1. Create a feature branch from `main`
-2. Make your changes with clear, focused commits
+2. Make your changes with clear, focused commits following the convention above
 3. Ensure all checks pass (`make lint && make type-check && make test`)
 4. Open a PR with a clear description of what and why
 5. Address review feedback

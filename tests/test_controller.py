@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -143,10 +143,13 @@ class TestControllerAgent:
 
     async def test_get_all_tasks_summary(self, controller):
         controller._active_tasks["wo-1"] = ControllerTaskState(
-            order_id="wo-1", status="executing",
+            order_id="wo-1",
+            status="executing",
         )
         controller._active_tasks["wo-2"] = ControllerTaskState(
-            order_id="wo-2", status="completed", summary="Done",
+            order_id="wo-2",
+            status="completed",
+            summary="Done",
         )
         result = controller.get_all_tasks_summary()
         assert "wo-1" in result
@@ -252,7 +255,7 @@ class TestControllerTools:
             context="Use React",
         )
 
-        assert "submitted to controller" in result
+        assert "Task accepted" in result
         mock_controller.submit_order.assert_called_once()
 
         # Cleanup
@@ -564,7 +567,8 @@ class TestControllerEdgeCases:
         statuses = ["pending", "planning", "executing", "completed", "failed", "cancelled"]
         for i, status in enumerate(statuses):
             controller._active_tasks[f"wo-{i}"] = ControllerTaskState(
-                order_id=f"wo-{i}", status=status,
+                order_id=f"wo-{i}",
+                status=status,
             )
 
         result = controller.get_all_tasks_summary()
@@ -590,8 +594,8 @@ class TestControllerEdgeCases:
         assert state.status == "completed"
         assert state.summary == "Completed"  # fallback when empty
 
-    async def test_order_long_result_truncated(self, controller, mock_orchestrator):
-        """Verify long result text is truncated to 500 chars in summary."""
+    async def test_order_long_result_preserved(self, controller, mock_orchestrator):
+        """Verify full result text is preserved in summary (no truncation)."""
         from agent.core.subagent import SubAgentResult, SubAgentStatus
 
         long_output = "x" * 1000
@@ -606,7 +610,7 @@ class TestControllerEdgeCases:
         await controller._handle_order(order)
 
         state = controller._active_tasks[order.order_id]
-        assert len(state.summary) == 500
+        assert len(state.summary) == 1000
 
     async def test_unique_order_ids(self):
         """Each work order should get a unique ID."""
@@ -637,7 +641,8 @@ class TestControllerBugFixes:
 
         # Should have pruned oldest entries
         finished_count = sum(
-            1 for s in controller._active_tasks.values()
+            1
+            for s in controller._active_tasks.values()
             if s.status in {"completed", "failed", "cancelled"}
         )
         assert finished_count <= _MAX_FINISHED_TASKS
@@ -719,10 +724,8 @@ class TestControllerBugFixes:
 
     async def test_fix4_directive_exception_doesnt_kill_loop(self, controller):
         """FIX #4: Exception in _handle_directive should not kill _run_loop."""
-        from agent.core.subagent import SubAgentResult, SubAgentStatus
 
         # Make _handle_directive raise an exception
-        original_handle = controller._handle_directive
 
         async def exploding_directive(directive):
             raise ValueError("Bad directive processing")
@@ -762,7 +765,9 @@ class TestControllerBugFixes:
         assert worker.cancelled() or worker.done()
 
     async def test_fix6_progress_event_includes_user_id(
-        self, controller, mock_orchestrator,
+        self,
+        controller,
+        mock_orchestrator,
     ):
         """FIX #6: CONTROLLER_TASK_PROGRESS events must include user_id."""
         from agent.core.subagent import SubAgentResult, SubAgentStatus
@@ -791,7 +796,9 @@ class TestControllerBugFixes:
         assert progress_events[0]["user_id"] == "user-42"
 
     async def test_fix7_strenum_comparison_no_dot_value(
-        self, controller, mock_orchestrator,
+        self,
+        controller,
+        mock_orchestrator,
     ):
         """FIX #7: StrEnum comparison works without .value."""
         from agent.core.subagent import SubAgentResult, SubAgentStatus
@@ -811,9 +818,9 @@ class TestControllerBugFixes:
         assert state.status == "completed"
         assert "Enum test" in state.summary
 
-
     async def test_fix8_cancelled_emit_doesnt_swallow_keyboard_interrupt(
-        self, controller,
+        self,
+        controller,
     ):
         """FIX #8: suppress(CancelledError) should NOT swallow KeyboardInterrupt."""
         original_emit = controller.event_bus.emit
@@ -837,7 +844,9 @@ class TestControllerBugFixes:
             await controller._handle_order(order)
 
     async def test_fix9_task_state_stores_user_id(
-        self, controller, mock_orchestrator,
+        self,
+        controller,
+        mock_orchestrator,
     ):
         """FIX #9: ControllerTaskState should store user_id from the work order."""
         from agent.core.subagent import SubAgentResult, SubAgentStatus
@@ -856,7 +865,8 @@ class TestControllerBugFixes:
         assert state.user_id == "user-99"
 
     async def test_fix9_directive_cancel_uses_state_user_id(
-        self, controller,
+        self,
+        controller,
     ):
         """FIX #9: Directive handler should use state.user_id, not getattr."""
         cancelled_events = []
@@ -867,7 +877,9 @@ class TestControllerBugFixes:
         controller.event_bus.on(Events.CONTROLLER_TASK_CANCELLED, capture)
 
         state = ControllerTaskState(
-            order_id="wo-uid", status="executing", user_id="user-77",
+            order_id="wo-uid",
+            status="executing",
+            user_id="user-77",
         )
         controller._active_tasks["wo-uid"] = state
 
@@ -889,10 +901,11 @@ class TestControllerBugFixes:
         await controller.stop()
 
     async def test_fix11_completion_race_with_directive(
-        self, controller, mock_orchestrator,
+        self,
+        controller,
+        mock_orchestrator,
     ):
         """FIX #11: If directive cancels during _execute_order, completion should not overwrite."""
-        from agent.core.subagent import SubAgentResult, SubAgentStatus
 
         completed_events = []
         cancelled_events = []
@@ -987,13 +1000,15 @@ class TestControllerBugFixes:
         # Controller should see spawn_subagent but NOT assign_work
         controller_excluded = {"assign_work", "check_work_status", "direct_controller"}
         controller_scoped = ScopedToolRegistry(
-            parent=parent, denied_tools=controller_excluded,
+            parent=parent,
+            denied_tools=controller_excluded,
         )
 
         # Main agent should see assign_work but NOT spawn_subagent
         orchestration_excluded = {"spawn_subagent"}
         main_scoped = ScopedToolRegistry(
-            parent=parent, denied_tools=orchestration_excluded,
+            parent=parent,
+            denied_tools=orchestration_excluded,
         )
 
         controller_schemas = controller_scoped.get_tool_schemas(enabled_only=True)
@@ -1015,7 +1030,8 @@ class TestControllerBugFixes:
         parent = ToolRegistry()
 
         @parent.tool(
-            name="shell_exec", description="Run shell commands",
+            name="shell_exec",
+            description="Run shell commands",
             tier=ToolTier.DANGEROUS,
         )
         async def _shell(command: str) -> str:
@@ -1129,6 +1145,116 @@ class TestControllerEvents:
         assert Events.CONTROLLER_TASK_CANCELLED == "controller.task.cancelled"
 
 
+class TestTaskNotificationDeduplication:
+    """Verify user gets exactly ONE notification per completed/failed task.
+
+    CONTROLLER_TASK_COMPLETED and TASK_COMPLETED_NOTIFY both fire from
+    _handle_order, but only TASK_COMPLETED_NOTIFY should have a Telegram
+    handler.  This test subscribes a mock "Telegram-like" listener to
+    both old and new events and asserts the notification count.
+    """
+
+    async def test_completed_task_fires_one_user_notification(
+        self,
+        controller,
+        mock_orchestrator,
+    ):
+        from agent.core.subagent import SubAgentResult, SubAgentStatus
+
+        mock_orchestrator.spawn_subagent.return_value = SubAgentResult(
+            task_id="sa-dedup-1",
+            role_name="controller-worker",
+            status=SubAgentStatus.COMPLETED,
+            output="Done",
+        )
+
+        # Simulate the Telegram channel's subscription set:
+        # - TASK_COMPLETED_NOTIFY is subscribed (new path)
+        # - CONTROLLER_TASK_COMPLETED is NOT subscribed (removed)
+        notifications: list[dict] = []
+
+        async def on_task_completed_notify(data):
+            notifications.append({"event": "task.completed.notify", **data})
+
+        controller.event_bus.on(
+            Events.TASK_COMPLETED_NOTIFY,
+            on_task_completed_notify,
+        )
+        # NOTE: no subscription for CONTROLLER_TASK_COMPLETED — that's the point
+
+        order = ControllerWorkOrder(
+            instruction="Deduplicate me",
+            user_id="user-42",
+        )
+        await controller._handle_order(order)
+
+        assert len(notifications) == 1
+        assert notifications[0]["user_id"] == "user-42"
+        assert notifications[0]["task_id"] == order.order_id
+
+    async def test_failed_task_fires_one_user_notification(
+        self,
+        controller,
+        mock_orchestrator,
+    ):
+        from agent.core.subagent import SubAgentResult, SubAgentStatus
+
+        mock_orchestrator.spawn_subagent.return_value = SubAgentResult(
+            task_id="sa-dedup-2",
+            role_name="controller-worker",
+            status=SubAgentStatus.FAILED,
+            error="boom",
+        )
+
+        notifications: list[dict] = []
+
+        async def on_task_failed_notify(data):
+            notifications.append({"event": "task.failed.notify", **data})
+
+        controller.event_bus.on(
+            Events.TASK_FAILED_NOTIFY,
+            on_task_failed_notify,
+        )
+
+        order = ControllerWorkOrder(
+            instruction="Fail once",
+            user_id="user-42",
+        )
+        await controller._handle_order(order)
+
+        assert len(notifications) == 1
+        assert notifications[0]["user_id"] == "user-42"
+        assert notifications[0]["task_id"] == order.order_id
+        assert "boom" in notifications[0]["error"]
+
+    async def test_old_completed_event_still_fires_for_internal_use(
+        self,
+        controller,
+        mock_orchestrator,
+    ):
+        """CONTROLLER_TASK_COMPLETED still fires (other components may use it)."""
+        from agent.core.subagent import SubAgentResult, SubAgentStatus
+
+        mock_orchestrator.spawn_subagent.return_value = SubAgentResult(
+            task_id="sa-dedup-3",
+            role_name="controller-worker",
+            status=SubAgentStatus.COMPLETED,
+            output="Done",
+        )
+
+        old_events: list[dict] = []
+
+        async def capture(data):
+            old_events.append(data)
+
+        controller.event_bus.on(Events.CONTROLLER_TASK_COMPLETED, capture)
+
+        order = ControllerWorkOrder(instruction="Still fires")
+        await controller._handle_order(order)
+
+        assert len(old_events) == 1  # internal event still emitted
+
+
 class TestControllerPrompts:
     """Test system prompt changes for controller mode."""
 
@@ -1172,7 +1298,7 @@ class TestControllerConfig:
         config = OrchestrationConfig()
         assert config.use_controller is False
         assert config.controller_model is None
-        assert config.controller_max_turns == 30
+        assert config.controller_max_turns == 200
 
     def test_custom_config(self):
         from agent.config import OrchestrationConfig

@@ -17,38 +17,43 @@ from typing import Any
 import structlog
 import typer
 import yaml
-from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 
 from agent import __version__
+from agent.cli._helpers import (
+    _apply_log_level_flags,
+    _init_agent_stack,
+    _is_process_running,
+    _load_config,
+    _read_pid_file,
+    _remove_pid_file,
+    _resolve_workspace,
+    _write_pid_file,
+    console,
+    err_console,
+)
+from agent.cli.memory_workspace import memory_app, workspace_app
+from agent.cli.skills import skills_app
+from agent.cli.teams_projects import project_app, teams_app
+from agent.cli.voice_daemon import daemon_app, voice_app
 from agent.config import (
     AgentConfig,
     config_to_dict_masked,
     get_agent_home,
     get_available_models,
-    get_config,
 )
 from agent.core.agent_loop import AgentLoop
-from agent.core.audit import AuditLog
-from agent.core.events import EventBus
-from agent.core.guardrails import Guardrails
-from agent.core.permissions import PermissionManager
+from agent.core.events import EventBus as EventBus
 from agent.core.planner import Planner
-from agent.core.recovery import ErrorRecovery
 from agent.core.session import Session
 from agent.llm.provider import LLMProvider
-from agent.tools.executor import ToolExecutor
 from agent.tools.registry import registry
 from agent.utils.helpers import get_system_info
 from agent.utils.logging import setup_logging
-from agent.workspaces.manager import WorkspaceManager, WorkspaceNotFoundError
 
 logger = structlog.get_logger(__name__)
-
-console = Console()
-err_console = Console(stderr=True)
 
 app = typer.Typer(
     name="agent",
@@ -57,172 +62,27 @@ app = typer.Typer(
 )
 
 config_app = typer.Typer(help="Configuration commands.")
-app.add_typer(config_app, name="config")
-
 tools_app = typer.Typer(help="Tool management commands.")
-app.add_typer(tools_app, name="tools")
-
 audit_app = typer.Typer(help="Audit log commands.")
-app.add_typer(audit_app, name="audit", invoke_without_command=True)
-
 heartbeat_app = typer.Typer(help="Heartbeat daemon commands.")
+
+# Register all sub-apps
+app.add_typer(config_app, name="config")
+app.add_typer(tools_app, name="tools")
+app.add_typer(audit_app, name="audit", invoke_without_command=True)
 app.add_typer(heartbeat_app, name="heartbeat")
-
-skills_app = typer.Typer(help="Skill management commands.")
 app.add_typer(skills_app, name="skills")
-
-memory_app = typer.Typer(help="Memory management commands.")
 app.add_typer(memory_app, name="memory")
-
-workspace_app = typer.Typer(help="Workspace management commands.")
 app.add_typer(workspace_app, name="workspace")
-
-voice_app = typer.Typer(help="Voice pipeline commands.")
 app.add_typer(voice_app, name="voice")
-
-daemon_app = typer.Typer(help="Daemon service management (launchd/systemd).")
 app.add_typer(daemon_app, name="daemon")
+app.add_typer(teams_app, name="teams")
+app.add_typer(project_app, name="project")
 
 
-def _load_config(config_path: str | None = None) -> AgentConfig:
-    """Load config with error handling."""
-    try:
-        return get_config(config_path)
-    except Exception as e:
-        err_console.print(f"[red]Error loading config:[/red] {e}")
-        raise typer.Exit(1) from e
-
-
-def _apply_log_level_flags(
-    cfg: AgentConfig, *, verbose: bool, quiet: bool
-) -> None:
-    """Override config log level from CLI flags.
-
-    --verbose sets DEBUG, --quiet sets WARNING. If both are given, verbose wins.
-    """
-    if verbose:
-        cfg.logging.level = "DEBUG"
-    elif quiet:
-        cfg.logging.level = "WARNING"
-
-
-def _pid_file_path() -> Path:
-    """Return the path to the agent PID file."""
-    return get_agent_home() / "agent.pid"
-
-
-def _write_pid_file() -> None:
-    """Write current process PID to the PID file."""
-    pid_path = _pid_file_path()
-    pid_path.parent.mkdir(parents=True, exist_ok=True)
-    pid_path.write_text(str(os.getpid()))
-
-
-def _remove_pid_file() -> None:
-    """Remove the PID file if it exists."""
-    pid_path = _pid_file_path()
-    with contextlib.suppress(FileNotFoundError):
-        pid_path.unlink()
-
-
-def _read_pid_file() -> int | None:
-    """Read the PID from the PID file, or None if missing/invalid."""
-    pid_path = _pid_file_path()
-    if not pid_path.exists():
-        return None
-    try:
-        return int(pid_path.read_text().strip())
-    except (ValueError, OSError):
-        return None
-
-
-def _is_process_running(pid: int) -> bool:
-    """Check if a process with the given PID is running."""
-    if platform.system() == "Windows":
-        # On Windows, os.kill(pid, 0) sends CTRL_C_EVENT (== 0) which actually
-        # interrupts the process instead of just checking existence.
-        # Use ctypes OpenProcess to safely check without side effects.
-        import ctypes
-
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        synchronize = 0x00100000
-        handle = kernel32.OpenProcess(synchronize, False, pid)
-        if handle:
-            kernel32.CloseHandle(handle)
-            return True
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except (OSError, ProcessLookupError):
-        return False
-
-
-
-def _resolve_workspace(cfg: AgentConfig, workspace_name: str | None = None) -> AgentConfig:
-    """Resolve workspace and apply config overrides.
-
-    If workspace_name is given, use that workspace. Otherwise use the default.
-    Returns a new AgentConfig with workspace overrides applied.
-    """
-    manager = WorkspaceManager(cfg)
-    manager.ensure_default()
-    ws_name = workspace_name or cfg.workspaces.default
-    try:
-        workspace = manager.resolve(ws_name)
-    except WorkspaceNotFoundError:
-        err_console.print(f"[red]Workspace '{ws_name}' not found.[/red]")
-        err_console.print(f"[dim]Available: {', '.join(manager.discover()) or '(none)'}[/dim]")
-        raise typer.Exit(1) from None
-    resolved = manager.apply_overrides(cfg, workspace)
-    logger.info("workspace_active", workspace=workspace.name)
-    return resolved
-
-
-def _init_agent_stack(cfg: AgentConfig) -> tuple[
-    AgentLoop, EventBus, AuditLog, PermissionManager, Guardrails, ErrorRecovery, Planner
-]:
-    """Initialize the full Phase 2 agent stack.
-
-    Returns:
-        Tuple of (agent_loop, event_bus, audit, permissions, guardrails, recovery, planner).
-    """
-    event_bus = EventBus()
-    llm = LLMProvider(cfg.models)
-
-    # Register built-in tools
-    import agent.tools.builtins  # noqa: F401
-
-    # Initialize Phase 2 components
-    guardrails = Guardrails(cfg.tools)
-    permissions = PermissionManager(cfg.tools)
-    audit = AuditLog()
-    recovery = ErrorRecovery()
-
-    tool_executor = ToolExecutor(
-        registry=registry,
-        config=cfg.tools,
-        event_bus=event_bus,
-        audit=audit,
-        permissions=permissions,
-        guardrails=guardrails,
-    )
-
-    planner = Planner(llm=llm, config=cfg.agent)
-
-    agent_loop = AgentLoop(
-        llm=llm,
-        config=cfg.agent,
-        event_bus=event_bus,
-        tool_executor=tool_executor,
-        planner=planner,
-        recovery=recovery,
-        guardrails=guardrails,
-        orchestration_enabled=cfg.orchestration.enabled,
-        skill_builder_enabled=cfg.skills.builder.enabled,
-    )
-
-    return agent_loop, event_bus, audit, permissions, guardrails, recovery, planner
+# ---------------------------------------------------------------------------
+# Top-level commands
+# ---------------------------------------------------------------------------
 
 
 @app.command()
@@ -259,8 +119,8 @@ async def _chat_loop(cfg: AgentConfig) -> None:
     Args:
         cfg: Validated agent configuration.
     """
-    agent_loop, event_bus, audit, permissions, guardrails, recovery, planner = (
-        _init_agent_stack(cfg)
+    agent_loop, event_bus, audit, permissions, guardrails, recovery, planner = _init_agent_stack(
+        cfg
     )
     session = Session()
 
@@ -282,10 +142,12 @@ async def _chat_loop(cfg: AgentConfig) -> None:
 
         # Wire into memory tools
         from agent.tools.builtins.memory import set_fact_store
+
         set_fact_store(fact_store)
 
         # Wire session store for message persistence
         from agent.core.session import SessionStore
+
         session_store = SessionStore(db=database)
         agent_loop.session_store = session_store
 
@@ -296,9 +158,7 @@ async def _chat_loop(cfg: AgentConfig) -> None:
         # Rebuild system prompt with soul content
         from agent.llm.prompts import build_system_prompt
 
-        agent_loop.system_prompt = build_system_prompt(
-            cfg.agent, soul_content=soul_loader.load()
-        )
+        agent_loop.system_prompt = build_system_prompt(cfg.agent, soul_content=soul_loader.load())
 
         # Fact extractor
         fact_extractor = FactExtractor(
@@ -319,9 +179,7 @@ async def _chat_loop(cfg: AgentConfig) -> None:
             await vector_store.initialize()
             agent_loop.vector_store = vector_store
 
-            summarizer = ConversationSummarizer(
-                llm=agent_loop.llm, vector_store=vector_store
-            )
+            summarizer = ConversationSummarizer(llm=agent_loop.llm, vector_store=vector_store)
             agent_loop.summarizer = summarizer
         except Exception as e:
             logger.debug("vector_store_unavailable", error=str(e))
@@ -471,6 +329,7 @@ async def _chat_loop_sdk(cfg: AgentConfig) -> None:
     db = None
     try:
         from agent.memory.soul import SoulLoader
+
         soul_loader = SoulLoader(cfg.memory.soul_path)
     except Exception as e:
         logger.debug("soul_loader_init_failed", error=str(e))
@@ -487,6 +346,7 @@ async def _chat_loop_sdk(cfg: AgentConfig) -> None:
 
     try:
         from agent.memory.vectors import VectorStore
+
         vector_store = VectorStore(
             persist_dir=str(Path(cfg.memory.markdown_dir) / "chroma"),
         )
@@ -496,12 +356,13 @@ async def _chat_loop_sdk(cfg: AgentConfig) -> None:
 
     if fact_store:
         try:
-            from agent.llm.provider import LLMProvider
+            from agent.llm.provider import LLMProvider as _LLMProvider
             from agent.memory.extraction import FactExtractor
 
-            llm = LLMProvider(cfg.models)
+            llm = _LLMProvider(cfg.models)
             fact_extractor = FactExtractor(
-                llm=llm, fact_store=fact_store,
+                llm=llm,
+                fact_store=fact_store,
                 enabled=cfg.memory.auto_extract,
             )
         except Exception as e:
@@ -528,7 +389,9 @@ async def _chat_loop_sdk(cfg: AgentConfig) -> None:
 
     # Permission callback — asks user in terminal
     async def on_permission(
-        tool_name: str, details: str, tool_input: dict,  # noqa: ARG001
+        tool_name: str,
+        details: str,
+        tool_input: dict,  # noqa: ARG001
     ) -> bool:
         console.print(f"\n[bold yellow]Permission required:[/bold yellow] {tool_name}")
         console.print(f"[dim]{details}[/dim]")
@@ -597,7 +460,8 @@ async def _chat_loop_sdk(cfg: AgentConfig) -> None:
                     continue
                 elif cmd == "/help":
                     table = Table(
-                        title="Commands (SDK Mode)", show_header=True,
+                        title="Commands (SDK Mode)",
+                        show_header=True,
                         header_style="bold cyan",
                     )
                     table.add_column("Command", style="green")
@@ -609,9 +473,7 @@ async def _chat_loop_sdk(cfg: AgentConfig) -> None:
                     console.print(table)
                     continue
                 else:
-                    console.print(
-                        f"[dim]Unknown command: {cmd}. Type /help for help.[/dim]"
-                    )
+                    console.print(f"[dim]Unknown command: {cmd}. Type /help for help.[/dim]")
                     continue
 
             # Send to Claude SDK
@@ -635,14 +497,10 @@ async def _chat_loop_sdk(cfg: AgentConfig) -> None:
                             console.print(event.content, end="")
                             result_text += event.content
                     elif event.type == "thinking":
-                        console.print(
-                            f"[dim italic]{event.content}[/dim italic]", end=""
-                        )
+                        console.print(f"[dim italic]{event.content}[/dim italic]", end="")
                     elif event.type == "tool_use":
                         tool_name = event.data.get("tool", "?")
-                        console.print(
-                            f"\n[bold yellow]> {tool_name}[/bold yellow]", end=""
-                        )
+                        console.print(f"\n[bold yellow]> {tool_name}[/bold yellow]", end="")
                         if tool_name == "Bash":
                             cmd = event.data.get("input", {}).get("command", "")
                             if cmd:
@@ -692,7 +550,7 @@ def _print_available_models(cfg: AgentConfig) -> None:
 
     for provider, models in available.items():
         for i, model in enumerate(models):
-            active = "[bold green]✓[/bold green]" if model == cfg.models.default else ""
+            active = "[bold green]\u2713[/bold green]" if model == cfg.models.default else ""
             prov_label = provider if i == 0 else ""
             table.add_row(prov_label, model, active)
 
@@ -761,7 +619,7 @@ def _print_tools_list() -> None:
     console.print(table)
 
 
-async def _print_audit_entries(audit: AuditLog, limit: int = 10) -> None:
+async def _print_audit_entries(audit: object, limit: int = 10) -> None:
     """Print recent audit log entries."""
     entries = await audit.get_entries(limit=limit)
     if not entries:
@@ -861,8 +719,7 @@ def init() -> None:
 
     console.print(
         Panel(
-            f"This will create configuration files in:\n"
-            f"[cyan]{agent_home}[/cyan]",
+            f"This will create configuration files in:\n" f"[cyan]{agent_home}[/cyan]",
             title="Agent Setup",
             border_style="cyan",
         )
@@ -904,13 +761,19 @@ def init() -> None:
         console.print("  [dim]Paste your keys below. Leave blank to skip a provider.[/dim]")
         console.print("  [dim]You can always add or change keys later in the .env file.[/dim]")
         anthropic_key = typer.prompt(
-            "  Anthropic API key", default="", show_default=False,
+            "  Anthropic API key",
+            default="",
+            show_default=False,
         ).strip()
         openai_key = typer.prompt(
-            "  OpenAI API key", default="", show_default=False,
+            "  OpenAI API key",
+            default="",
+            show_default=False,
         ).strip()
         gemini_key = typer.prompt(
-            "  Gemini API key", default="", show_default=False,
+            "  Gemini API key",
+            default="",
+            show_default=False,
         ).strip()
 
         if not any([anthropic_key, openai_key, gemini_key]):
@@ -1085,17 +948,17 @@ def init() -> None:
 
     if telegram_enabled:
         next_steps.append("")
-        next_steps.append(
-            "  Telegram bot is enabled. Start the agent and message your bot!"
-        )
+        next_steps.append("  Telegram bot is enabled. Start the agent and message your bot!")
 
-    next_steps.extend([
-        "",
-        f"  Dashboard: [blue]http://127.0.0.1:{gateway_port}/dashboard[/blue]",
-        f"  [dim]Dashboard login token is in {env_path} (GATEWAY_TOKEN)[/dim]",
-        "",
-        f"  [dim]Edit config anytime: {config_path}[/dim]",
-    ])
+    next_steps.extend(
+        [
+            "",
+            f"  Dashboard: [blue]http://127.0.0.1:{gateway_port}/dashboard[/blue]",
+            f"  [dim]Dashboard login token is in {env_path} (GATEWAY_TOKEN)[/dim]",
+            "",
+            f"  [dim]Edit config anytime: {config_path}[/dim]",
+        ]
+    )
 
     console.print(
         Panel(
@@ -1134,9 +997,28 @@ async def _run_gateway(cfg: AgentConfig) -> None:
     from agent.core.startup import Application
 
     application = Application(cfg)
+    shutdown_triggered = False
+
+    async def _graceful_shutdown(sig: signal.Signals) -> None:
+        nonlocal shutdown_triggered
+        if shutdown_triggered:
+            return
+        shutdown_triggered = True
+        logger.info("shutdown_signal_received", signal=sig.name)
+        _remove_pid_file()
+        await application.shutdown()
+
     try:
         await application.initialize()
         _write_pid_file()
+
+        # Install signal handlers for graceful shutdown
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(
+                sig,
+                lambda s=sig: asyncio.create_task(_graceful_shutdown(s)),
+            )
 
         console.print(
             Panel(
@@ -1155,7 +1037,8 @@ async def _run_gateway(cfg: AgentConfig) -> None:
         pass
     finally:
         _remove_pid_file()
-        await application.shutdown()
+        if not shutdown_triggered:
+            await application.shutdown()
 
 
 @app.command()
@@ -1288,6 +1171,11 @@ async def _run_doctor(cfg: AgentConfig, *, security_only: bool = False) -> None:
     console.print()
 
 
+# ---------------------------------------------------------------------------
+# Config subcommands
+# ---------------------------------------------------------------------------
+
+
 @config_app.command("show")
 def config_show(
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
@@ -1299,7 +1187,10 @@ def config_show(
     console.print(Panel(yaml_str, title="Resolved Configuration", border_style="cyan"))
 
 
-# --- Tools subcommands ---
+# ---------------------------------------------------------------------------
+# Tools subcommands
+# ---------------------------------------------------------------------------
+
 
 @tools_app.command("list")
 def tools_list(
@@ -1308,6 +1199,7 @@ def tools_list(
     """List all registered tools with tier and status."""
     _load_config(config)
     import agent.tools.builtins  # noqa: F401
+
     _print_tools_list()
 
 
@@ -1319,6 +1211,7 @@ def tools_enable(
     """Enable a tool."""
     _load_config(config)
     import agent.tools.builtins  # noqa: F401
+
     try:
         registry.enable_tool(name)
         console.print(f"[green]Tool '{name}' enabled.[/green]")
@@ -1334,6 +1227,7 @@ def tools_disable(
     """Disable a tool."""
     _load_config(config)
     import agent.tools.builtins  # noqa: F401
+
     try:
         registry.disable_tool(name)
         console.print(f"[yellow]Tool '{name}' disabled.[/yellow]")
@@ -1341,7 +1235,10 @@ def tools_disable(
         console.print(f"[red]Error:[/red] {e}")
 
 
-# --- Audit subcommands ---
+# ---------------------------------------------------------------------------
+# Audit subcommands
+# ---------------------------------------------------------------------------
+
 
 @audit_app.callback(invoke_without_command=True)
 def audit_default(
@@ -1353,8 +1250,7 @@ def audit_default(
     if ctx.invoked_subcommand is not None:
         return
     console.print(
-        "[dim]Audit log is session-based in Phase 2."
-        " Start a chat to generate entries.[/dim]"
+        "[dim]Audit log is session-based in Phase 2." " Start a chat to generate entries.[/dim]"
     )
 
 
@@ -1362,12 +1258,14 @@ def audit_default(
 def audit_stats() -> None:
     """Show audit statistics."""
     console.print(
-        "[dim]Audit stats are session-based in Phase 2."
-        " Start a chat to generate entries.[/dim]"
+        "[dim]Audit stats are session-based in Phase 2." " Start a chat to generate entries.[/dim]"
     )
 
 
-# --- Heartbeat subcommands ---
+# ---------------------------------------------------------------------------
+# Heartbeat subcommands
+# ---------------------------------------------------------------------------
+
 
 @heartbeat_app.command("start")
 def heartbeat_start(
@@ -1391,9 +1289,7 @@ async def _run_heartbeat(cfg: AgentConfig) -> None:
         event_bus=event_bus,
     )
 
-    console.print(
-        f"[cyan]Starting heartbeat (interval: {cfg.agent.heartbeat_interval})...[/cyan]"
-    )
+    console.print(f"[cyan]Starting heartbeat (interval: {cfg.agent.heartbeat_interval})...[/cyan]")
     console.print("[dim]Press Ctrl+C to stop.[/dim]")
 
     await heartbeat.start()
@@ -1412,982 +1308,3 @@ def heartbeat_status() -> None:
     """Show heartbeat status."""
     console.print("[dim]Heartbeat status is only available while running.[/dim]")
     console.print("[dim]Use 'agent heartbeat start' to start the heartbeat daemon.[/dim]")
-
-
-# --- Skills subcommands ---
-
-
-@skills_app.command("list")
-def skills_list(
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """List all discovered skills."""
-    cfg = _load_config(config)
-    asyncio.run(_skills_list(cfg))
-
-
-async def _skills_list(cfg: AgentConfig) -> None:
-    from agent.core.events import EventBus
-    from agent.core.scheduler import TaskScheduler
-    from agent.skills.manager import SkillManager
-    from agent.tools.registry import ToolRegistry
-
-    tool_registry = ToolRegistry()
-    event_bus = EventBus()
-    scheduler = TaskScheduler(event_bus)
-    manager = SkillManager(
-        config=cfg.skills,
-        tool_registry=tool_registry,
-        event_bus=event_bus,
-        scheduler=scheduler,
-    )
-
-    with contextlib.suppress(Exception):
-        await manager.discover_and_load()
-
-    skills = manager.list_skills()
-    if not skills:
-        console.print("[dim]No skills found.[/dim]")
-        return
-
-    table = Table(title="Skills", show_header=True, header_style="bold cyan")
-    table.add_column("Name", style="green")
-    table.add_column("Version")
-    table.add_column("Status")
-    table.add_column("Tools")
-    table.add_column("Permissions")
-
-    for s in skills:
-        status = "[green]loaded[/green]" if s["loaded"] else "[yellow]not loaded[/yellow]"
-        tools = ", ".join(s["tools"]) if s["tools"] else "-"
-        perms = ", ".join(s["permissions"])
-        table.add_row(
-            s["display_name"] or s["name"],
-            s["version"],
-            status,
-            tools,
-            perms,
-        )
-
-    console.print(table)
-
-
-@skills_app.command("info")
-def skills_info(
-    name: str = typer.Argument(help="Skill name"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """Show detailed information about a skill."""
-    cfg = _load_config(config)
-    asyncio.run(_skills_info(cfg, name))
-
-
-async def _skills_info(cfg: AgentConfig, name: str) -> None:
-    from agent.core.events import EventBus
-    from agent.core.scheduler import TaskScheduler
-    from agent.skills.manager import SkillManager
-    from agent.tools.registry import ToolRegistry
-
-    tool_registry = ToolRegistry()
-    event_bus = EventBus()
-    scheduler = TaskScheduler(event_bus)
-    manager = SkillManager(
-        config=cfg.skills,
-        tool_registry=tool_registry,
-        event_bus=event_bus,
-        scheduler=scheduler,
-    )
-
-    with contextlib.suppress(Exception):
-        await manager.discover_and_load()
-
-    skills = manager.list_skills()
-    skill = next((s for s in skills if s["name"] == name), None)
-    if not skill:
-        console.print(f"[red]Skill '{name}' not found.[/red]")
-        raise typer.Exit(1)
-
-    table = Table(show_header=False, title=skill["display_name"] or skill["name"])
-    table.add_column("Key", style="cyan")
-    table.add_column("Value")
-    table.add_row("Name", skill["name"])
-    table.add_row("Version", skill["version"])
-    table.add_row("Author", skill.get("author", "") or "-")
-    table.add_row("Description", skill.get("description", "") or "-")
-    table.add_row("Status", "loaded" if skill["loaded"] else "not loaded")
-    table.add_row("Permissions", ", ".join(skill["permissions"]))
-    table.add_row("Tools", ", ".join(skill["tools"]) if skill["tools"] else "-")
-    table.add_row("Path", skill.get("path", ""))
-    console.print(table)
-
-
-@skills_app.command("enable")
-def skills_enable(
-    name: str = typer.Argument(help="Skill name to enable"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """Enable a disabled skill (removes from disabled list in config)."""
-    from agent.config import _save_config_to_disk
-
-    cfg = _load_config(config)
-    if name in cfg.skills.disabled:
-        cfg.skills.disabled.remove(name)
-        _save_config_to_disk(cfg)
-        console.print(f"[green]Skill '{name}' enabled and saved to config.[/green]")
-    else:
-        console.print(f"[dim]Skill '{name}' is already enabled.[/dim]")
-
-
-@skills_app.command("disable")
-def skills_disable(
-    name: str = typer.Argument(help="Skill name to disable"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """Disable a skill (adds to disabled list in config)."""
-    from agent.config import _save_config_to_disk
-
-    cfg = _load_config(config)
-    if name not in cfg.skills.disabled:
-        cfg.skills.disabled.append(name)
-        _save_config_to_disk(cfg)
-        console.print(f"[yellow]Skill '{name}' disabled and saved to config.[/yellow]")
-    else:
-        console.print(f"[dim]Skill '{name}' is already disabled.[/dim]")
-
-
-@skills_app.command("reload")
-def skills_reload(
-    name: str = typer.Argument(help="Skill name to reload"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """Reload a skill (hot-reload)."""
-    console.print(
-        "[dim]Skill reload is only available while the agent is running "
-        "(agent start). Use the API: POST /api/v1/skills/{name}/reload[/dim]"
-    )
-
-
-@skills_app.command("create")
-def skills_create(
-    name: str = typer.Argument(help="Skill name (e.g. my-skill)"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """Scaffold a new skill directory."""
-    cfg = _load_config(config)
-    skills_dir = Path(cfg.skills.directory)
-    skill_path = skills_dir / name
-
-    if skill_path.exists():
-        console.print(f"[red]Directory already exists:[/red] {skill_path}")
-        raise typer.Exit(1)
-
-    skill_path.mkdir(parents=True)
-
-    # SKILL.md
-    (skill_path / "SKILL.md").write_text(
-        f"---\n"
-        f"name: {name}\n"
-        f"description: A new skill\n"
-        f"version: '0.1.0'\n"
-        f"permissions:\n"
-        f"  - safe\n"
-        f"---\n\n"
-        f"# {name.replace('-', ' ').title()}\n\n"
-        f"Describe your skill here.\n",
-        encoding="utf-8",
-    )
-
-    # main.py
-    class_name = name.replace("-", " ").replace("_", " ").title().replace(" ", "") + "Skill"
-    (skill_path / "main.py").write_text(
-        f"from agent.skills.base import Skill\n\n\n"
-        f"class {class_name}(Skill):\n"
-        f"    async def setup(self) -> None:\n"
-        f"        self.register_tool(\n"
-        f"            name=\"hello\",\n"
-        f"            description=\"Say hello\",\n"
-        f"            function=self._hello,\n"
-        f"            tier=\"safe\",\n"
-        f"        )\n\n"
-        f"    async def _hello(self, name: str = \"world\") -> str:\n"
-        f"        return f\"Hello, {{name}}!\"\n",
-        encoding="utf-8",
-    )
-
-    console.print(f"[green]Skill scaffolded:[/green] {skill_path}")
-    console.print(f"  - {skill_path / 'SKILL.md'}")
-    console.print(f"  - {skill_path / 'main.py'}")
-
-
-@skills_app.command("staged")
-def skills_staged(
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """List staged (pending approval) skills."""
-    cfg = _load_config(config)
-    staging_dir = Path(cfg.skills.builder.staging_dir)
-
-    if not staging_dir.is_dir():
-        console.print("[dim]No staged skills.[/dim]")
-        return
-
-    found = False
-    for entry in sorted(staging_dir.iterdir()):
-        if entry.is_dir() and not entry.name.startswith("."):
-            found = True
-            marker = entry / ".auto_generated"
-            desc = ""
-            if marker.is_file():
-                import json
-
-                try:
-                    data = json.loads(marker.read_text(encoding="utf-8"))
-                    desc = data.get("description", "")
-                except Exception:
-                    pass
-            console.print(f"  [bold]{entry.name}[/bold]  {desc}")
-
-    if not found:
-        console.print("[dim]No staged skills.[/dim]")
-
-
-@skills_app.command("approve")
-def skills_approve(
-    name: str = typer.Argument(help="Name of staged skill to approve"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """Approve a staged skill and activate it."""
-    import shutil
-
-    cfg = _load_config(config)
-    staging_path = Path(cfg.skills.builder.staging_dir) / name
-    if not staging_path.is_dir():
-        console.print(f"[red]No staged skill: {name}[/red]")
-        raise typer.Exit(1)
-
-    target = Path(cfg.skills.directory) / name
-    if target.exists():
-        console.print(f"[red]Skill '{name}' already exists at {target}[/red]")
-        raise typer.Exit(1)
-
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(staging_path), str(target))
-    console.print(f"[green]Skill '{name}' approved and moved to {target}[/green]")
-
-
-@skills_app.command("reject")
-def skills_reject(
-    name: str = typer.Argument(help="Name of staged skill to reject"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """Reject and delete a staged skill."""
-    import shutil
-
-    cfg = _load_config(config)
-    staging_path = Path(cfg.skills.builder.staging_dir) / name
-    if not staging_path.is_dir():
-        console.print(f"[red]No staged skill: {name}[/red]")
-        raise typer.Exit(1)
-
-    shutil.rmtree(staging_path)
-    console.print(f"[yellow]Staged skill '{name}' deleted.[/yellow]")
-
-
-# --- Teams subcommands ---
-
-
-teams_app = typer.Typer(help="Sub-agent team commands.")
-app.add_typer(teams_app, name="teams")
-
-
-def _load_all_teams(cfg: Any) -> list[Any]:
-    """Load teams from both config and teams/ directory."""
-    from agent.teams.loader import (
-        config_to_team,
-        load_teams_from_directory,
-        merge_teams,
-    )
-
-    config_teams = [config_to_team(t) for t in cfg.orchestration.teams]
-    file_teams = load_teams_from_directory(cfg.orchestration.teams_directory)
-    return merge_teams(file_teams, config_teams)
-
-
-@teams_app.command("list")
-def teams_list(
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """List configured sub-agent teams."""
-    cfg = _load_config(config)
-    teams = _load_all_teams(cfg)
-
-    if not teams:
-        console.print(
-            "[dim]No teams configured. "
-            "Add YAML files to teams/ or define inline in agent.yaml.[/dim]"
-        )
-        return
-
-    table = Table(title="Agent Teams")
-    table.add_column("Name", style="cyan")
-    table.add_column("Description")
-    table.add_column("Roles")
-    table.add_column("#", justify="right")
-
-    for team in teams:
-        roles = ", ".join(r.name for r in team.roles)
-        table.add_row(team.name, team.description, roles, str(len(team.roles)))
-
-    console.print(table)
-
-
-@teams_app.command("info")
-def teams_info(
-    name: str = typer.Argument(help="Team name"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """Show details about a sub-agent team."""
-    cfg = _load_config(config)
-    teams = _load_all_teams(cfg)
-
-    team = next((t for t in teams if t.name == name), None)
-    if not team:
-        console.print(f"[red]Team '{name}' not found[/red]")
-        raise typer.Exit(1)
-
-    console.print(Panel(f"[bold]{team.name}[/bold]\n{team.description}", title="Team"))
-    for role in team.roles:
-        tools = ", ".join(role.allowed_tools) if role.allowed_tools else "all safe+moderate"
-        denied = ", ".join(role.denied_tools) if role.denied_tools else "none"
-        console.print(
-            f"  [cyan]{role.name}[/cyan]: {role.persona}\n"
-            f"    Allowed: {tools} | Denied: {denied} | Max iterations: {role.max_iterations}"
-        )
-
-
-@teams_app.command("create")
-def teams_create(
-    name: str = typer.Argument(help="Team name"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """Scaffold a new team YAML file in the teams/ directory."""
-    cfg = _load_config(config)
-    teams_dir = Path(cfg.orchestration.teams_directory)
-    teams_dir.mkdir(parents=True, exist_ok=True)
-
-    target = teams_dir / f"{name}.yaml"
-    if target.exists():
-        console.print(f"[red]Team file already exists: {target}[/red]")
-        raise typer.Exit(1)
-
-    template = (
-        f"name: {name}\n"
-        f"description: \"\"\n"
-        f"roles:\n"
-        f"  - name: agent\n"
-        f"    persona: \"You are a helpful assistant.\"\n"
-        f"    allowed_tools: []\n"
-        f"    denied_tools: []\n"
-        f"    max_iterations: 5\n"
-    )
-    target.write_text(template, encoding="utf-8")
-    console.print(f"[green]Created team file: {target}[/green]")
-    console.print("[dim]Edit the file to add roles and configure the team.[/dim]")
-
-
-# --- Project subcommands ---
-
-project_app = typer.Typer(help="Cross-team project pipeline commands.")
-app.add_typer(project_app, name="project")
-
-
-@project_app.command("list")
-def project_list(
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """List available project pipelines."""
-    cfg = _load_config(config)
-
-    from agent.teams.loader import load_projects_from_directory
-
-    projects = load_projects_from_directory(cfg.orchestration.teams_directory)
-
-    if not projects:
-        console.print(
-            "[dim]No projects configured. "
-            "Add YAML files to teams/projects/ to define pipelines.[/dim]"
-        )
-        return
-
-    table = Table(title="Project Pipelines")
-    table.add_column("Name", style="cyan")
-    table.add_column("Description")
-    table.add_column("Stages")
-    table.add_column("Agents", justify="right")
-
-    for proj in projects:
-        stages = " → ".join(s.name for s in proj.stages)
-        total_agents = sum(len(s.agents) for s in proj.stages)
-        table.add_row(proj.name, proj.description, stages, str(total_agents))
-
-    console.print(table)
-
-
-@project_app.command("info")
-def project_info(
-    name: str = typer.Argument(help="Project name"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """Show details about a project pipeline."""
-    cfg = _load_config(config)
-
-    from agent.teams.loader import load_projects_from_directory
-
-    projects = load_projects_from_directory(cfg.orchestration.teams_directory)
-    proj = next((p for p in projects if p.name == name), None)
-
-    if not proj:
-        console.print(f"[red]Project '{name}' not found[/red]")
-        raise typer.Exit(1)
-
-    console.print(Panel(f"[bold]{proj.name}[/bold]\n{proj.description}", title="Project"))
-    for i, stage in enumerate(proj.stages, 1):
-        agents_str = ", ".join(f"{a.team}/{a.role}" for a in stage.agents)
-        parallel_str = "parallel" if stage.parallel else "sequential"
-        console.print(
-            f"  [cyan]Stage {i}: {stage.name}[/cyan] ({parallel_str})\n"
-            f"    Agents: {agents_str}"
-        )
-
-
-@project_app.command("create")
-def project_create(
-    name: str = typer.Argument(help="Project name"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """Scaffold a new project YAML file in teams/projects/."""
-    cfg = _load_config(config)
-    projects_dir = Path(cfg.orchestration.teams_directory) / "projects"
-    projects_dir.mkdir(parents=True, exist_ok=True)
-
-    target = projects_dir / f"{name}.yaml"
-    if target.exists():
-        console.print(f"[red]Project file already exists: {target}[/red]")
-        raise typer.Exit(1)
-
-    template = (
-        f"name: {name}\n"
-        f"description: \"\"\n"
-        f"stages:\n"
-        f"  - name: planning\n"
-        f"    parallel: true\n"
-        f"    agents:\n"
-        f"      - team: engineering\n"
-        f"        role: architect\n"
-        f"\n"
-        f"  - name: implementation\n"
-        f"    parallel: true\n"
-        f"    agents:\n"
-        f"      - team: engineering\n"
-        f"        role: backend_developer\n"
-        f"\n"
-        f"  - name: review\n"
-        f"    parallel: true\n"
-        f"    agents:\n"
-        f"      - team: quality\n"
-        f"        role: qa_engineer\n"
-    )
-    target.write_text(template, encoding="utf-8")
-    console.print(f"[green]Created project file: {target}[/green]")
-    console.print("[dim]Edit the file to define stages and agents.[/dim]")
-
-
-# --- Memory subcommands ---
-
-
-@memory_app.command("export")
-def memory_export(
-    output: str = typer.Argument("memory_export.json", help="Output file path"),
-    format: str = typer.Option("json", "--format", "-f", help="Export format: json or markdown"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """Export memory (facts + soul) to file."""
-    cfg = _load_config(config)
-    asyncio.run(_memory_export(cfg, output, format))
-
-
-async def _memory_export(cfg: AgentConfig, output: str, fmt: str) -> None:
-    from agent.memory.database import Database
-    from agent.memory.export import MemoryExporter
-    from agent.memory.soul import SoulLoader
-    from agent.memory.store import FactStore
-
-    fact_store = None
-    database = None
-
-    try:
-        database = Database(cfg.memory.db_path)
-        await database.connect()
-        fact_store = FactStore(database)
-    except Exception as e:
-        console.print(f"[yellow]Warning: Could not open database: {e}[/yellow]")
-
-    soul_loader = SoulLoader(cfg.memory.soul_path)
-
-    exporter = MemoryExporter(fact_store=fact_store, soul_loader=soul_loader)
-
-    if fmt == "markdown":
-        await exporter.export_markdown(output)
-    else:
-        await exporter.export_json(output)
-
-    console.print(f"[green]Memory exported to:[/green] {output}")
-
-    if database:
-        await database.close()
-
-
-@memory_app.command("import")
-def memory_import(
-    input_file: str = typer.Argument(help="Input JSON file path"),
-    merge: bool = typer.Option(True, "--merge/--replace", help="Merge or replace existing facts"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """Import memory from a JSON export file."""
-    cfg = _load_config(config)
-    asyncio.run(_memory_import(cfg, input_file, merge))
-
-
-async def _memory_import(cfg: AgentConfig, input_file: str, merge: bool) -> None:
-    from agent.memory.database import Database
-    from agent.memory.export import MemoryExporter
-    from agent.memory.soul import SoulLoader
-    from agent.memory.store import FactStore
-
-    database = Database(cfg.memory.db_path)
-    await database.connect()
-    fact_store = FactStore(database)
-    soul_loader = SoulLoader(cfg.memory.soul_path)
-
-    exporter = MemoryExporter(fact_store=fact_store, soul_loader=soul_loader)
-    stats = await exporter.import_json(input_file, merge=merge)
-
-    mode = "merged" if merge else "replaced"
-    console.print(f"[green]Memory imported ({mode}):[/green]")
-    console.print(f"  Facts: {stats['facts_imported']}")
-    console.print(f"  Soul updated: {stats['soul_updated']}")
-
-    await database.close()
-
-
-@memory_app.command("stats")
-def memory_stats_cmd(
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """Show memory system statistics."""
-    cfg = _load_config(config)
-    asyncio.run(_memory_stats(cfg))
-
-
-async def _memory_stats(cfg: AgentConfig) -> None:
-    from agent.memory.database import Database
-    from agent.memory.soul import SoulLoader
-    from agent.memory.store import FactStore
-
-    facts_count = 0
-    vectors_count = 0
-    soul_loaded = False
-
-    try:
-        database = Database(cfg.memory.db_path)
-        await database.connect()
-        fact_store = FactStore(database)
-        facts_count = await fact_store.count()
-        await database.close()
-    except Exception:
-        pass
-
-    try:
-        from agent.memory.vectors import VectorStore
-
-        vs = VectorStore(persist_dir=cfg.memory.markdown_dir + "chroma")
-        await vs.initialize()
-        vectors_count = await vs.count()
-    except Exception:
-        pass
-
-    soul_loader = SoulLoader(cfg.memory.soul_path)
-    soul_loaded = bool(soul_loader.content)
-
-    table = Table(title="Memory Stats", show_header=False)
-    table.add_column("Key", style="cyan")
-    table.add_column("Value")
-    table.add_row("Facts", str(facts_count))
-    table.add_row("Vectors", str(vectors_count))
-    table.add_row("Soul loaded", "[green]yes[/green]" if soul_loaded else "[yellow]no[/yellow]")
-    console.print(table)
-
-
-# --- Workspace subcommands ---
-
-
-@workspace_app.command("list")
-def workspace_list(
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """List all workspaces."""
-    cfg = _load_config(config)
-    manager = WorkspaceManager(cfg)
-    manager.ensure_default()
-
-    names = manager.discover()
-    if not names:
-        console.print("[dim]No workspaces found.[/dim]")
-        return
-
-    table = Table(
-        title=f"Workspaces ({len(names)} found)",
-        show_header=True,
-        header_style="bold cyan",
-    )
-    table.add_column("Name", style="green")
-    table.add_column("Display Name")
-    table.add_column("Description")
-    table.add_column("Active")
-
-    for name in names:
-        try:
-            ws = manager.resolve(name)
-            active = "yes" if name == cfg.workspaces.default else ""
-            table.add_row(ws.name, ws.display_name, ws.description, active)
-        except Exception:
-            table.add_row(name, "(error)", "", "")
-
-    console.print(table)
-
-
-@workspace_app.command("create")
-def workspace_create(
-    name: str = typer.Argument(help="Workspace name (lowercase, no spaces)"),
-    display_name: str = typer.Option("", "--display-name", "-d", help="Human-readable name"),
-    description: str = typer.Option("", "--description", help="Workspace description"),
-    clone: str | None = typer.Option(None, "--clone", help="Clone config from existing workspace"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """Create a new workspace."""
-    cfg = _load_config(config)
-    manager = WorkspaceManager(cfg)
-
-    try:
-        ws = manager.create(
-            name, display_name=display_name,
-            description=description, clone_from=clone,
-        )
-        console.print(f"[green]Workspace created:[/green] {ws.name}")
-        console.print(f"  Path: {ws.root_dir}")
-        console.print(f"  Soul: {ws.soul_path}")
-        console.print(f"  Data: {ws.data_dir}")
-        if clone:
-            console.print(f"  Cloned from: {clone}")
-    except Exception as e:
-        err_console.print(f"[red]Error:[/red] {e}")
-        raise typer.Exit(1) from e
-
-
-@workspace_app.command("info")
-def workspace_info(
-    name: str = typer.Argument(help="Workspace name"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """Show detailed information about a workspace."""
-    cfg = _load_config(config)
-    manager = WorkspaceManager(cfg)
-
-    try:
-        ws = manager.resolve(name)
-    except WorkspaceNotFoundError:
-        err_console.print(f"[red]Workspace '{name}' not found.[/red]")
-        raise typer.Exit(1) from None
-
-    wc = ws.config
-
-    # Basic info
-    table = Table(
-        title=f"Workspace: {ws.name} ({ws.display_name})",
-        show_header=False,
-    )
-    table.add_column("Key", style="cyan")
-    table.add_column("Value")
-    table.add_row("Description", ws.description or "(none)")
-    table.add_row("Path", str(ws.root_dir))
-
-    # Overrides
-    if wc.default_model is not None:
-        table.add_row("Model", f"{wc.default_model} (override)")
-    if wc.fallback_model is not None:
-        table.add_row("Fallback Model", f"{wc.fallback_model} (override)")
-    if wc.max_iterations is not None:
-        table.add_row("Max Iterations", f"{wc.max_iterations} (override)")
-    if wc.heartbeat_interval is not None:
-        table.add_row("Heartbeat", f"{wc.heartbeat_interval} (override)")
-    if wc.enabled_skills is not None:
-        table.add_row("Enabled Skills", ", ".join(wc.enabled_skills))
-    if wc.disabled_skills is not None:
-        table.add_row("Disabled Skills", ", ".join(wc.disabled_skills))
-    if wc.enabled_tools is not None:
-        table.add_row("Enabled Tools", ", ".join(wc.enabled_tools))
-    if wc.disabled_tools is not None:
-        table.add_row("Disabled Tools", ", ".join(wc.disabled_tools))
-
-    # Data stats
-    db_path = Path(ws.get_db_path())
-    if db_path.exists():
-        size_kb = db_path.stat().st_size / 1024
-        table.add_row("Database", f"{size_kb:.1f} KB")
-    else:
-        table.add_row("Database", "(not created)")
-
-    soul_exists = ws.soul_path.exists()
-    if soul_exists:
-        soul_size = ws.soul_path.stat().st_size
-        table.add_row("Soul", f"{soul_size} bytes")
-    else:
-        table.add_row("Soul", "(not created)")
-
-    console.print(table)
-
-
-@workspace_app.command("switch")
-def workspace_switch(
-    name: str = typer.Argument(help="Workspace name to switch to"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """Set the active workspace (updates agent.yaml)."""
-    cfg = _load_config(config)
-    manager = WorkspaceManager(cfg)
-
-    try:
-        manager.resolve(name)
-    except WorkspaceNotFoundError:
-        err_console.print(f"[red]Workspace '{name}' not found.[/red]")
-        raise typer.Exit(1) from None
-
-    # Update the config file
-    config_file = Path("agent.yaml")
-    if config_file.exists():
-        with open(config_file) as f:
-            raw = yaml.safe_load(f) or {}
-        raw.setdefault("workspaces", {})["default"] = name
-        with open(config_file, "w") as f:
-            yaml.dump(raw, f, default_flow_style=False, sort_keys=False)
-        console.print(f"[green]Switched to workspace:[/green] {name}")
-        console.print("[dim]Restart the agent for changes to take effect.[/dim]")
-    else:
-        console.print(f"[yellow]No agent.yaml found. Use --workspace {name} flag instead.[/yellow]")
-
-
-@workspace_app.command("delete")
-def workspace_delete(
-    name: str = typer.Argument(help="Workspace name to delete"),
-    confirm: bool = typer.Option(False, "--confirm", help="Confirm deletion (required)"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """Delete a workspace and all its data."""
-    cfg = _load_config(config)
-    manager = WorkspaceManager(cfg)
-
-    try:
-        deleted = manager.delete(name, confirm=confirm)
-        if deleted:
-            console.print(f"[green]Workspace '{name}' deleted.[/green]")
-        else:
-            console.print(f"[yellow]Workspace '{name}' not found.[/yellow]")
-    except ValueError as e:
-        err_console.print(f"[red]Error:[/red] {e}")
-        raise typer.Exit(1) from e
-
-
-@workspace_app.command("current")
-def workspace_current(
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """Show the currently active workspace."""
-    cfg = _load_config(config)
-    console.print(f"Active workspace: [green]{cfg.workspaces.default}[/green]")
-
-
-# ------------------------------------------------------------------
-# Voice commands
-# ------------------------------------------------------------------
-
-
-@voice_app.command("list-voices")
-def voice_list_voices(
-    language: str = typer.Option(
-        "", "--language", "-l", help="Filter by language code (en, ru, uz)"
-    ),
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """List available TTS voices."""
-    cfg = _load_config(config)
-
-    async def _run() -> None:
-        from agent.voice.pipeline import VoicePipeline
-
-        pipeline = VoicePipeline(cfg.voice, EventBus())
-        voices = await pipeline.list_voices(language)
-
-        if not voices:
-            console.print("[yellow]No voices found.[/yellow]")
-            return
-
-        table = Table(title=f"TTS Voices ({cfg.voice.tts.provider})")
-        table.add_column("Name", style="green")
-        table.add_column("Gender")
-        table.add_column("Language")
-
-        for v in voices:
-            table.add_row(
-                v.get("name", ""),
-                v.get("gender", ""),
-                v.get("language", ""),
-            )
-
-        console.print(table)
-        console.print(f"\n[dim]Total: {len(voices)} voices[/dim]")
-
-    asyncio.run(_run())
-
-
-@voice_app.command("test")
-def voice_test(
-    text: str = typer.Argument(..., help="Text to synthesize"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """Synthesize text to speech and save the audio file."""
-    cfg = _load_config(config)
-
-    async def _run() -> None:
-        from agent.voice.pipeline import VoicePipeline
-
-        pipeline = VoicePipeline(cfg.voice, EventBus())
-        result = await pipeline.synthesize(text)
-
-        if not result:
-            console.print("[red]TTS synthesis failed or TTS is disabled.[/red]")
-            return
-
-        ext = "ogg" if result.mime_type == "audio/ogg" else "mp3"
-        out_path = Path(f"data/voice_test.{ext}")
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        await asyncio.to_thread(out_path.write_bytes, result.audio_data)
-
-        console.print(
-            Panel(
-                f"Voice: [green]{result.voice}[/green]\n"
-                f"Size: {len(result.audio_data):,} bytes\n"
-                f"Duration: ~{result.duration_seconds:.1f}s\n"
-                f"Saved to: [blue]{out_path}[/blue]",
-                title="TTS Result",
-            )
-        )
-
-    asyncio.run(_run())
-
-
-@voice_app.command("config")
-def voice_config_cmd(
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """Show current voice configuration."""
-    cfg = _load_config(config)
-    vc = cfg.voice
-
-    table = Table(title="Voice Configuration")
-    table.add_column("Setting", style="cyan")
-    table.add_column("Value")
-
-    table.add_row("STT Provider", vc.stt.provider)
-    table.add_row("STT Language", vc.stt.language or "(auto-detect)")
-    table.add_row("TTS Enabled", str(vc.tts.enabled))
-    table.add_row("TTS Provider", vc.tts.provider)
-    table.add_row("TTS Voice", vc.tts.edge_voice)
-    table.add_row("TTS Rate", vc.tts.edge_rate)
-    table.add_row("Output Format", vc.tts.output_format)
-    table.add_row("Auto Voice Reply", str(vc.auto_voice_reply))
-    table.add_row("Voice Reply Channels", ", ".join(vc.voice_reply_channels))
-
-    console.print(table)
-
-
-# -----------------------------------------------------------------------
-# Daemon commands
-# -----------------------------------------------------------------------
-
-
-@daemon_app.command("install")
-def daemon_install_cmd() -> None:
-    """Install the agent as an OS service (launchd on macOS, systemd on Linux)."""
-    from agent.core.daemon import daemon_install
-
-    result = daemon_install()
-    console.print(result)
-
-
-@daemon_app.command("uninstall")
-def daemon_uninstall_cmd() -> None:
-    """Uninstall the agent OS service."""
-    from agent.core.daemon import daemon_uninstall
-
-    result = daemon_uninstall()
-    console.print(result)
-
-
-@daemon_app.command("start")
-def daemon_start_cmd() -> None:
-    """Start the agent daemon service."""
-    from agent.core.daemon import daemon_start
-
-    result = daemon_start()
-    console.print(result)
-
-
-@daemon_app.command("stop")
-def daemon_stop_cmd() -> None:
-    """Stop the agent daemon service."""
-    from agent.core.daemon import daemon_stop
-
-    result = daemon_stop()
-    console.print(result)
-
-
-@daemon_app.command("restart")
-def daemon_restart_cmd() -> None:
-    """Restart the agent daemon service."""
-    from agent.core.daemon import daemon_restart
-
-    result = daemon_restart()
-    console.print(result)
-
-
-@daemon_app.command("status")
-def daemon_status_cmd() -> None:
-    """Show the current daemon service status."""
-    from agent.core.daemon import daemon_status
-
-    status = daemon_status()
-
-    table = Table(title="Daemon Status")
-    table.add_column("Property", style="cyan")
-    table.add_column("Value")
-
-    table.add_row("Installed", "[green]Yes[/green]" if status.installed else "[red]No[/red]")
-    table.add_row("Running", "[green]Yes[/green]" if status.running else "[red]No[/red]")
-    if status.pid:
-        table.add_row("PID", str(status.pid))
-    if status.service_path:
-        table.add_row("Service File", status.service_path)
-    if status.log_path:
-        table.add_row("Log Directory", status.log_path)
-
-    console.print(table)

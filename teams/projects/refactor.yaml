@@ -1,0 +1,51 @@
+name: refactor
+description: "Code refactoring — analyze, plan, implement, test, review"
+stages:
+  - name: analyze
+    parallel: true
+    agents:
+      - team: engineering
+        role: code_reviewer
+      - team: quality
+        role: performance_engineer
+
+  - name: plan
+    agents:
+      - team: engineering
+        role: architect
+
+  - name: implement
+    feedback_target: true
+    parallel: true
+    agents:
+      - team: engineering
+        role: backend_developer
+      - team: engineering
+        role: frontend_developer
+
+  - name: test
+    parallel: true
+    agents:
+      - team: quality
+        role: qa_engineer
+      - team: quality
+        role: integration_tester
+    denied_tools:
+      - assign_task
+      - request_review
+      - ask_team
+    feedback:
+      fix_stage: implement
+      max_retries: 2
+
+  - name: review
+    parallel: true
+    agents:
+      - team: engineering
+        role: code_reviewer
+      - team: quality
+        role: security_reviewer
+    denied_tools:
+      - file_write
+      - assign_task
+      - request_review

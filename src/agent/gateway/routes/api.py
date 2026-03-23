@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from agent import __version__
@@ -52,6 +53,10 @@ router = APIRouter(prefix="/api/v1")
 
 # Track server start time for uptime
 _start_time = time.time()
+
+# Health check cache (result + timestamp)
+_health_cache: dict[str, Any] = {}
+_health_cache_ttl: float = 10.0  # seconds
 
 
 # --- Request / Response models ---
@@ -105,14 +110,76 @@ class MessageOut(BaseModel):
 
 
 @router.get("/health")
-async def health() -> dict[str, Any]:
-    """Health check — no auth required."""
-    return {
-        "status": "ok",
+async def health(
+    request: Request,
+    session_store: SessionStore = Depends(get_session_store),  # noqa: B008
+) -> dict[str, Any]:
+    """Health check — no auth required.
+
+    Includes database connectivity check, disk space, and DB size.
+    Results are cached for 10 seconds to avoid excessive checks.
+    """
+    # Return cached result if fresh enough
+    cached_at = _health_cache.get("_cached_at", 0.0)
+    if _health_cache and (time.time() - cached_at) < _health_cache_ttl:
+        return _health_cache["result"]
+
+    status = "ok"
+    db_status = "not_configured"
+    db_size_mb: float | None = None
+
+    # Check database connectivity via the session store's underlying DB
+    if session_store._db is not None:
+        try:
+            async with session_store._db.db.execute("SELECT 1") as cursor:
+                await cursor.fetchone()
+            db_status = "ok"
+
+            # Measure database size
+            try:
+                async with session_store._db.db.execute(
+                    "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()"
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        db_size_mb = round(row[0] / (1024 * 1024), 2)
+            except Exception:
+                pass
+        except Exception:
+            db_status = "error"
+            status = "degraded"
+
+    # Check disk space
+    try:
+        disk_usage = shutil.disk_usage("/")
+        disk_free_gb = round(disk_usage.free / (1024**3), 2)
+    except Exception:
+        disk_free_gb = -1.0
+
+    if disk_free_gb != -1.0 and disk_free_gb < 1.0:
+        status = "degraded"
+
+    # Check LLM availability
+    agent_loop = getattr(request.app.state, "agent_loop", None)
+    llm_status = "ok" if agent_loop and getattr(agent_loop, "llm", None) else "not_configured"
+
+    result: dict[str, Any] = {
+        "status": status,
         "version": __version__,
         "uptime_seconds": int(time.time() - _start_time),
         "timestamp": datetime.now().isoformat(),
+        "database": db_status,
+        "llm": llm_status,
+        "disk_free_gb": disk_free_gb,
     }
+    if db_size_mb is not None:
+        result["db_size_mb"] = db_size_mb
+
+    # Cache the result
+    _health_cache["result"] = result
+    _health_cache["_cached_at"] = time.time()
+
+    return result
 
 
 @router.get("/status")
@@ -212,10 +279,7 @@ async def get_messages(
             model=m.model,
             timestamp=m.timestamp.isoformat(),
             tool_calls=(
-                [
-                    {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
-                    for tc in m.tool_calls
-                ]
+                [{"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in m.tool_calls]
                 if m.tool_calls
                 else None
             ),
@@ -338,9 +402,7 @@ async def update_config(
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         logger.error("config_update_failed", section=section, error=str(e))
-        raise HTTPException(
-            status_code=500, detail=f"Failed to update config: {e}"
-        ) from e
+        raise HTTPException(status_code=500, detail=f"Failed to update config: {e}") from e
 
     return {
         "success": True,
@@ -428,15 +490,10 @@ async def delete_fact(
     if not fact_store:
         raise HTTPException(status_code=503, detail="Fact store not available")
 
-    # FactStore.delete works by key, but we need to find by ID first
-    # Get all facts and find the one with matching ID, then delete by key
-    all_facts = await fact_store.get_all(limit=10000)
-    target = next((f for f in all_facts if f.id == fact_id), None)
-    if not target:
+    deleted = await fact_store.delete_by_id(fact_id)
+    if not deleted:
         raise HTTPException(status_code=404, detail="Fact not found")
-
-    deleted = await fact_store.delete(target.key)
-    return {"success": deleted}
+    return {"success": True}
 
 
 @router.get("/memory/stats")
@@ -532,20 +589,22 @@ async def get_timeline(
         elif e.status == "denied":
             icon = "x-circle"
 
-        events.append({
-            "id": e.id,
-            "timestamp": e.timestamp.isoformat(),
-            "event": f"tool.{e.status}",
-            "description": f"{e.tool_name} → {e.status} ({e.duration_ms}ms)",
-            "details": {
-                "tool": e.tool_name,
-                "status": e.status,
-                "duration_ms": e.duration_ms,
-                "trigger": e.trigger,
-                "error": e.error,
-            },
-            "icon": icon,
-        })
+        events.append(
+            {
+                "id": e.id,
+                "timestamp": e.timestamp.isoformat(),
+                "event": f"tool.{e.status}",
+                "description": f"{e.tool_name} → {e.status} ({e.duration_ms}ms)",
+                "details": {
+                    "tool": e.tool_name,
+                    "status": e.status,
+                    "duration_ms": e.duration_ms,
+                    "trigger": e.trigger,
+                    "error": e.error,
+                },
+                "icon": icon,
+            }
+        )
 
     return {"events": events[:limit]}
 
@@ -576,13 +635,13 @@ async def get_soul(
     path = str(soul_loader.path) if soul_loader.path else ""
     last_modified = ""
     if soul_loader.path:
+
         def _get_mtime() -> str:
             soul_p = Path(soul_loader.path)  # type: ignore[arg-type]
             if soul_p.exists():
-                return datetime.fromtimestamp(
-                    soul_p.stat().st_mtime
-                ).isoformat()
+                return datetime.fromtimestamp(soul_p.stat().st_mtime).isoformat()
             return ""
+
         last_modified = await asyncio.to_thread(_get_mtime)
 
     return {
@@ -641,9 +700,7 @@ async def toggle_tool(
             tool_registry.disable_tool(tool_name)
     except Exception as e:
         logger.error("tool_toggle_failed", tool=tool_name, error=str(e))
-        raise HTTPException(
-            status_code=500, detail=f"Failed to toggle tool: {e}"
-        ) from e
+        raise HTTPException(status_code=500, detail=f"Failed to toggle tool: {e}") from e
 
     return {"success": True, "name": tool_name, "enabled": body.enabled}
 
@@ -696,9 +753,7 @@ async def create_task(
         raise HTTPException(status_code=503, detail="Task scheduler not available")
 
     if body.type not in ("reminder", "cron"):
-        raise HTTPException(
-            status_code=400, detail="Task type must be 'reminder' or 'cron'"
-        )
+        raise HTTPException(status_code=400, detail="Task type must be 'reminder' or 'cron'")
 
     try:
         if body.type == "reminder":
@@ -718,9 +773,7 @@ async def create_task(
             )
     except Exception as e:
         logger.error("task_create_failed", error=str(e))
-        raise HTTPException(
-            status_code=400, detail=f"Failed to create task: {e}"
-        ) from e
+        raise HTTPException(status_code=400, detail=f"Failed to create task: {e}") from e
 
     return {
         "id": task.id,
@@ -864,6 +917,7 @@ async def import_memory(
     stats = await exporter.import_json(temp_path, merge=merge)
 
     import os
+
     os.unlink(temp_path)
 
     return {"success": True, **stats}
@@ -981,22 +1035,26 @@ async def list_workspaces(
         try:
             ws = workspace_manager.resolve(name)
             active = workspace_manager.get_active()
-            results.append({
-                "name": ws.name,
-                "display_name": ws.display_name,
-                "description": ws.description or "",
-                "is_active": ws.name == active.name,
-                "model": ws.config.default_model,
-                "root_dir": str(ws.root_dir),
-            })
+            results.append(
+                {
+                    "name": ws.name,
+                    "display_name": ws.display_name,
+                    "description": ws.description or "",
+                    "is_active": ws.name == active.name,
+                    "model": ws.config.default_model,
+                    "root_dir": str(ws.root_dir),
+                }
+            )
         except Exception as e:
-            results.append({
-                "name": name,
-                "display_name": name,
-                "description": "",
-                "is_active": False,
-                "error": str(e),
-            })
+            results.append(
+                {
+                    "name": name,
+                    "display_name": name,
+                    "description": "",
+                    "is_active": False,
+                    "error": str(e),
+                }
+            )
 
     return results
 

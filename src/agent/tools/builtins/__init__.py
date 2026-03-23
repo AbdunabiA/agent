@@ -10,11 +10,15 @@ logger = structlog.get_logger(__name__)
 
 # Always-available tools (only core deps)
 from agent.tools.builtins import (  # noqa: F401, E402
+    collaboration,
+    controller,
     filesystem,
+    github,
     http,
     memory,
     monitor,
     orchestration,
+    planner_tools,
     python_exec,
     scheduler,
     send_file,
@@ -26,7 +30,7 @@ from agent.tools.builtins import (  # noqa: F401, E402
 )
 
 # Tools with optional dependencies — skip if not installed
-_optional_modules = ["browser", "desktop"]
+_optional_modules = ["browser", "desktop", "email_tool"]
 
 for _mod_name in _optional_modules:
     try:

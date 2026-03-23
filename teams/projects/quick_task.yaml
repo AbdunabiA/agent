@@ -1,0 +1,7 @@
+name: quick_task
+description: "Single-agent task — one fullstack developer handles everything"
+stages:
+  - name: execute
+    agents:
+      - team: engineering
+        role: fullstack_developer

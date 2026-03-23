@@ -61,9 +61,7 @@ def _validate_read_path(path: str) -> Path:
     root_resolved = Path(os.path.expanduser(root)).resolve()
 
     if not resolved.is_relative_to(root_resolved):
-        raise ToolPermissionError(
-            f"Access denied: {path} is outside allowed read root {root}"
-        )
+        raise ToolPermissionError(f"Access denied: {path} is outside allowed read root {root}")
 
     _check_deny_paths(resolved, deny_paths)
     return resolved
@@ -97,9 +95,7 @@ def _validate_write_path(path: str) -> Path:
 
     # Block system-critical files even if inside write_root
     # Resolve the system paths too so symlinks are handled (macOS: /etc → /private/etc)
-    system_files = {
-        str(Path(p).resolve()) for p in ("/etc/passwd", "/etc/shadow", "/etc/sudoers")
-    }
+    system_files = {str(Path(p).resolve()) for p in ("/etc/passwd", "/etc/shadow", "/etc/sudoers")}
     if str(resolved) in system_files:
         raise ToolPermissionError(f"Access denied: {resolved} is a protected system file")
 
@@ -123,9 +119,7 @@ def _validate_path(path: str, root: str) -> Path:
     resolved = Path(os.path.expanduser(path)).resolve()
     root_resolved = Path(os.path.expanduser(root)).resolve()
     if not resolved.is_relative_to(root_resolved):
-        raise ToolPermissionError(
-            f"Access denied: {path} is outside allowed root {root}"
-        )
+        raise ToolPermissionError(f"Access denied: {path} is outside allowed root {root}")
     return resolved
 
 
@@ -181,10 +175,14 @@ def _sync_read_file(resolved: Path, max_lines: int | None) -> str:
     return content
 
 
-def _sync_write_file(
-    resolved: Path, content: str, append: bool
-) -> str:
+def _sync_write_file(resolved: Path, content: str, append: bool) -> str:
     """Sync file write logic — run via asyncio.to_thread()."""
+    # Validate parent directory is within write root to prevent directory escape
+    _, write_root, _ = _get_fs_config()
+    write_root_resolved = Path(os.path.expanduser(write_root)).resolve()
+    if not resolved.parent.is_relative_to(write_root_resolved):
+        return f"[ERROR] Parent directory {resolved.parent} is outside write root {write_root}"
+
     resolved.parent.mkdir(parents=True, exist_ok=True)
 
     # Create backup before overwriting existing files
@@ -207,9 +205,7 @@ def _sync_write_file(
         return f"[ERROR] Cannot write file: {e}"
 
 
-def _sync_list_dir(
-    resolved: Path, max_depth: int, show_hidden: bool
-) -> str:
+def _sync_list_dir(resolved: Path, max_depth: int, show_hidden: bool) -> str:
     """Sync directory listing logic — run via asyncio.to_thread()."""
     if not resolved.exists():
         return f"[ERROR] Path not found: {resolved}"
@@ -328,9 +324,7 @@ async def file_write(path: str, content: str, append: bool = False) -> str:
     ),
     tier=ToolTier.SAFE,
 )
-async def file_list(
-    path: str = ".", max_depth: int = 1, show_hidden: bool = False
-) -> str:
+async def file_list(path: str = ".", max_depth: int = 1, show_hidden: bool = False) -> str:
     """List directory contents.
 
     Args:

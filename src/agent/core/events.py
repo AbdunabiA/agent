@@ -81,12 +81,52 @@ class Events:
     DISCUSSION_CONSENSUS_REACHED = "discussion.consensus.reached"
     DISCUSSION_COMPLETED = "discussion.completed"
 
+    # Worker resilience
+    WORKER_RETRYING = "worker.retrying"
+    WORKER_FAILED = "worker.failed"
+    WORKER_SUCCEEDED = "worker.succeeded"
+
     # Controller agent
     CONTROLLER_TASK_STARTED = "controller.task.started"
     CONTROLLER_TASK_PROGRESS = "controller.task.progress"
     CONTROLLER_TASK_COMPLETED = "controller.task.completed"
     CONTROLLER_TASK_FAILED = "controller.task.failed"
     CONTROLLER_TASK_CANCELLED = "controller.task.cancelled"
+
+    # Task lifecycle (fire-and-forget notifications)
+    TASK_ACCEPTED = "task.accepted"
+    TASK_COMPLETED_NOTIFY = "task.completed.notify"
+    TASK_FAILED_NOTIFY = "task.failed.notify"
+    ROUND_STARTED = "task.round.started"
+    ROUND_COMPLETED = "task.round.completed"
+    TEAM_FINISHED = "task.team.finished"
+
+    # Project planner pipeline
+    PLAN_CREATED = "plan.created"
+    PLAN_APPROVED = "plan.approved"
+    PLAN_TASK_STARTED = "plan.task.started"
+    PLAN_TASK_COMPLETED = "plan.task.completed"
+    PLAN_TASK_FAILED = "plan.task.failed"
+    PLAN_PROGRESS = "plan.progress"
+    PLAN_COMPLETED = "plan.completed"
+
+    # Inter-agent messaging
+    MESSAGE_SENT = "message.sent"
+    MESSAGE_READ = "message.read"
+    MESSAGE_BROADCAST = "message.broadcast"
+
+    # Pipeline re-planning
+    PIPELINE_REPLANNED = "pipeline.replanned"
+    PIPELINE_STAGE_SKIPPED = "pipeline.stage.skipped"
+
+    # Shared working memory
+    FINDING_SAVED = "finding.saved"
+    FINDING_VALIDATED = "finding.validated"
+
+    # Quality gates
+    QUALITY_GATE_PASSED = "quality.gate.passed"
+    QUALITY_GATE_FAILED = "quality.gate.failed"
+    QUALITY_ISSUES_ROUTED = "quality.issues.routed"
 
     # Proactive autonomy
     PROACTIVE_MESSAGE = "proactive.message"

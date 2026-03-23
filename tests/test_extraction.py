@@ -49,9 +49,9 @@ class TestParseFactsJson:
     def test_json_array_in_surrounding_text(self) -> None:
         """Extracts JSON array from surrounding text."""
         text = (
-            'Here are the facts:\n'
+            "Here are the facts:\n"
             '[{"key": "user.name", "value": "Eve", "category": "user"}]'
-            '\nDone.'
+            "\nDone."
         )
         result = _parse_facts_json(text)
         assert len(result) == 1
@@ -83,10 +83,12 @@ class TestFactExtractor:
         self, mock_llm: MagicMock, mock_fact_store: MagicMock
     ) -> None:
         """Extract facts from messages successfully."""
-        facts_json = json.dumps([
-            {"key": "user.name", "value": "Alice", "category": "user"},
-            {"key": "preference.language", "value": "Python", "category": "preference"},
-        ])
+        facts_json = json.dumps(
+            [
+                {"key": "user.name", "value": "Alice", "category": "user"},
+                {"key": "preference.language", "value": "Python", "category": "preference"},
+            ]
+        )
         mock_llm.completion.return_value = MagicMock(content=facts_json)
 
         # Mock fact_store.set to return a Fact-like object
@@ -114,24 +116,20 @@ class TestFactExtractor:
     ) -> None:
         """Disabled extractor returns empty list."""
         extractor = FactExtractor(mock_llm, mock_fact_store, enabled=False)
-        result = await extractor.extract_from_messages(
-            [{"role": "user", "content": "hello"}]
-        )
+        result = await extractor.extract_from_messages([{"role": "user", "content": "hello"}])
         assert result == []
         mock_llm.completion.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_llm_failure_returns_empty(
+    async def test_llm_failure_returns_none(
         self, mock_llm: MagicMock, mock_fact_store: MagicMock
     ) -> None:
-        """LLM failure returns empty list."""
+        """LLM failure returns None to distinguish from 'no facts found'."""
         mock_llm.completion.side_effect = Exception("API error")
 
         extractor = FactExtractor(mock_llm, mock_fact_store)
-        result = await extractor.extract_from_messages(
-            [{"role": "user", "content": "test"}]
-        )
-        assert result == []
+        result = await extractor.extract_from_messages([{"role": "user", "content": "test"}])
+        assert result is None
 
     @pytest.mark.asyncio
     async def test_extract_from_session_last_pair(
@@ -169,18 +167,18 @@ class TestFactExtractor:
         self, mock_llm: MagicMock, mock_fact_store: MagicMock
     ) -> None:
         """Facts with empty key or value are skipped."""
-        facts_json = json.dumps([
-            {"key": "", "value": "Alice", "category": "user"},
-            {"key": "user.name", "value": "", "category": "user"},
-            {"key": "valid.key", "value": "valid value", "category": "general"},
-        ])
+        facts_json = json.dumps(
+            [
+                {"key": "", "value": "Alice", "category": "user"},
+                {"key": "user.name", "value": "", "category": "user"},
+                {"key": "valid.key", "value": "valid value", "category": "general"},
+            ]
+        )
         mock_llm.completion.return_value = MagicMock(content=facts_json)
         mock_fact_store.set.return_value = MagicMock()
 
         extractor = FactExtractor(mock_llm, mock_fact_store)
-        result = await extractor.extract_from_messages(
-            [{"role": "user", "content": "test"}]
-        )
+        result = await extractor.extract_from_messages([{"role": "user", "content": "test"}])
 
         assert len(result) == 1
         assert mock_fact_store.set.call_count == 1

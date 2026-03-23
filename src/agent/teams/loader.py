@@ -91,16 +91,12 @@ def parse_team_file(path: Path) -> list[AgentTeamConfig]:
     elif isinstance(data, list):
         items = data
     else:
-        raise TeamLoadError(
-            f"Expected dict or list in {path}, got {type(data).__name__}"
-        )
+        raise TeamLoadError(f"Expected dict or list in {path}, got {type(data).__name__}")
 
     configs: list[AgentTeamConfig] = []
     for i, item in enumerate(items):
         if not isinstance(item, dict):
-            raise TeamLoadError(
-                f"Item {i} in {path} is not a dict: {type(item).__name__}"
-            )
+            raise TeamLoadError(f"Item {i} in {path} is not a dict: {type(item).__name__}")
         try:
             config = _parse_team_dict(item, source=str(path))
             configs.append(config)
@@ -286,9 +282,7 @@ def parse_project_file(path: Path) -> list[Project]:
     elif isinstance(data, list):
         items = data
     else:
-        raise TeamLoadError(
-            f"Expected dict or list in {path}, got {type(data).__name__}"
-        )
+        raise TeamLoadError(f"Expected dict or list in {path}, got {type(data).__name__}")
 
     projects: list[Project] = []
     for item in items:
@@ -314,26 +308,22 @@ def _parse_project_dict(data: dict[str, Any], source: str = "") -> Project:
             if not isinstance(agent_data, dict):
                 raise TeamLoadError(f"Agent ref must be a dict in {source}")
             if "team" not in agent_data or "role" not in agent_data:
-                raise TeamLoadError(
-                    f"Agent ref must have 'team' and 'role' fields in {source}"
+                raise TeamLoadError(f"Agent ref must have 'team' and 'role' fields in {source}")
+            agents.append(
+                ProjectAgentRef(
+                    team=agent_data["team"],
+                    role=agent_data["role"],
                 )
-            agents.append(ProjectAgentRef(
-                team=agent_data["team"],
-                role=agent_data["role"],
-            ))
+            )
 
         # Parse feedback config
         feedback: FeedbackConfig | None = None
         feedback_data = stage_data.get("feedback")
         if feedback_data is not None:
             if not isinstance(feedback_data, dict):
-                raise TeamLoadError(
-                    f"Stage feedback must be a dict in {source}"
-                )
+                raise TeamLoadError(f"Stage feedback must be a dict in {source}")
             if "fix_stage" not in feedback_data:
-                raise TeamLoadError(
-                    f"Stage feedback must have 'fix_stage' field in {source}"
-                )
+                raise TeamLoadError(f"Stage feedback must have 'fix_stage' field in {source}")
             feedback = FeedbackConfig(
                 fix_stage=feedback_data["fix_stage"],
                 max_retries=feedback_data.get("max_retries", 3),
@@ -345,28 +335,22 @@ def _parse_project_dict(data: dict[str, Any], source: str = "") -> Project:
         mode = stage_data.get("mode", "standard")
         if mode not in ("standard", "discussion"):
             raise TeamLoadError(
-                f"Invalid stage mode '{mode}' in {source}. "
-                f"Must be 'standard' or 'discussion'."
+                f"Invalid stage mode '{mode}' in {source}. " f"Must be 'standard' or 'discussion'."
             )
 
         discussion: DiscussionConfig | None = None
         discussion_data = stage_data.get("discussion")
         if discussion_data is not None:
             if not isinstance(discussion_data, dict):
-                raise TeamLoadError(
-                    f"Stage discussion must be a dict in {source}"
-                )
+                raise TeamLoadError(f"Stage discussion must be a dict in {source}")
             moderator: ProjectAgentRef | None = None
             mod_data = discussion_data.get("moderator")
             if mod_data is not None:
                 if not isinstance(mod_data, dict):
-                    raise TeamLoadError(
-                        f"Discussion moderator must be a dict in {source}"
-                    )
+                    raise TeamLoadError(f"Discussion moderator must be a dict in {source}")
                 if "team" not in mod_data or "role" not in mod_data:
                     raise TeamLoadError(
-                        f"Discussion moderator must have 'team' and 'role' "
-                        f"fields in {source}"
+                        f"Discussion moderator must have 'team' and 'role' " f"fields in {source}"
                     )
                 moderator = ProjectAgentRef(
                     team=mod_data["team"],
@@ -376,25 +360,28 @@ def _parse_project_dict(data: dict[str, Any], source: str = "") -> Project:
                 rounds=discussion_data.get("rounds", 3),
                 moderator=moderator,
                 consensus_required=discussion_data.get(
-                    "consensus_required", False,
+                    "consensus_required",
+                    False,
                 ),
             )
 
         if mode == "discussion" and discussion is None:
             raise TeamLoadError(
-                f"Stage mode is 'discussion' but no discussion config "
-                f"provided in {source}"
+                f"Stage mode is 'discussion' but no discussion config " f"provided in {source}"
             )
 
-        stages.append(ProjectStage(
-            name=stage_data.get("name", f"stage_{len(stages)}"),
-            agents=agents,
-            parallel=stage_data.get("parallel", True),
-            feedback=feedback,
-            feedback_target=feedback_target,
-            mode=mode,
-            discussion=discussion,
-        ))
+        stages.append(
+            ProjectStage(
+                name=stage_data.get("name", f"stage_{len(stages)}"),
+                agents=agents,
+                parallel=stage_data.get("parallel", True),
+                feedback=feedback,
+                feedback_target=feedback_target,
+                mode=mode,
+                discussion=discussion,
+                denied_tools=stage_data.get("denied_tools", []),
+            )
+        )
 
     # Validate feedback stage references
     stage_names = {s.name for s in stages}
@@ -404,6 +391,17 @@ def _parse_project_dict(data: dict[str, Any], source: str = "") -> Project:
                 f"Feedback fix_stage '{stage.feedback.fix_stage}' not found "
                 f"in project '{name}'. Available stages: "
                 f"{', '.join(stage_names)} (in {source})"
+            )
+
+    # Warn about denied_tools that don't exist in the tool registry
+    # (catches typos and stale references at load time)
+    for stage in stages:
+        if stage.denied_tools:
+            logger.debug(
+                "project_stage_denied_tools",
+                project=name,
+                stage=stage.name,
+                denied_tools=stage.denied_tools,
             )
 
     return Project(name=name, description=description, stages=stages)

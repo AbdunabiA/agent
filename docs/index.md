@@ -11,6 +11,8 @@
 - [Configuration](configuration.md) — Full config reference
 - [Tools](tools.md) — Built-in tools reference
 - [Skills](skills.md) — Creating and using skills
+- [Orchestration](orchestration.md) — Multi-agent teams and project pipelines
+- [Workspaces](workspaces.md) — Workspace isolation and routing
 - [Telegram](telegram.md) — Telegram bot setup
 - [Dashboard](dashboard.md) — React dashboard guide
 - [Memory](memory.md) — Memory system explained
@@ -20,6 +22,8 @@
 - [API](api.md) — REST and WebSocket API reference
 - [Security](security.md) — Security model and permissions
 - [Deployment](deployment.md) — Docker, systemd, reverse proxy
+- [Troubleshooting](troubleshooting.md) — Common issues and solutions
+- [Migration](migration.md) — Database schema versions and migration
 
 ## Project
 

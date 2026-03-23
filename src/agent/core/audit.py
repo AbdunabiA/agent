@@ -8,6 +8,7 @@ Phase 4: Upgraded to SQLite persistence with in-memory fallback.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -19,6 +20,24 @@ if TYPE_CHECKING:
     from agent.memory.database import Database
 
 logger = structlog.get_logger(__name__)
+
+# Regex to match JSON keys containing sensitive terms and their values
+_SENSITIVE_KEY_PATTERN = re.compile(
+    r'("(?:[^"]*(?:password|api_key|token|secret|auth|credential)[^"]*)"'
+    r'\s*:\s*)"(?:[^"\\]|\\.)*"',
+    re.IGNORECASE,
+)
+
+_MAX_AUDIT_DATA_LENGTH = 10000
+
+
+def _mask_secrets(data: str) -> str:
+    """Mask sensitive values in serialized data.
+
+    Replaces values of JSON keys containing password, api_key, token,
+    secret, auth, or credential with ***MASKED***.
+    """
+    return _SENSITIVE_KEY_PATTERN.sub(r'\1"***MASKED***"', data)
 
 
 @dataclass
@@ -37,6 +56,7 @@ class AuditEntry:
     session_id: str
     approved_by: str
     error: str | None = None
+    request_id: str = ""
 
 
 class AuditLog:
@@ -62,6 +82,7 @@ class AuditLog:
         session_id: str,
         approved_by: str = "auto",
         error: str | None = None,
+        request_id: str = "",
     ) -> AuditEntry:
         """Log a tool execution.
 
@@ -76,31 +97,39 @@ class AuditLog:
             session_id: Session identifier.
             approved_by: How the execution was approved.
             error: Error message if failed.
+            request_id: Optional request ID for tracing.
 
         Returns:
             The created AuditEntry.
         """
+        # Mask secrets in input and output data before storing
+        masked_input_str = _mask_secrets(json.dumps(input_data))
+        masked_input = json.loads(masked_input_str)
+        masked_output = _mask_secrets(output[:10240])
+
         entry = AuditEntry(
             id=str(uuid4()),
             timestamp=datetime.now(),
             tool_name=tool_name,
             tool_call_id=tool_call_id,
-            input_data=input_data,
-            output=output[:10240],  # Truncate output to 10KB in audit
+            input_data=masked_input,
+            output=masked_output,
             status=status,
             duration_ms=duration_ms,
             trigger=trigger,
             session_id=session_id,
             approved_by=approved_by,
             error=error,
+            request_id=request_id,
         )
 
         if self._db:
             await self._db.db.execute(
                 """INSERT INTO audit_log
                    (id, timestamp, tool_name, tool_call_id, input_data, output,
-                    status, duration_ms, trigger, session_id, approved_by, error)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    status, duration_ms, trigger, session_id, approved_by, error,
+                    request_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     entry.id,
                     entry.timestamp.isoformat(),
@@ -114,6 +143,7 @@ class AuditLog:
                     entry.session_id,
                     entry.approved_by,
                     entry.error,
+                    entry.request_id,
                 ),
             )
             await self._db.db.commit()
@@ -196,6 +226,7 @@ class AuditLog:
                 session_id=row["session_id"],
                 approved_by=row["approved_by"],
                 error=row["error"],
+                request_id=row["request_id"] if "request_id" in row.keys() else "",  # noqa: SIM118
             )
             for row in rows
         ]

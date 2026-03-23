@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -68,9 +67,7 @@ class TestSendFile:
         assert "[ERROR]" in result
         assert "not found" in result.lower()
 
-    async def test_directory_returns_error(
-        self, event_bus: EventBus, tmp_path: Path
-    ):
+    async def test_directory_returns_error(self, event_bus: EventBus, tmp_path: Path):
         """Returns error when path is a directory."""
         set_file_send_bus(event_bus)
         set_file_send_context(channel="telegram", user_id="123")
@@ -78,9 +75,7 @@ class TestSendFile:
         assert "[ERROR]" in result
         assert "Not a file" in result
 
-    async def test_empty_file_returns_error(
-        self, event_bus: EventBus, tmp_path: Path
-    ):
+    async def test_empty_file_returns_error(self, event_bus: EventBus, tmp_path: Path):
         """Returns error for empty files."""
         empty_file = tmp_path / "empty.txt"
         empty_file.write_text("")
@@ -90,9 +85,7 @@ class TestSendFile:
         assert "[ERROR]" in result
         assert "empty" in result.lower()
 
-    async def test_successful_send_emits_event(
-        self, event_bus: EventBus, tmp_path: Path
-    ):
+    async def test_successful_send_emits_event(self, event_bus: EventBus, tmp_path: Path):
         """Emits FILE_SEND event and returns confirmation on success."""
         test_file = tmp_path / "hello.txt"
         test_file.write_text("Hello, world!")
@@ -112,9 +105,7 @@ class TestSendFile:
         assert data["channel"] == "telegram"
         assert data["user_id"] == "42"
 
-    async def test_send_without_caption(
-        self, event_bus: EventBus, tmp_path: Path
-    ):
+    async def test_send_without_caption(self, event_bus: EventBus, tmp_path: Path):
         """Works with empty caption."""
         test_file = tmp_path / "data.csv"
         test_file.write_text("a,b,c\n1,2,3")

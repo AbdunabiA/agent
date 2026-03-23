@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -26,10 +26,12 @@ _global_scheduler: Any | None = None  # TaskScheduler
 
 # Per-task context vars — safe for concurrent asyncio tasks (GAP 15)
 _channel_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "tg_post_channel", default=None,
+    "tg_post_channel",
+    default=None,
 )
 _user_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "tg_post_user_id", default=None,
+    "tg_post_user_id",
+    default=None,
 )
 
 
@@ -46,7 +48,8 @@ def set_telegram_post_scheduler(scheduler: Any) -> None:
 
 
 def set_telegram_post_context(
-    channel: str | None = None, user_id: str | None = None,
+    channel: str | None = None,
+    user_id: str | None = None,
 ) -> None:
     """Update the current channel/user context."""
     _channel_var.set(channel)
@@ -72,14 +75,23 @@ def _parse_delay(delay_str: str) -> timedelta | None:
 
     # Natural language: "5 minutes", "2 hours"
     natural = re.findall(
-        r"(\d+)\s*(seconds?|minutes?|mins?|hours?|hrs?|days?)", delay_str,
+        r"(\d+)\s*(seconds?|minutes?|mins?|hours?|hrs?|days?)",
+        delay_str,
     )
     if natural:
         mult = {
-            "second": 1, "seconds": 1,
-            "minute": 60, "minutes": 60, "min": 60, "mins": 60,
-            "hour": 3600, "hours": 3600, "hr": 3600, "hrs": 3600,
-            "day": 86400, "days": 86400,
+            "second": 1,
+            "seconds": 1,
+            "minute": 60,
+            "minutes": 60,
+            "min": 60,
+            "mins": 60,
+            "hour": 3600,
+            "hours": 3600,
+            "hr": 3600,
+            "hrs": 3600,
+            "day": 86400,
+            "days": 86400,
         }
         total = sum(int(v) * mult.get(u, 60) for v, u in natural)
         return timedelta(seconds=total)
@@ -256,7 +268,10 @@ async def schedule_post(
 
     td = _parse_delay(delay)
     if td is None:
-        return f"[ERROR] Could not parse delay: '{delay}'. Use formats like '5m', '1h', '30 minutes'."
+        return (
+            f"[ERROR] Could not parse delay: '{delay}'."
+            " Use formats like '5m', '1h', '30 minutes'."
+        )
 
     if td.total_seconds() < 10:
         return "[ERROR] Delay must be at least 10 seconds."
@@ -270,7 +285,7 @@ async def schedule_post(
             return f"[ERROR] Photo not found: {resolved}"
         photo_path = str(resolved)
 
-    run_at = datetime.now(tz=timezone.utc) + td
+    run_at = datetime.now(tz=UTC) + td
 
     if _global_scheduler is None:
         return "[ERROR] Scheduler not available — cannot schedule posts."
@@ -279,12 +294,14 @@ async def schedule_post(
     # can reconstruct the CHANNEL_POST event. The description is stored
     # in the scheduler's task list and is visible via list_reminders/
     # cancel_reminder tools.
-    post_meta = json.dumps({
-        "chat_id": chat_id.strip(),
-        "photo_path": photo_path,
-        "pin": pin,
-        "parse_mode": parse_mode,
-    })
+    post_meta = json.dumps(
+        {
+            "chat_id": chat_id.strip(),
+            "photo_path": photo_path,
+            "pin": pin,
+            "parse_mode": parse_mode,
+        }
+    )
     description = f"[scheduled_post:{post_meta}] {text}"
 
     task = await _global_scheduler.add_reminder(

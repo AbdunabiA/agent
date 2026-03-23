@@ -57,7 +57,7 @@ class FactExtractor:
 
     def __init__(
         self,
-        llm: LLMProvider,
+        llm: LLMProvider | None,
         fact_store: FactStore,
         enabled: bool = True,
     ) -> None:
@@ -65,9 +65,7 @@ class FactExtractor:
         self.fact_store = fact_store
         self.enabled = enabled
 
-    async def extract_from_messages(
-        self, messages: list[dict[str, str]]
-    ) -> list[Fact]:
+    async def extract_from_messages(self, messages: list[dict[str, str]]) -> list[Fact] | None:
         """Extract facts from a list of messages.
 
         Sends the messages to the LLM with the extraction prompt,
@@ -77,30 +75,39 @@ class FactExtractor:
             messages: List of message dicts with "role" and "content" keys.
 
         Returns:
-            List of stored Fact objects. Empty list on failure or if disabled.
+            List of stored Fact objects (empty if disabled/no facts), or None on LLM failure.
         """
         if not self.enabled or not messages:
             return []
 
         # Format messages for the prompt
         formatted = "\n".join(
-            f"{msg.get('role', 'unknown')}: {msg.get('content', '')}"
-            for msg in messages
+            f"{msg.get('role', 'unknown')}: {msg.get('content', '')}" for msg in messages
         )
 
         prompt_text = EXTRACTION_PROMPT.format(messages=formatted)
 
         try:
-            response = await self.llm.completion(
-                messages=[{"role": "user", "content": prompt_text}],
-                temperature=0.2,
-                max_tokens=1024,
-            )
+            if self.llm is not None:
+                response = await self.llm.completion(
+                    messages=[{"role": "user", "content": prompt_text}],
+                    temperature=0.2,
+                    max_tokens=1024,
+                )
+                content = response.content
+            else:
+                from agent.llm.fallback import llm_complete
+
+                content = await llm_complete(
+                    prompt=prompt_text,
+                    temperature=0.2,
+                    max_tokens=1024,
+                )
         except Exception as e:
             logger.warning("fact_extraction_llm_failed", error=str(e))
-            return []
+            return None
 
-        raw_facts = _parse_facts_json(response.content)
+        raw_facts = _parse_facts_json(content)
         if not raw_facts:
             return []
 
@@ -130,7 +137,7 @@ class FactExtractor:
 
         return stored_facts
 
-    async def extract_from_session(self, session: Session) -> list[Fact]:
+    async def extract_from_session(self, session: Session) -> list[Fact] | None:
         """Extract facts from the last user+assistant message pair in a session.
 
         Only processes the last 2 messages to avoid re-extracting old facts.
@@ -139,7 +146,7 @@ class FactExtractor:
             session: The conversation session.
 
         Returns:
-            List of extracted Fact objects.
+            List of extracted Fact objects, or None on LLM failure.
         """
         if not self.enabled:
             return []

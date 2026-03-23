@@ -8,8 +8,13 @@ import json
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+import structlog
+
+from agent.core.events import Events
 from agent.core.subagent import SubAgentStatus
 from agent.tools.registry import ToolTier, tool
+
+logger = structlog.get_logger(__name__)
 
 if TYPE_CHECKING:
     from agent.core.orchestrator import SubAgentOrchestrator
@@ -35,6 +40,7 @@ def _register_task_user(task_id: str) -> None:
         return
     try:
         from agent.tools.builtins.scheduler import _user_id_var
+
         user_id = _user_id_var.get("")
         if user_id:
             _task_user_callback(task_id, user_id)
@@ -46,7 +52,8 @@ def _register_task_user(task_id: str) -> None:
 # Set by the orchestrator before running each subagent so that tools
 # can determine the correct depth without scanning all running tasks.
 _nesting_depth_var: contextvars.ContextVar[int] = contextvars.ContextVar(
-    "orchestration_nesting_depth", default=0,
+    "orchestration_nesting_depth",
+    default=0,
 )
 
 
@@ -81,8 +88,7 @@ def get_orchestrator() -> SubAgentOrchestrator:
     """
     if _global_orchestrator is None:
         raise RuntimeError(
-            "Orchestrator not initialized. "
-            "Enable orchestration in config and restart."
+            "Orchestrator not initialized. " "Enable orchestration in config and restart."
         )
     return _global_orchestrator
 
@@ -105,6 +111,7 @@ async def spawn_subagent_tool(
     model: str = "",
     allowed_tools: str = "",
     max_iterations: int = 5,
+    mode: str = "sync",
 ) -> str:
     """Spawn a single sub-agent.
 
@@ -116,6 +123,7 @@ async def spawn_subagent_tool(
         model: Optional model override.
         allowed_tools: Comma-separated list of tool names (empty = all safe+moderate).
         max_iterations: Max tool-calling iterations.
+        mode: "sync" to wait for results, "async" to fire and forget.
 
     Returns:
         Sub-agent result.
@@ -124,20 +132,58 @@ async def spawn_subagent_tool(
 
     orchestrator = get_orchestrator()
 
-    tools_list = [t.strip() for t in allowed_tools.split(",") if t.strip()] or []
+    # Look up the role in the registry — use the detailed persona
+    # from teams/*.yaml instead of the generic one the controller passes.
+    registry_role: SubAgentRole | None = None
+    try:
+        if hasattr(orchestrator, "_role_registry"):
+            registry_role = orchestrator._role_registry.get_role(role_name)  # type: ignore[union-attr]
+    except Exception:
+        pass
 
-    role = SubAgentRole(
-        name=role_name,
-        persona=persona,
-        model=model or None,
-        allowed_tools=tools_list,
-        max_iterations=min(max_iterations, 10),
-    )
+    # Also try via controller's registry
+    if registry_role is None:
+        try:
+            from agent.tools.builtins.controller import get_controller
+
+            controller = get_controller()
+            if controller.role_registry is not None:
+                clean_name = role_name.split("/")[-1] if "/" in role_name else role_name
+                registry_role = controller.role_registry.get_role(clean_name)
+        except Exception:
+            pass
+
+    if registry_role is not None:
+        role = SubAgentRole(
+            name=registry_role.name,
+            persona=registry_role.persona,
+            model=model or registry_role.model,
+            allowed_tools=registry_role.allowed_tools,
+            denied_tools=registry_role.denied_tools,
+            max_iterations=(
+                min(max_iterations, 100) if max_iterations != 5 else registry_role.max_iterations
+            ),
+        )
+        logger.info(
+            "spawn_subagent_role_from_registry",
+            role=role.name,
+            persona_len=len(role.persona),
+        )
+    else:
+        tools_list = [t.strip() for t in allowed_tools.split(",") if t.strip()] or []
+        role = SubAgentRole(
+            name=role_name,
+            persona=persona,
+            model=model or None,
+            allowed_tools=tools_list,
+            max_iterations=min(max_iterations, 100),
+        )
 
     task = SubAgentTask(
         role=role,
         instruction=instruction,
         context=context,
+        timeout_seconds=orchestrator.config.subagent_timeout,
     )
 
     import uuid as _uuid
@@ -145,6 +191,12 @@ async def spawn_subagent_tool(
     task_id = task.task_id or f"sa-{_uuid.uuid4().hex[:8]}"
     task.task_id = task_id
     _register_task_user(task_id)
+
+    if mode == "sync":
+        result = await orchestrator.spawn_subagent(task)
+        if result.status == SubAgentStatus.COMPLETED:
+            return f"Sub-agent '{role_name}' completed:\n\n{result.output}"
+        return f"Sub-agent '{role_name}' failed: {result.error or 'unknown error'}"
 
     # Fire and forget — the subagent runs in the background.
     # Status updates are pushed to the user via event bus.
@@ -168,12 +220,13 @@ async def spawn_subagent_tool(
     ),
     tier=ToolTier.MODERATE,
 )
-async def spawn_parallel_tool(agents: str) -> str:
+async def spawn_parallel_tool(agents: str, mode: str = "sync") -> str:
     """Spawn multiple sub-agents concurrently.
 
     Args:
         agents: JSON array of objects with keys: role_name, instruction,
                 persona (optional), context (optional), allowed_tools (optional).
+        mode: "sync" to wait for all results, "async" to fire and forget.
 
     Returns:
         Combined results from all sub-agents.
@@ -204,13 +257,16 @@ async def spawn_parallel_tool(agents: str) -> str:
             persona=spec.get("persona", "You are a helpful assistant."),
             model=spec.get("model") or None,
             allowed_tools=allowed,
-            max_iterations=min(spec.get("max_iterations", 5), 10),
+            max_iterations=min(spec.get("max_iterations", 60), 100),
         )
-        tasks.append(SubAgentTask(
-            role=role,
-            instruction=spec.get("instruction", ""),
-            context=spec.get("context", ""),
-        ))
+        tasks.append(
+            SubAgentTask(
+                role=role,
+                instruction=spec.get("instruction", ""),
+                context=spec.get("context", ""),
+                timeout_seconds=orchestrator.config.subagent_timeout,
+            )
+        )
 
     if not tasks:
         return "No valid agent specs provided"
@@ -219,6 +275,19 @@ async def spawn_parallel_tool(agents: str) -> str:
 
     group_id = f"par-{_uuid.uuid4().hex[:8]}"
     _register_task_user(group_id)
+
+    if mode == "sync":
+        results = await orchestrator.spawn_parallel(tasks)
+        lines = [f"All {len(results)} agents completed:\n"]
+        for r in results:
+            status_icon = "\u2705" if r.status == SubAgentStatus.COMPLETED else "\u274c"
+            lines.append(f"{status_icon} {r.role_name}:")
+            if r.output:
+                lines.append(r.output)
+            if r.error:
+                lines.append(f"Error: {r.error}")
+            lines.append("")
+        return "\n".join(lines)
 
     # Fire and forget — agents run in the background.
     future = asyncio.ensure_future(orchestrator.spawn_parallel(tasks))
@@ -246,6 +315,7 @@ async def spawn_team_tool(
     team_name: str,
     instruction: str,
     context: str = "",
+    mode: str = "sync",
 ) -> str:
     """Spawn a team of sub-agents.
 
@@ -253,6 +323,7 @@ async def spawn_team_tool(
         team_name: Name of the pre-defined team.
         instruction: Task for the team to accomplish.
         context: Additional context for all team members.
+        mode: "sync" to wait for results, "async" to fire and forget.
 
     Returns:
         Combined team results.
@@ -263,6 +334,23 @@ async def spawn_team_tool(
 
     group_id = f"team-{_uuid.uuid4().hex[:8]}"
     _register_task_user(group_id)
+
+    if mode == "sync":
+        results = await orchestrator.spawn_team(
+            team_name=team_name,
+            instruction=instruction,
+            context=context,
+        )
+        lines = [f"Team '{team_name}' completed ({len(results)} agents):\n"]
+        for r in results:
+            status_icon = "\u2705" if r.status == SubAgentStatus.COMPLETED else "\u274c"
+            lines.append(f"{status_icon} {r.role_name}:")
+            if r.output:
+                lines.append(r.output)
+            if r.error:
+                lines.append(f"Error: {r.error}")
+            lines.append("")
+        return "\n".join(lines)
 
     # Fire and forget — team runs in the background.
     future = asyncio.ensure_future(
@@ -336,7 +424,7 @@ async def get_status_tool(task_id: str) -> str:
         f"Status: {result.status}",
     ]
     if result.output:
-        lines.append(f"Output: {result.output[:500]}")
+        lines.append(f"Output: {result.output}")
     if result.error:
         lines.append(f"Error: {result.error}")
 
@@ -466,9 +554,7 @@ async def delegate_to_specialist_tool(
     # Use context var for accurate caller-specific nesting depth
     nesting_depth = get_nesting_depth()
 
-    delegation_mode = (
-        DelegationMode.ASYNC if mode == "async" else DelegationMode.SYNC
-    )
+    delegation_mode = DelegationMode.ASYNC if mode == "async" else DelegationMode.SYNC
 
     import uuid as _uuid
 
@@ -500,10 +586,7 @@ async def delegate_to_specialist_tool(
         ]
         return "\n".join(lines)
     else:
-        return (
-            f"Delegation to {result.target_role} [{result.status}]: "
-            f"{result.error}"
-        )
+        return f"Delegation to {result.target_role} [{result.status}]: " f"{result.error}"
 
 
 @tool(
@@ -520,6 +603,7 @@ async def run_project_tool(
     project_name: str,
     instruction: str,
     context: str = "",
+    mode: str = "sync",
 ) -> str:
     """Run a project pipeline.
 
@@ -527,6 +611,7 @@ async def run_project_tool(
         project_name: Name of the project to run.
         instruction: Task instruction for the project.
         context: Initial context for the first stage.
+        mode: "sync" to wait for results, "async" to fire and forget.
 
     Returns:
         Combined project results from all stages.
@@ -536,7 +621,38 @@ async def run_project_tool(
     import uuid as _uuid
 
     task_id = f"proj-{_uuid.uuid4().hex[:8]}"
+
+    # Validate project exists before registering user
+    proj = orchestrator.projects.get(project_name)
+    if not proj:
+        available = ", ".join(orchestrator.projects.keys()) or "none"
+        return f"Unknown project: '{project_name}'. Available: {available}"
+
     _register_task_user(task_id)
+
+    if mode == "sync":
+        project_result = await orchestrator.run_project(
+            project_name=project_name,
+            instruction=instruction,
+            context=context,
+        )
+        status_icon = "\u2705" if project_result.status == SubAgentStatus.COMPLETED else "\u274c"
+        lines = [
+            f"{status_icon} Project '{project_name}' " f"({len(project_result.stages)} stages):\n"
+        ]
+        if project_result.final_output:
+            lines.append(project_result.final_output[:2000])
+        else:
+            for stage in project_result.stages:
+                lines.append(f"\n--- {stage.stage_name} ---")
+                if stage.combined_output:
+                    lines.append(stage.combined_output)
+                for r in stage.results:
+                    if r.error:
+                        lines.append(f"Error ({r.role_name}): {r.error}")
+        if project_result.error:
+            lines.append(f"\nProject error: {project_result.error}")
+        return "\n".join(lines)
 
     # Fire and forget — project pipeline runs in the background.
     # Status updates for each stage/agent are pushed via event bus.
@@ -549,7 +665,70 @@ async def run_project_tool(
     )
     orchestrator._async_futures[task_id] = future
 
-    proj = orchestrator.projects.get(project_name)
+    # Capture user_id NOW (before the callback fires) via the context var
+    # that was set by the Telegram channel's _register_task_user callback.
+    _captured_user_id = ""
+    try:
+        from agent.tools.builtins.scheduler import _user_id_var
+
+        _captured_user_id = _user_id_var.get("")
+    except Exception:
+        pass
+
+    # Done-callback: emit TASK_COMPLETED_NOTIFY with full project summary
+    def _on_project_done(
+        fut: asyncio.Future,  # type: ignore[type-arg]
+        _user_id: str = _captured_user_id,
+    ) -> None:
+        # CancelledError is a BaseException — must be caught explicitly
+        # so it doesn't produce an unhandled exception traceback.
+        if fut.cancelled():
+            logger.info(
+                "project_cancelled",
+                task_id=task_id,
+            )
+            return
+
+        exc = fut.exception()
+        if exc is not None:
+            logger.error(
+                "project_done_error",
+                task_id=task_id,
+                error=str(exc),
+            )
+            return
+
+        try:
+            project_result = fut.result()
+            # Build summary from stage results
+            summary_parts: list[str] = []
+            for sr in project_result.stages:
+                if sr.combined_output:
+                    summary_parts.append(f"[{sr.stage_name}]:\n{sr.combined_output[:300]}")
+            summary = "\n\n".join(summary_parts)
+            if project_result.final_output:
+                summary = project_result.final_output
+
+            asyncio.get_event_loop().create_task(
+                orchestrator.event_bus.emit(
+                    Events.TASK_COMPLETED_NOTIFY,
+                    {
+                        "task_id": task_id,
+                        "user_id": _user_id,
+                        "result": summary or "Project completed.",
+                        "duration_seconds": round(
+                            project_result.duration_ms / 1000,
+                            1,
+                        ),
+                        "summary": summary,
+                    },
+                )
+            )
+        except Exception:
+            pass
+
+    future.add_done_callback(_on_project_done)
+
     stage_names = [s.name for s in proj.stages] if proj else ["(unknown)"]
     return (
         f"Project '{project_name}' started (task: {task_id}).\n"
@@ -575,18 +754,13 @@ async def list_projects_tool() -> str:
     projects = orchestrator.list_projects()
 
     if not projects:
-        return (
-            "No projects configured. "
-            "Add YAML files to teams/projects/ to define pipelines."
-        )
+        return "No projects configured. " "Add YAML files to teams/projects/ to define pipelines."
 
     lines = [f"Available Projects ({len(projects)}):"]
     for proj in projects:
         lines.append(f"\n  {proj['name']}: {proj['description']}")
         for stage in proj["stages"]:
-            agents_str = ", ".join(
-                f"{a['team']}/{a['role']}" for a in stage["agents"]
-            )
+            agents_str = ", ".join(f"{a['team']}/{a['role']}" for a in stage["agents"])
             lines.append(f"    Stage '{stage['name']}': {agents_str}")
 
     return "\n".join(lines)

@@ -6,9 +6,10 @@ Phase 4: SQLite persistence with in-memory cache fallback.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -72,9 +73,7 @@ def content_as_text(content: str | list[dict[str, Any]]) -> str:
     """
     if isinstance(content, str):
         return content
-    return " ".join(
-        block.get("text", "") for block in content if block.get("type") == "text"
-    )
+    return " ".join(block.get("text", "") for block in content if block.get("type") == "text")
 
 
 class Session:
@@ -175,17 +174,34 @@ class SessionStore:
     def __init__(self, db: Database | None = None) -> None:
         self._db = db
         self._sessions: dict[str, Session] = {}
+        self._write_lock = asyncio.Lock()
 
-    def _evict_oldest(self) -> None:
-        """Evict oldest sessions from cache if over the limit."""
-        if len(self._sessions) <= _MAX_CACHED_SESSIONS:
-            return
-        sorted_sessions = sorted(
-            self._sessions.items(), key=lambda kv: kv[1].updated_at,
-        )
-        to_remove = len(self._sessions) - _MAX_CACHED_SESSIONS
-        for sid, _ in sorted_sessions[:to_remove]:
-            del self._sessions[sid]
+    async def _evict_oldest(self) -> None:
+        """Evict oldest sessions from cache if over the limit.
+
+        Persists evicted sessions to the database before removing them
+        from the in-memory cache to prevent data loss.
+        """
+        async with self._write_lock:
+            if len(self._sessions) <= _MAX_CACHED_SESSIONS:
+                return
+            sorted_sessions = sorted(
+                self._sessions.items(),
+                key=lambda kv: kv[1].updated_at,
+            )
+            to_remove = len(self._sessions) - _MAX_CACHED_SESSIONS
+            for sid, session in sorted_sessions[:to_remove]:
+                if self._db:
+                    try:
+                        channel = str(session.metadata.get("channel", "api"))
+                        await self._persist_session(session, channel)
+                    except Exception as e:
+                        logger.warning(
+                            "eviction_persist_failed",
+                            session_id=sid,
+                            error=str(e),
+                        )
+                del self._sessions[sid]
 
     async def get_or_create(
         self,
@@ -216,7 +232,7 @@ class SessionStore:
         session = Session(session_id=session_id)
         session.metadata["channel"] = channel
         self._sessions[session.id] = session
-        self._evict_oldest()
+        await self._evict_oldest()
 
         if self._db:
             await self._persist_session(session, channel)
@@ -256,7 +272,7 @@ class SessionStore:
         session = Session()
         session.metadata["channel"] = channel
         self._sessions[session.id] = session
-        self._evict_oldest()
+        await self._evict_oldest()
 
         if self._db:
             await self._persist_session(session, channel)
@@ -273,52 +289,57 @@ class SessionStore:
         if not self._db:
             return
 
-        msg_id = str(uuid4())
-        tool_calls_json = None
-        if message.tool_calls:
-            tool_calls_json = json.dumps([
-                {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
-                for tc in message.tool_calls
-            ])
+        async with self._write_lock:
+            msg_id = str(uuid4())
+            tool_calls_json = None
+            if message.tool_calls:
+                tool_calls_json = json.dumps(
+                    [
+                        {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+                        for tc in message.tool_calls
+                    ]
+                )
 
-        token_usage_json = None
-        if message.usage:
-            token_usage_json = json.dumps({
-                "input_tokens": message.usage.input_tokens,
-                "output_tokens": message.usage.output_tokens,
-                "total_tokens": message.usage.total_tokens,
-            })
+            token_usage_json = None
+            if message.usage:
+                token_usage_json = json.dumps(
+                    {
+                        "input_tokens": message.usage.input_tokens,
+                        "output_tokens": message.usage.output_tokens,
+                        "total_tokens": message.usage.total_tokens,
+                    }
+                )
 
-        content_value = (
-            json.dumps(message.content)
-            if isinstance(message.content, list)
-            else message.content
-        )
+            content_value = (
+                json.dumps(message.content)
+                if isinstance(message.content, list)
+                else message.content
+            )
 
-        await self._db.db.execute(
-            """INSERT INTO messages
-               (id, conversation_id, role, content, tool_calls, tool_call_id,
-                model, token_usage, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                msg_id,
-                session_id,
-                message.role,
-                content_value,
-                tool_calls_json,
-                message.tool_call_id,
-                message.model,
-                token_usage_json,
-                message.timestamp.isoformat(),
-            ),
-        )
-        await self._db.db.execute(
-            """UPDATE conversations
-               SET message_count = message_count + 1, updated_at = ?
-               WHERE id = ?""",
-            (datetime.now().isoformat(), session_id),
-        )
-        await self._db.db.commit()
+            await self._db.db.execute(
+                """INSERT INTO messages
+                   (id, conversation_id, role, content, tool_calls, tool_call_id,
+                    model, token_usage, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    msg_id,
+                    session_id,
+                    message.role,
+                    content_value,
+                    tool_calls_json,
+                    message.tool_call_id,
+                    message.model,
+                    token_usage_json,
+                    message.timestamp.isoformat(),
+                ),
+            )
+            await self._db.db.execute(
+                """UPDATE conversations
+                   SET message_count = message_count + 1, updated_at = ?
+                   WHERE id = ?""",
+                (datetime.now().isoformat(), session_id),
+            )
+            await self._db.db.commit()
 
     async def load_history(self, session_id: str, limit: int = 50) -> list[Message]:
         """Load message history from SQLite.
@@ -363,9 +384,7 @@ class SessionStore:
 
         sessions = list(self._sessions.values())
         if channel:
-            sessions = [
-                s for s in sessions if s.metadata.get("channel") == channel
-            ]
+            sessions = [s for s in sessions if s.metadata.get("channel") == channel]
         sessions.sort(key=lambda s: s.updated_at, reverse=True)
         return sessions[:limit]
 
@@ -399,6 +418,53 @@ class SessionStore:
                 removed = True
 
         return removed
+
+    async def cleanup_stale(self, max_age_days: int = 30) -> int:
+        """Delete stale conversations and orphaned messages.
+
+        Removes conversations older than ``max_age_days`` and any messages
+        whose ``conversation_id`` no longer references an existing conversation.
+
+        Args:
+            max_age_days: Maximum age in days before a conversation is deleted.
+
+        Returns:
+            Total number of rows deleted (conversations + orphaned messages).
+        """
+        if not self._db:
+            return 0
+
+        cutoff = (datetime.now() - timedelta(days=max_age_days)).isoformat()
+
+        # Delete old conversations
+        cursor = await self._db.db.execute(
+            "DELETE FROM conversations WHERE updated_at < ?", (cutoff,)
+        )
+        deleted_conversations = cursor.rowcount or 0
+
+        # Delete orphaned messages (conversation no longer exists)
+        cursor = await self._db.db.execute(
+            """DELETE FROM messages
+               WHERE conversation_id NOT IN (SELECT id FROM conversations)"""
+        )
+        deleted_messages = cursor.rowcount or 0
+
+        await self._db.db.commit()
+
+        total = deleted_conversations + deleted_messages
+        logger.info(
+            "stale_sessions_cleaned",
+            deleted_conversations=deleted_conversations,
+            deleted_messages=deleted_messages,
+            max_age_days=max_age_days,
+        )
+
+        # Also evict stale sessions from in-memory cache
+        stale_ids = [sid for sid, s in self._sessions.items() if s.updated_at.isoformat() < cutoff]
+        for sid in stale_ids:
+            del self._sessions[sid]
+
+        return total
 
     # --- Private helpers ---
 
@@ -434,9 +500,7 @@ class SessionStore:
 
         return session
 
-    async def _list_sessions_from_db(
-        self, channel: str | None, limit: int
-    ) -> list[Session]:
+    async def _list_sessions_from_db(self, channel: str | None, limit: int) -> list[Session]:
         """List sessions from SQLite."""
         if channel:
             query = """SELECT * FROM conversations
@@ -471,8 +535,7 @@ class SessionStore:
         if row["tool_calls"]:
             raw = json.loads(row["tool_calls"])
             tool_calls = [
-                ToolCall(id=tc["id"], name=tc["name"], arguments=tc["arguments"])
-                for tc in raw
+                ToolCall(id=tc["id"], name=tc["name"], arguments=tc["arguments"]) for tc in raw
             ]
 
         usage = None

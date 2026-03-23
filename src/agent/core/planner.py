@@ -114,7 +114,7 @@ class Planner:
     generates a plan via LLM, and tracks execution progress.
     """
 
-    def __init__(self, llm: LLMProvider, config: AgentPersonaConfig) -> None:
+    def __init__(self, llm: LLMProvider | None, config: AgentPersonaConfig) -> None:
         self.llm = llm
         self.config = config
         self._active_plan: Plan | None = None
@@ -151,8 +151,19 @@ class Planner:
 
         # Count action verbs as a signal
         action_verbs = [
-            "create", "write", "build", "setup", "install", "configure",
-            "deploy", "run", "test", "update", "delete", "move", "copy",
+            "create",
+            "write",
+            "build",
+            "setup",
+            "install",
+            "configure",
+            "deploy",
+            "run",
+            "test",
+            "update",
+            "delete",
+            "move",
+            "copy",
         ]
         verb_count = sum(1 for verb in action_verbs if verb in user_message.lower())
         return verb_count >= 2
@@ -180,20 +191,40 @@ class Planner:
             {"role": "system", "content": planning_prompt},
         ]
         if history:
-            context_messages.append({
-                "role": "user",
-                "content": f"Context from conversation:\n{history[-1].get('content', '')}",
-            })
+            context_messages.append(
+                {
+                    "role": "user",
+                    "content": f"Context from conversation:\n{history[-1].get('content', '')}",
+                }
+            )
         context_messages.append({"role": "user", "content": goal})
 
-        response = await self.llm.completion(
-            messages=context_messages,
-            temperature=0.3,
-            max_tokens=1024,
-        )
+        if self.llm is not None:
+            response = await self.llm.completion(
+                messages=context_messages,
+                temperature=0.3,
+                max_tokens=1024,
+            )
+            content = response.content
+        else:
+            from agent.llm.fallback import llm_complete
+
+            system_prompt = ""
+            prompt_parts = []
+            for msg in context_messages:
+                if msg["role"] == "system":
+                    system_prompt = msg["content"]
+                else:
+                    prompt_parts.append(msg["content"])
+            content = await llm_complete(
+                prompt="\n\n".join(prompt_parts),
+                system=system_prompt,
+                temperature=0.3,
+                max_tokens=1024,
+            )
 
         # Parse the numbered list
-        steps = self._parse_steps(response.content)
+        steps = self._parse_steps(content)
 
         plan = Plan(
             goal=goal,
@@ -226,16 +257,27 @@ class Planner:
             "Return ONLY a numbered list, no other text."
         )
 
-        response = await self.llm.completion(
-            messages=[
-                {"role": "system", "content": "You are a planning assistant."},
-                {"role": "user", "content": replan_prompt},
-            ],
-            temperature=0.3,
-            max_tokens=1024,
-        )
+        if self.llm is not None:
+            response = await self.llm.completion(
+                messages=[
+                    {"role": "system", "content": "You are a planning assistant."},
+                    {"role": "user", "content": replan_prompt},
+                ],
+                temperature=0.3,
+                max_tokens=1024,
+            )
+            content = response.content
+        else:
+            from agent.llm.fallback import llm_complete
 
-        new_steps = self._parse_steps(response.content)
+            content = await llm_complete(
+                prompt=replan_prompt,
+                system="You are a planning assistant.",
+                temperature=0.3,
+                max_tokens=1024,
+            )
+
+        new_steps = self._parse_steps(content)
 
         # Preserve completed steps, replace remaining
         completed_steps = [s for s in plan.steps if s.status == PlanStatus.COMPLETED]

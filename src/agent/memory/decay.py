@@ -58,7 +58,7 @@ class MemoryDecay:
                SET confidence = MAX(?, confidence - ?),
                    updated_at = datetime('now')
                WHERE julianday('now') - julianday(accessed_at) > ?
-                 AND confidence > ?
+                 AND confidence > ? + 0.001
             """,
             (min_confidence, decay_rate, stale_days, min_confidence),
         )

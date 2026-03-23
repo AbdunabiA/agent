@@ -1,0 +1,44 @@
+name: launch_prep
+description: "Launch preparation — landing page, SEO, docs, deployment, monitoring"
+stages:
+  - name: strategy
+    parallel: true
+    agents:
+      - team: product
+        role: growth_hacker
+      - team: product
+        role: product_manager
+
+  - name: landing_page
+    parallel: true
+    agents:
+      - team: content
+        role: copywriter
+      - team: design
+        role: ui_designer
+
+  - name: seo_content
+    agents:
+      - team: product
+        role: growth_hacker
+
+  - name: documentation
+    parallel: true
+    agents:
+      - team: content
+        role: technical_writer
+      - team: content
+        role: api_docs_writer
+
+  - name: deployment
+    agents:
+      - team: engineering
+        role: devops_engineer
+
+  - name: accessibility_check
+    agents:
+      - team: design
+        role: accessibility_specialist
+    denied_tools:
+      - file_write
+      - assign_task

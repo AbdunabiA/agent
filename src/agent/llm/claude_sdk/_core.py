@@ -13,8 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
-import os
 import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
@@ -40,7 +38,6 @@ _SDK_AVAILABLE: bool | None = None
 _SDK_PATCHED: bool = False
 
 
-
 def _patch_sdk_permission_protocol() -> None:
     """Patch claude-code-sdk to use the new permission response format.
 
@@ -59,7 +56,8 @@ def _patch_sdk_permission_protocol() -> None:
         _original_handle = Query._handle_control_request
 
         async def _patched_handle_control_request(
-            self: Any, request: dict[str, Any],
+            self: Any,
+            request: dict[str, Any],
         ) -> None:
             import json as _json
 
@@ -85,8 +83,7 @@ def _patch_sdk_permission_protocol() -> None:
 
                 context = ToolPermissionContext(
                     signal=None,
-                    suggestions=permission_request.get("permission_suggestions", [])
-                    or [],
+                    suggestions=permission_request.get("permission_suggestions", []) or [],
                 )
 
                 response = await self.can_use_tool(
@@ -225,8 +222,7 @@ class ClaudeSDKService:
     ) -> None:
         if not sdk_available():
             raise ImportError(
-                "claude-agent-sdk is not installed. "
-                "Install with: pip install claude-agent-sdk"
+                "claude-agent-sdk is not installed. " "Install with: pip install claude-agent-sdk"
             )
         self.working_dir = working_dir
         self.max_turns = max_turns
@@ -324,30 +320,22 @@ class ClaudeSDKService:
             await asyncio.sleep(60)
             now = time.monotonic()
             idle_ids = [
-                tid for tid, last in self._last_activity.items()
+                tid
+                for tid, last in self._last_activity.items()
                 if (now - last) > self._idle_timeout and tid in self._clients
             ]
             for tid in idle_ids:
-                logger.info("sdk_reaping_idle_client", task_id=tid,
-                            idle_secs=int(now - self._last_activity[tid]))
+                logger.info(
+                    "sdk_reaping_idle_client",
+                    task_id=tid,
+                    idle_secs=int(now - self._last_activity[tid]),
+                )
                 await self.disconnect_client(tid)
 
     # ------------------------------------------------------------------
-    # Issue 1: System prompt fingerprint
+    # Issue 1: System prompt fingerprint — bound from _prompts.py
     # ------------------------------------------------------------------
-
-    def _compute_prompt_fingerprint(
-        self,
-        facts: list[Any] | None = None,
-    ) -> str:
-        """Hash soul + facts into a fingerprint for drift detection."""
-        parts: list[str] = []
-        if self.soul_loader:
-            parts.append(self.soul_loader.content or "")
-        if facts:
-            parts.extend(f"{f.key}={f.value}" for f in facts)
-        raw = "\n".join(parts)
-        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+    # _compute_prompt_fingerprint — bound below
 
     async def run_task_stream(
         self,
@@ -523,8 +511,16 @@ class ClaudeSDKService:
             context: Any,
         ) -> Any:
             safe_tools = {
-                "Read", "Glob", "Grep", "WebFetch", "WebSearch",
-                "LS", "TaskGet", "TaskList", "TaskOutput", "ToolSearch",
+                "Read",
+                "Glob",
+                "Grep",
+                "WebFetch",
+                "WebSearch",
+                "LS",
+                "TaskGet",
+                "TaskList",
+                "TaskOutput",
+                "ToolSearch",
             }
             if tool_name in safe_tools or tool_name in agent_safe_tools:
                 return PermissionResultAllow(updated_input=tool_input)
@@ -533,9 +529,7 @@ class ClaudeSDKService:
             if tool_name in all_agent_tools:
                 return PermissionResultAllow(updated_input=tool_input)
 
-            return PermissionResultDeny(
-                message="Tool not in sub-agent scope", interrupt=False
-            )
+            return PermissionResultDeny(message="Tool not in sub-agent scope", interrupt=False)
 
         resolved_cwd = str(_Path(_os.path.expanduser(self.working_dir)).resolve())  # noqa: ASYNC240
 
@@ -562,7 +556,9 @@ class ClaudeSDKService:
         # Only blank vars that control Claude Code CLI behavior to avoid conflicts.
         _env_overrides = dict(options_kwargs.get("env", {}))
         for key in (
-            "CLAUDECODE", "CLAUDE_CODE_SSE_PORT", "CLAUDE_CODE_ENTRYPOINT",
+            "CLAUDECODE",
+            "CLAUDE_CODE_SSE_PORT",
+            "CLAUDE_CODE_ENTRYPOINT",
         ):
             if key in _os.environ and key not in _env_overrides:
                 _env_overrides[key] = ""
@@ -616,6 +612,15 @@ class ClaudeSDKService:
             if not final_text:
                 final_text = "[No response from sub-agent]"
 
+            # Verify URLs in output (shared with LiteLLM path)
+            if "http" in final_text:
+                try:
+                    from agent.utils.url_check import check_urls_in_output
+
+                    final_text = await check_urls_in_output(final_text)
+                except Exception:
+                    pass  # Don't fail sub-agent on URL check errors
+
             # Store metrics for the orchestrator to read
             self._subagent_metrics[task_id] = {
                 "tool_calls": tool_calls,
@@ -648,7 +653,8 @@ class ClaudeSDKService:
                 logger.info("sdk_subagent_disconnected", task_id=task_id)
 
     async def _query_memory(
-        self, user_message: str,
+        self,
+        user_message: str,
     ) -> tuple[list[Any] | None, list[Any] | None]:
         """Query fact store and vector store for relevant context.
 
@@ -679,543 +685,31 @@ class ClaudeSDKService:
         facts, vectors = await asyncio.gather(_get_facts(), _get_vectors())
         return facts, vectors
 
-    def _build_system_prompt(
-        self,
-        facts: list[Any] | None = None,
-        vector_results: list[Any] | None = None,
-        channel: str | None = None,
-    ) -> str | None:
-        """Build system prompt from soul.md + memory context.
-
-        Mirrors the format used by agent.core.context.build_messages().
-        Wraps the soul content with identity override instructions so the
-        agent adopts the persona defined in soul.md rather than defaulting
-        to Claude/Anthropic identity.
-
-        Args:
-            facts: Known facts to inject.
-            vector_results: Semantic search results to inject.
-            channel: Channel name (e.g. "telegram", "webchat", "cli").
-        """
-        parts: list[str] = []
-
-        # Identity override — must come first
-        parts.append(
-            "CRITICAL IDENTITY INSTRUCTIONS:\n"
-            "You must fully adopt the persona described below. "
-            "You are NOT Claude and you are NOT made by Anthropic. "
-            "When asked who you are, what you are, or who made you, "
-            "answer ONLY according to the persona below. "
-            "Never mention Claude, Anthropic, or any other AI company "
-            "as your creator or identity. You are the agent described below, "
-            "running locally on the user's machine."
-        )
-
-        # Soul personality
-        if self.soul_loader:
-            soul_content = self.soul_loader.content
-            if soul_content:
-                parts.append(soul_content)
-
-        # Inject known facts
-        if facts:
-            fact_lines = [f"- {f.key}: {f.value}" for f in facts]
-            parts.append(
-                "KNOWN FACTS ABOUT THE USER:\n" + "\n".join(fact_lines)
-            )
-
-        # Inject related past conversations
-        if vector_results:
-            vr_lines = []
-            for vr in vector_results:
-                score_pct = int(vr.score * 100)
-                vr_lines.append(f"[Relevance: {score_pct}%] {vr.text}")
-            parts.append(
-                "RELATED PAST CONVERSATIONS:\n"
-                + "\n---\n".join(vr_lines)
-            )
-
-        # Orchestration mandate — only when orchestration is enabled
-        from agent.config import get_config
-        _cfg = get_config()
-        if _cfg.orchestration.enabled:
-            parts.append(
-                "WORK DELEGATION RULE:\n"
-                "You MUST delegate all substantive work (coding, file creation, "
-                "research, commands, multi-step tasks) to sub-agents. You are the "
-                "orchestrator — stay free for conversation and coordination. "
-                "Only handle simple conversational replies and clarifying questions yourself.\n\n"
-                "CHOOSING THE RIGHT WORKFLOW:\n"
-                "- Vague/broad requests (\"build me an app\", \"create a website\"): "
-                "First ask the user clarifying questions (purpose, features, tech stack, "
-                "scope). Once clear, use run_project build_app.\n"
-                "- Bug reports: use run_project bug_fix.\n"
-                "- Code review requests: use run_project code_review.\n"
-                "- Complex features with clear requirements: use run_project full_feature.\n"
-                "- Specific single tasks: use spawn_subagent with the right role.\n"
-                "- Multiple independent tasks: use spawn_parallel_agents.\n"
-                "Use list_projects to see all available pipelines.\n\n"
-                "DISCOVERY:\n"
-                "When a request is too vague, YOU ask clarifying questions directly — "
-                "do NOT delegate discovery. Gather requirements, confirm scope, "
-                "then launch the right project or sub-agent with full context."
-            )
-
-        # Runtime context (channel awareness, capabilities)
-        from agent.llm.prompts import build_runtime_context
-
-        runtime_ctx = build_runtime_context(
-            channel=channel or "cli",
-            model_name=self.model,
-            has_memory=self.fact_store is not None,
-            has_orchestration=_cfg.orchestration.enabled,
-        )
-        parts.append(runtime_ctx)
-
-        return "\n\n".join(parts) if parts else None
-
-    def _build_subagent_prompt(
-        self,
-        role_persona: str,
-        task_context: str = "",
-        nesting_depth: int = 0,
-    ) -> str:
-        """Build a focused system prompt for sub-agents.
-
-        Unlike the full system prompt, this omits identity override,
-        orchestration mandate, memory facts, and soul.md. Sub-agents
-        are workers — they should execute, not delegate.
-
-        Args:
-            role_persona: The sub-agent's role persona description.
-            task_context: Optional task context to include.
-            nesting_depth: How deep in the sub-agent chain this agent is.
-        """
-        parts: list[str] = []
-
-        # Role persona as primary identity
-        parts.append(f"ROLE:\n{role_persona}")
-
-        # Worker instruction — prevent recursive delegation
-        delegation_note = ""
-        if nesting_depth >= 1:
-            delegation_note = (
-                f" You are a nested sub-agent (depth {nesting_depth}). "
-                "You MUST NOT use consult_agent, delegate_to_specialist, "
-                "spawn_subagent, or any orchestration tools."
-            )
-        parts.append(
-            "INSTRUCTIONS:\n"
-            "You are a focused worker agent. Complete the task directly using "
-            "the tools available to you. Do NOT delegate work to sub-agents. "
-            "Do NOT spawn additional agents. Execute the task yourself."
-            + delegation_note
-        )
-
-        if task_context:
-            parts.append(f"CONTEXT:\n{task_context}")
-
-        return "\n\n".join(parts)
-
-    @staticmethod
-    async def _safe_receive(client: Any) -> AsyncGenerator[Any, None]:
-        """Iterate client messages, skipping unknown types and stale results.
-
-        Uses receive_messages() instead of receive_response() so we can
-        detect and skip stale ResultMessages that sit in the buffer from
-        a previous query cycle.
-
-        Unknown message types (e.g. rate_limit_event) are skipped per-message
-        instead of aborting the entire stream, so the actual response is still
-        received.
-        """
-        from claude_code_sdk import AssistantMessage, ResultMessage
-
-        got_assistant = False
-        stream = client.receive_messages().__aiter__()
-
-        while True:
-            try:
-                message = await stream.__anext__()
-            except StopAsyncIteration:
-                break
-            except Exception as e:
-                if "Unknown message type" in str(e):
-                    # Skip unparseable messages (e.g. rate_limit_event)
-                    # and keep iterating — the real response follows.
-                    logger.debug("sdk_unknown_message_skipped", error=str(e))
-                    continue
-                raise
-
-            if isinstance(message, AssistantMessage):
-                got_assistant = True
-
-            if isinstance(message, ResultMessage):
-                if not got_assistant:
-                    # Stale ResultMessage from a previous query — skip it
-                    logger.warning(
-                        "sdk_stale_result_skipped",
-                        session_id=getattr(message, "session_id", None),
-                        num_turns=getattr(message, "num_turns", None),
-                    )
-                    continue
-                # Real result — yield it and stop
-                yield message
-                return
-
-            yield message
+    # _build_system_prompt — bound from _prompts.py below
+    # _build_subagent_prompt — bound from _prompts.py below
+    # _safe_receive — bound from _client.py below
+    # _safe_extract_facts — defined here (small, uses self)
 
     async def _safe_extract_facts(
-        self, user_message: str, assistant_response: str,
+        self,
+        user_message: str,
+        assistant_response: str,
     ) -> None:
         """Extract facts from a user+assistant exchange (fire-and-forget)."""
         try:
-            await self.fact_extractor.extract_from_messages([
-                {"role": "user", "content": user_message},
-                {"role": "assistant", "content": assistant_response},
-            ])
+            await self.fact_extractor.extract_from_messages(
+                [
+                    {"role": "user", "content": user_message},
+                    {"role": "assistant", "content": assistant_response},
+                ]
+            )
         except Exception as e:
             logger.debug("sdk_fact_extraction_failed", error=str(e))
 
-    def _build_mcp_server(
-        self, registry: Any | None = None,
-        tool_executor: Any | None = None,
-        session_id: str = "sdk",
-    ) -> tuple[Any, list[str]] | None:
-        """Build an in-process MCP server exposing agent tools to the SDK.
-
-        Creates SDK-compatible tool wrappers for each enabled tool in the
-        registry, bundles them into an MCP server, and returns the server
-        config + list of tool names.
-
-        When ``tool_executor`` is provided, tool calls are routed through
-        the executor for permission checks, guardrails, and audit logging.
-        Otherwise falls back to direct function invocation.
-
-        Args:
-            registry: Optional tool registry override. Falls back to
-                ``self.tool_registry`` when not provided.
-            tool_executor: Optional ToolExecutor for safety routing.
-            session_id: Session ID for audit logging when using executor.
-
-        Returns:
-            Tuple of (McpSdkServerConfig, tool_name_list) or None if no tools.
-        """
-        effective_registry = registry or self.tool_registry
-        if not effective_registry:
-            return None
-
-        from claude_code_sdk import create_sdk_mcp_server
-        from claude_code_sdk import tool as sdk_tool
-
-        tools = effective_registry.list_tools()
-        enabled_tools = [t for t in tools if t.enabled]
-        if not enabled_tools:
-            return None
-
-        sdk_tools = []
-        tool_names = []
-
-        for tool_def in enabled_tools:
-            # Capture tool_def in closure via default arg
-            def _make_handler(
-                td: Any, executor: Any = tool_executor, sid: str = session_id,
-            ) -> Any:
-                async def handler(args: dict[str, Any]) -> dict[str, Any]:
-                    from agent.tools.executor import MultimodalToolOutput
-
-                    # Route through executor for permission/audit/guardrails
-                    if executor is not None:
-                        from uuid import uuid4
-
-                        from agent.core.session import ToolCall
-
-                        tc = ToolCall(
-                            id=str(uuid4())[:8],
-                            name=td.name,
-                            arguments=args,
-                        )
-                        result = await executor.execute(
-                            tool_call=tc,
-                            session_id=sid,
-                            trigger="sdk_mcp",
-                        )
-                        if result.images:
-                            content_blocks: list[dict[str, Any]] = [
-                                {"type": "text", "text": result.output},
-                            ]
-                            for img in result.images:
-                                content_blocks.append({
-                                    "type": "image",
-                                    "data": img.base64_data,
-                                    "mimeType": img.media_type,
-                                })
-                            return {"content": content_blocks}
-                        return {
-                            "content": [{"type": "text", "text": result.output}],
-                        }
-
-                    # Direct call fallback (no executor)
-                    try:
-                        result = await td.function(**args)
-                        if isinstance(result, MultimodalToolOutput):
-                            content_blocks = [
-                                {"type": "text", "text": result.text},
-                            ]
-                            for img in result.images:
-                                content_blocks.append({
-                                    "type": "image",
-                                    "data": img.base64_data,
-                                    "mimeType": img.media_type,
-                                })
-                            return {"content": content_blocks}
-                        text = str(result) if result is not None else ""
-                    except Exception as e:
-                        text = f"Error: {e}"
-                    return {
-                        "content": [{"type": "text", "text": text}],
-                    }
-                return handler
-
-            wrapped = sdk_tool(
-                tool_def.name,
-                tool_def.description,
-                tool_def.parameters,
-            )(_make_handler(tool_def))
-
-            sdk_tools.append(wrapped)
-            tool_names.append(tool_def.name)
-
-        server = create_sdk_mcp_server(
-            name="agent-tools",
-            version="1.0.0",
-            tools=sdk_tools,
-        )
-
-        logger.info("sdk_mcp_server_built", tool_count=len(sdk_tools))
-        return server, tool_names
-
-    async def _ensure_client(
-        self,
-        task_id: str,
-        on_permission: PermissionCallback | None = None,
-        on_question: QuestionCallback | None = None,
-        session_id: str | None = None,
-        channel: str | None = None,
-    ) -> Any:
-        """Get or create a persistent SDK client for a task/user.
-
-        The client stays connected across messages — no subprocess restart.
-        Reconnects if tool generation or system prompt has drifted.
-        """
-        # Issue 2: Check if tool generation changed → reconnect
-        if task_id in self._clients and self.tool_registry:
-            current_gen = self.tool_registry._generation
-            if self._tool_generations.get(task_id) != current_gen:
-                logger.info("sdk_reconnect_tool_change", task_id=task_id,
-                            old_gen=self._tool_generations.get(task_id), new_gen=current_gen)
-                await self.disconnect_client(task_id)
-
-        # Issue 1: Check if system prompt drifted → reconnect
-        # Compare the stored fingerprint (from connect time) against
-        # a freshly computed one.  We pass facts=None so the fingerprint
-        # reflects the current soul.md content.  When run_task_impl later
-        # queries memory it will get up-to-date facts for the new client.
-        if task_id in self._clients:
-            new_fp = self._compute_prompt_fingerprint(None)
-            old_fp = self._prompt_fingerprints.get(task_id)
-            if old_fp and old_fp != new_fp:
-                logger.info("sdk_reconnect_prompt_drift", task_id=task_id)
-                await self.disconnect_client(task_id)
-
-        if task_id in self._clients:
-            return self._clients[task_id]
-
-        from claude_code_sdk import (
-            ClaudeCodeOptions,
-            ClaudeSDKClient,
-        )
-        from claude_code_sdk.types import (
-            PermissionResultAllow,
-            PermissionResultDeny,
-        )
-
-        work_dir = self.working_dir
-        resolved_cwd = str(Path(os.path.expanduser(work_dir)).resolve())  # noqa: ASYNC240
-
-        # Build MCP server for agent tools
-        mcp_result = self._build_mcp_server()
-        mcp_servers: dict[str, Any] = {}
-        if mcp_result:
-            server_config, _ = mcp_result
-            mcp_servers["agent-tools"] = server_config
-
-        # Resolve agent tool tiers for permission decisions
-        from agent.tools.registry import ToolTier
-
-        agent_safe_tools: set[str] = set()
-        if self.tool_registry:
-            for td in self.tool_registry.list_tools():
-                if td.enabled and td.tier == ToolTier.SAFE:
-                    agent_safe_tools.add(td.name)
-
-        # Permission callback for Claude Code + agent tools
-        cancel_event = self._cancel_events.get(task_id, asyncio.Event())
-        self._cancel_events[task_id] = cancel_event
-
-        async def can_use_tool(
-            tool_name: str,
-            tool_input: dict[str, Any],
-            context: Any,
-        ) -> Any:
-            if cancel_event.is_set():
-                return PermissionResultDeny(
-                    message="Task cancelled by user", interrupt=True
-                )
-
-            safe_tools = {
-                "Read", "Glob", "Grep", "WebFetch", "WebSearch",
-                "LS", "Agent", "Explore", "TaskGet", "TaskList",
-                "TaskOutput", "ToolSearch",
-            }
-            if tool_name in safe_tools:
-                return PermissionResultAllow(updated_input=tool_input)
-
-            if tool_name in agent_safe_tools:
-                return PermissionResultAllow(updated_input=tool_input)
-
-            if tool_name == "AskUserQuestion":
-                if on_question:
-                    self._status[task_id] = SDKTaskStatus.WAITING_ANSWER
-                    questions = tool_input.get("questions", [])
-                    q_text = questions[0].get("question", "") if questions else ""
-                    options = (
-                        [o.get("label", "") for o in questions[0].get("options", [])]
-                        if questions
-                        else []
-                    )
-                    answer = await on_question(q_text, options)
-                    self._status[task_id] = SDKTaskStatus.RUNNING
-                    if questions:
-                        questions[0]["answer"] = answer
-                    return PermissionResultAllow(updated_input=tool_input)
-                return PermissionResultAllow(updated_input=tool_input)
-
-            if on_permission:
-                self._status[task_id] = SDKTaskStatus.WAITING_PERMISSION
-                details = _format_tool_details(tool_name, tool_input)
-                approved = await on_permission(tool_name, details, tool_input)
-                self._status[task_id] = SDKTaskStatus.RUNNING
-                if approved:
-                    return PermissionResultAllow(updated_input=tool_input)
-                return PermissionResultDeny(
-                    message="User denied permission", interrupt=False
-                )
-
-            # No permission callback — deny non-safe tools by default
-            return PermissionResultDeny(
-                message="No permission handler configured", interrupt=False
-            )
-
-        # Query memory for system prompt
-        facts, vector_results = await self._query_memory("")
-        self._cached_facts[task_id] = facts or []
-        system_prompt = self._build_system_prompt(
-            facts, vector_results, channel=channel,
-        )
-
-        # Issue 4: Use stored session_id for resume if not explicitly provided
-        resume_id = session_id or self._last_session_ids.get(task_id)
-
-        options_kwargs: dict[str, Any] = {
-            "cwd": resolved_cwd,
-            "max_turns": self.max_turns,
-            "model": self.model,
-            "permission_mode": self.permission_mode,
-            "can_use_tool": can_use_tool,
-            "env": {
-                "GIT_TERMINAL_PROMPT": "0",
-                "PYTHONUTF8": "1",
-                "PYTHONIOENCODING": "utf-8",
-            },
-        }
-        if mcp_servers:
-            options_kwargs["mcp_servers"] = mcp_servers
-        if system_prompt:
-            options_kwargs["system_prompt"] = system_prompt
-        if resume_id:
-            options_kwargs["resume"] = resume_id
-
-        # Prevent conflicting env vars from leaking into the subprocess
-        # by overriding them in the options.env dict (no process-wide mutation).
-        _env_overrides = dict(options_kwargs.get("env", {}))
-        # Note: ANTHROPIC_API_KEY is NOT blanked — the subprocess needs it
-        # for auth.  Only blank vars that control Claude Code CLI behavior
-        # to avoid conflicts (consistent with run_subagent).
-        for key in (
-            "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
-            "CLAUDECODE", "CLAUDE_CODE_SSE_PORT", "CLAUDE_CODE_ENTRYPOINT",
-        ):
-            if key in os.environ and key not in _env_overrides:
-                _env_overrides[key] = ""
-        options_kwargs["env"] = _env_overrides
-
-        options = ClaudeCodeOptions(**options_kwargs)
-
-        client = ClaudeSDKClient(options=options)
-        try:
-            await client.connect()
-        except Exception:
-            with contextlib.suppress(Exception):
-                await client.disconnect()
-            raise
-
-        self._clients[task_id] = client
-        self._last_activity[task_id] = time.monotonic()
-
-        # Store soul-only fingerprint at connect time.  We intentionally
-        # exclude facts so drift detection in _get_or_create_client (which
-        # doesn't have the prompt to query memory) stays consistent.
-        self._prompt_fingerprints[task_id] = self._compute_prompt_fingerprint(None)
-        if self.tool_registry:
-            self._tool_generations[task_id] = self.tool_registry._generation
-
-        logger.info(
-            "sdk_client_connected",
-            task_id=task_id,
-            cwd=resolved_cwd,
-            model=self.model,
-            resume=resume_id[:16] + "..." if resume_id else None,
-        )
-
-        return client
-
-    async def disconnect_client(self, task_id: str) -> None:
-        """Disconnect and remove a persistent client (e.g. on /new command)."""
-        client = self._clients.pop(task_id, None)
-        if client:
-            with contextlib.suppress(Exception):
-                await client.disconnect()
-            logger.info("sdk_client_disconnected", task_id=task_id)
-        self._cancel_events.pop(task_id, None)
-        self._permission_events.pop(task_id, None)
-        self._permission_responses.pop(task_id, None)
-        self._question_events.pop(task_id, None)
-        self._question_responses.pop(task_id, None)
-        self._status.pop(task_id, None)
-        self._last_activity.pop(task_id, None)
-        self._tool_generations.pop(task_id, None)
-        self._prompt_fingerprints.pop(task_id, None)
-        self._cached_facts.pop(task_id, None)
-        self._query_locks.pop(task_id, None)
-        self._subagent_metrics.pop(task_id, None)
-        # Keep _last_session_ids — needed for resume on next connect
-
-    def _get_query_lock(self, task_id: str) -> asyncio.Lock:
-        """Get or create a per-task lock to serialize concurrent queries."""
-        if task_id not in self._query_locks:
-            self._query_locks[task_id] = asyncio.Lock()
-        return self._query_locks[task_id]
+    # _build_mcp_server — bound from _mcp.py below
+    # _ensure_client — bound from _client.py below
+    # disconnect_client — bound from _client.py below
+    # _get_query_lock — bound from _client.py below
 
     async def _run_task_impl(
         self,
@@ -1319,9 +813,14 @@ class ClaudeSDKService:
                     # Subagent messages have parent_tool_use_id set —
                     # their text is internal and should not be part of
                     # the final response sent to the user.
-                    is_subagent = getattr(
-                        message, "parent_tool_use_id", None,
-                    ) is not None
+                    is_subagent = (
+                        getattr(
+                            message,
+                            "parent_tool_use_id",
+                            None,
+                        )
+                        is not None
+                    )
 
                     for block in message.content:
                         if isinstance(block, TextBlock):
@@ -1333,9 +832,7 @@ class ClaudeSDKService:
                                 data={"subagent": is_subagent},
                             )
                         elif isinstance(block, ThinkingBlock):
-                            yield SDKStreamEvent(
-                                type="thinking", content=block.thinking
-                            )
+                            yield SDKStreamEvent(type="thinking", content=block.thinking)
                         elif isinstance(block, ToolUseBlock):
                             yield SDKStreamEvent(
                                 type="tool_use",
@@ -1374,9 +871,7 @@ class ClaudeSDKService:
 
                     # Fire-and-forget: extract facts (tracked for clean shutdown)
                     if self.fact_extractor and result_text:
-                        bg_task = asyncio.create_task(
-                            self._safe_extract_facts(prompt, result_text)
-                        )
+                        bg_task = asyncio.create_task(self._safe_extract_facts(prompt, result_text))
                         self._background_tasks.add(bg_task)
                         bg_task.add_done_callback(self._background_tasks.discard)
                         bg_task.add_done_callback(_log_task_exception)
@@ -1404,18 +899,26 @@ class ClaudeSDKService:
                     # message.result — the SDK sometimes only fills one.
                     msg_result = getattr(message, "result", "") or ""
                     final_content = (
-                        msg_result if len(msg_result) > len(result_text)
-                        else result_text
+                        msg_result if len(msg_result) > len(result_text) else result_text
                     )
+
+                    # Verify URLs in output (shared with LiteLLM path)
+                    if "http" in final_content:
+                        try:
+                            from agent.utils.url_check import check_urls_in_output
+
+                            final_content = await check_urls_in_output(
+                                final_content,
+                            )
+                        except Exception:
+                            pass
 
                     yield SDKStreamEvent(
                         type="result",
                         content=final_content,
                         data={
                             "session_id": message.session_id,
-                            "cost_usd": getattr(
-                                message, "total_cost_usd", 0.0
-                            ),
+                            "cost_usd": getattr(message, "total_cost_usd", 0.0),
                             "num_turns": num_turns,
                             "input_tokens": in_tokens,
                             "output_tokens": out_tokens,
@@ -1458,9 +961,7 @@ class ClaudeSDKService:
             with contextlib.suppress(Exception):
                 await client.interrupt()
 
-    def approve_permission(
-        self, task_id: str = "default", *, approved: bool = True
-    ) -> None:
+    def approve_permission(self, task_id: str = "default", *, approved: bool = True) -> None:
         """Respond to a pending permission request (for async HITL)."""
         self._permission_responses[task_id] = approved
         event = self._permission_events.get(task_id)
@@ -1500,3 +1001,34 @@ def _format_tool_details(tool_name: str, tool_input: dict[str, Any]) -> str:
     if tool_name == "NotebookEdit":
         return f"Notebook: {tool_input.get('notebook_path', 'unknown')}"
     return str(tool_input)[:300]
+
+
+# ------------------------------------------------------------------
+# Method binding: attach functions from sub-modules to the class
+# ------------------------------------------------------------------
+
+from agent.llm.claude_sdk._prompts import (  # noqa: E402
+    _build_subagent_prompt,
+    _build_system_prompt,
+    _compute_prompt_fingerprint,
+)
+
+ClaudeSDKService._compute_prompt_fingerprint = _compute_prompt_fingerprint  # type: ignore[assignment]
+ClaudeSDKService._build_system_prompt = _build_system_prompt  # type: ignore[assignment]
+ClaudeSDKService._build_subagent_prompt = _build_subagent_prompt  # type: ignore[assignment]
+
+from agent.llm.claude_sdk._mcp import _build_mcp_server  # noqa: E402
+
+ClaudeSDKService._build_mcp_server = _build_mcp_server  # type: ignore[assignment]
+
+from agent.llm.claude_sdk._client import (  # noqa: E402
+    _ensure_client,
+    _get_query_lock,
+    _safe_receive,
+    disconnect_client,
+)
+
+ClaudeSDKService._ensure_client = _ensure_client  # type: ignore[assignment]
+ClaudeSDKService.disconnect_client = disconnect_client  # type: ignore[assignment]
+ClaudeSDKService._get_query_lock = _get_query_lock  # type: ignore[assignment]
+ClaudeSDKService._safe_receive = staticmethod(_safe_receive)  # type: ignore[assignment]

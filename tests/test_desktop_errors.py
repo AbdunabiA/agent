@@ -15,10 +15,10 @@ from agent.desktop.errors import (
 )
 from agent.desktop.platform_utils import OSType, PlatformInfo
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_platform(
     has_display: bool = True,
@@ -43,6 +43,7 @@ def _make_platform(
 # ---------------------------------------------------------------------------
 # Exception hierarchy tests
 # ---------------------------------------------------------------------------
+
 
 class TestExceptionHierarchy:
     """Verify the custom desktop exception class hierarchy."""
@@ -86,6 +87,7 @@ class TestExceptionHierarchy:
 # @desktop_op decorator tests
 # ---------------------------------------------------------------------------
 
+
 class TestDesktopOpNoDisplay:
     """When has_display=False the decorator short-circuits."""
 
@@ -103,9 +105,7 @@ class TestDesktopOpNoDisplay:
         assert "GUI environment" in result
 
     @patch("agent.desktop.platform_utils.get_platform")
-    async def test_inner_function_never_called_when_no_display(
-        self, mock_gp: object
-    ) -> None:
+    async def test_inner_function_never_called_when_no_display(self, mock_gp: object) -> None:
         mock_gp.return_value = _make_platform(has_display=False)  # type: ignore[union-attr]
         called = False
 
@@ -194,9 +194,7 @@ class TestDesktopOpPlatformNotSupported:
             raise MissingDependencyError("grim is required for Wayland screenshots")
 
         result = await capture()
-        assert result == (
-            "[UNAVAILABLE] Screen Capture: grim is required for Wayland screenshots"
-        )
+        assert result == ("[UNAVAILABLE] Screen Capture: grim is required for Wayland screenshots")
 
     @patch("agent.desktop.platform_utils.get_platform")
     async def test_catches_no_display_error(self, mock_gp: object) -> None:
@@ -327,9 +325,7 @@ class TestDesktopOpExceptionPriority:
     """Verify that more specific exceptions are caught before generic ones."""
 
     @patch("agent.desktop.platform_utils.get_platform")
-    async def test_import_error_takes_precedence_over_generic(
-        self, mock_gp: object
-    ) -> None:
+    async def test_import_error_takes_precedence_over_generic(self, mock_gp: object) -> None:
         """ImportError is a subclass of Exception but has its own handler."""
         mock_gp.return_value = _make_platform(has_display=True)  # type: ignore[union-attr]
 
@@ -344,9 +340,7 @@ class TestDesktopOpExceptionPriority:
         assert "[ERROR]" not in result
 
     @patch("agent.desktop.platform_utils.get_platform")
-    async def test_platform_error_takes_precedence_over_generic(
-        self, mock_gp: object
-    ) -> None:
+    async def test_platform_error_takes_precedence_over_generic(self, mock_gp: object) -> None:
         """DesktopError subclasses have their own handler."""
         mock_gp.return_value = _make_platform(has_display=True)  # type: ignore[union-attr]
 
@@ -359,9 +353,7 @@ class TestDesktopOpExceptionPriority:
         assert "[ERROR]" not in result
 
     @patch("agent.desktop.platform_utils.get_platform")
-    async def test_no_display_check_takes_precedence_over_everything(
-        self, mock_gp: object
-    ) -> None:
+    async def test_no_display_check_takes_precedence_over_everything(self, mock_gp: object) -> None:
         """has_display=False short-circuits before the function even runs."""
         mock_gp.return_value = _make_platform(has_display=False)  # type: ignore[union-attr]
 

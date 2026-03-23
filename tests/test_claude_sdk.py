@@ -107,19 +107,25 @@ class TestMultimodalMCPHandler:
         # Simulate what the MCP handler does
         content_blocks = [{"type": "text", "text": result.text}]
         for img in result.images:
-            content_blocks.append({
-                "type": "image",
-                "data": img.base64_data,
-                "mimeType": img.media_type,
-            })
+            content_blocks.append(
+                {
+                    "type": "image",
+                    "data": img.base64_data,
+                    "mimeType": img.media_type,
+                }
+            )
 
         assert len(content_blocks) == 3
         assert content_blocks[0] == {"type": "text", "text": "Captured"}
         assert content_blocks[1] == {
-            "type": "image", "data": "img1", "mimeType": "image/png",
+            "type": "image",
+            "data": "img1",
+            "mimeType": "image/png",
         }
         assert content_blocks[2] == {
-            "type": "image", "data": "img2", "mimeType": "image/jpeg",
+            "type": "image",
+            "data": "img2",
+            "mimeType": "image/jpeg",
         }
 
 
@@ -181,16 +187,19 @@ class TestConfigIntegration:
 
     def test_models_config_has_backend(self):
         from agent.config import ModelsConfig
+
         cfg = ModelsConfig()
         assert cfg.backend == "litellm"
 
     def test_models_config_sdk_backend(self):
         from agent.config import ModelsConfig
+
         cfg = ModelsConfig(backend="claude-sdk")
         assert cfg.backend == "claude-sdk"
 
     def test_models_config_has_claude_sdk(self):
         from agent.config import ClaudeSDKConfig, ModelsConfig
+
         cfg = ModelsConfig()
         assert isinstance(cfg.claude_sdk, ClaudeSDKConfig)
         assert cfg.claude_sdk.max_turns == 50
@@ -198,6 +207,7 @@ class TestConfigIntegration:
 
     def test_claude_sdk_config_custom(self):
         from agent.config import ClaudeSDKConfig
+
         cfg = ClaudeSDKConfig(
             claude_auth_dir="/custom/.claude",
             working_dir="/home/user/project",
@@ -213,6 +223,7 @@ class TestConfigIntegration:
 
     def test_claude_sdk_config_default_auth_dir(self):
         from agent.config import ClaudeSDKConfig
+
         cfg = ClaudeSDKConfig()
         assert cfg.claude_auth_dir == "~/.claude"
 
@@ -222,6 +233,7 @@ class TestEnvVarLoading:
 
     def test_env_vars_apply_to_sdk_config(self, monkeypatch):
         from agent.config import AgentConfig, _apply_env_api_keys
+
         monkeypatch.setenv("CLAUDE_WORKING_DIR", "/from/env")
         monkeypatch.setenv("CLAUDE_AUTH_DIR", "/custom/auth")
         monkeypatch.setenv("CLAUDE_SDK_MAX_TURNS", "100")
@@ -236,20 +248,18 @@ class TestEnvVarLoading:
 
     def test_env_vars_dont_override_yaml(self, monkeypatch):
         from agent.config import AgentConfig, ClaudeSDKConfig, ModelsConfig, _apply_env_api_keys
+
         monkeypatch.setenv("CLAUDE_WORKING_DIR", "/from/env")
 
         # Simulate YAML-configured value (non-default)
-        cfg = AgentConfig(
-            models=ModelsConfig(
-                claude_sdk=ClaudeSDKConfig(working_dir="/from/yaml")
-            )
-        )
+        cfg = AgentConfig(models=ModelsConfig(claude_sdk=ClaudeSDKConfig(working_dir="/from/yaml")))
         _apply_env_api_keys(cfg)
         # Env var should NOT override existing non-empty value
         assert cfg.models.claude_sdk.working_dir == "/from/yaml"
 
     def test_invalid_max_turns_ignored(self, monkeypatch):
         from agent.config import AgentConfig, _apply_env_api_keys
+
         monkeypatch.setenv("CLAUDE_SDK_MAX_TURNS", "not-a-number")
 
         cfg = AgentConfig()
@@ -262,6 +272,7 @@ class TestEditableConfigMeta:
 
     def test_claude_sdk_has_fields(self):
         from agent.config import AgentConfig, get_editable_config_meta
+
         cfg = AgentConfig()
         meta = get_editable_config_meta(cfg)
 
@@ -281,6 +292,7 @@ class TestEditableConfigMeta:
 
     def test_claude_sdk_subfields_types(self):
         from agent.config import AgentConfig, get_editable_config_meta
+
         cfg = AgentConfig()
         meta = get_editable_config_meta(cfg)
 
@@ -292,6 +304,7 @@ class TestEditableConfigMeta:
 
     def test_backend_has_options(self):
         from agent.config import AgentConfig, get_editable_config_meta
+
         cfg = AgentConfig()
         meta = get_editable_config_meta(cfg)
 
@@ -312,6 +325,7 @@ class TestSafeReceive:
 
         If error_at is set, raises an exception at that index.
         """
+
         class _MockStream:
             def __init__(self):
                 self._index = 0
@@ -337,16 +351,21 @@ class TestSafeReceive:
 
     async def test_normal_messages_yielded(self):
         """Normal messages pass through."""
-        from unittest.mock import MagicMock
         from claude_code_sdk import AssistantMessage, ResultMessage, TextBlock
 
         assistant = AssistantMessage(
-            content=[TextBlock(text="Hello")], model="test",
+            content=[TextBlock(text="Hello")],
+            model="test",
         )
         result = ResultMessage(
-            subtype="result", session_id="s1", num_turns=1,
-            duration_ms=100, duration_api_ms=50, is_error=False,
-            total_cost_usd=0.0, usage={},
+            subtype="result",
+            session_id="s1",
+            num_turns=1,
+            duration_ms=100,
+            duration_api_ms=50,
+            is_error=False,
+            total_cost_usd=0.0,
+            usage={},
         )
 
         client = await self._mock_client([assistant, result])
@@ -363,12 +382,18 @@ class TestSafeReceive:
         from claude_code_sdk import AssistantMessage, ResultMessage, TextBlock
 
         assistant = AssistantMessage(
-            content=[TextBlock(text="Hello")], model="test",
+            content=[TextBlock(text="Hello")],
+            model="test",
         )
         result = ResultMessage(
-            subtype="result", session_id="s1", num_turns=1,
-            duration_ms=100, duration_api_ms=50, is_error=False,
-            total_cost_usd=0.0, usage={},
+            subtype="result",
+            session_id="s1",
+            num_turns=1,
+            duration_ms=100,
+            duration_api_ms=50,
+            is_error=False,
+            total_cost_usd=0.0,
+            usage={},
         )
 
         # Error at index 1 (between assistant and result)
@@ -391,7 +416,8 @@ class TestSafeReceive:
         from claude_code_sdk import AssistantMessage, TextBlock
 
         assistant = AssistantMessage(
-            content=[TextBlock(text="Hi")], model="test",
+            content=[TextBlock(text="Hi")],
+            model="test",
         )
 
         client = await self._mock_client(
@@ -409,17 +435,28 @@ class TestSafeReceive:
         from claude_code_sdk import AssistantMessage, ResultMessage, TextBlock
 
         stale_result = ResultMessage(
-            subtype="result", session_id="old", num_turns=0,
-            duration_ms=0, duration_api_ms=0, is_error=False,
-            total_cost_usd=0.0, usage={},
+            subtype="result",
+            session_id="old",
+            num_turns=0,
+            duration_ms=0,
+            duration_api_ms=0,
+            is_error=False,
+            total_cost_usd=0.0,
+            usage={},
         )
         assistant = AssistantMessage(
-            content=[TextBlock(text="Real response")], model="test",
+            content=[TextBlock(text="Real response")],
+            model="test",
         )
         real_result = ResultMessage(
-            subtype="result", session_id="new", num_turns=1,
-            duration_ms=100, duration_api_ms=50, is_error=False,
-            total_cost_usd=0.0, usage={},
+            subtype="result",
+            session_id="new",
+            num_turns=1,
+            duration_ms=100,
+            duration_api_ms=50,
+            is_error=False,
+            total_cost_usd=0.0,
+            usage={},
         )
 
         client = await self._mock_client([stale_result, assistant, real_result])
@@ -438,12 +475,18 @@ class TestSafeReceive:
         from claude_code_sdk import AssistantMessage, ResultMessage, TextBlock
 
         assistant = AssistantMessage(
-            content=[TextBlock(text="Done")], model="test",
+            content=[TextBlock(text="Done")],
+            model="test",
         )
         result = ResultMessage(
-            subtype="result", session_id="s1", num_turns=1,
-            duration_ms=100, duration_api_ms=50, is_error=False,
-            total_cost_usd=0.0, usage={},
+            subtype="result",
+            session_id="s1",
+            num_turns=1,
+            duration_ms=100,
+            duration_api_ms=50,
+            is_error=False,
+            total_cost_usd=0.0,
+            usage={},
         )
 
         # Two consecutive errors then real messages
@@ -545,10 +588,14 @@ class TestSubagentFiltering:
     def test_sdk_stream_event_carries_subagent_flag(self):
         """SDKStreamEvent should carry subagent flag in data."""
         event_main = SDKStreamEvent(
-            type="text", content="Hello", data={"subagent": False},
+            type="text",
+            content="Hello",
+            data={"subagent": False},
         )
         event_sub = SDKStreamEvent(
-            type="text", content="Research", data={"subagent": True},
+            type="text",
+            content="Research",
+            data={"subagent": True},
         )
 
         assert not event_main.data.get("subagent")
@@ -564,9 +611,8 @@ class TestSubagentFiltering:
 
         accumulated = ""
         for event in events:
-            if event.type == "text":
-                if not (event.data and event.data.get("subagent")):
-                    accumulated += event.content
+            if event.type == "text" and not (event.data and event.data.get("subagent")):
+                accumulated += event.content
 
         assert accumulated == "Main answer"
         assert "Sub work" not in accumulated

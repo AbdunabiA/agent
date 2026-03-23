@@ -2,25 +2,21 @@
 
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from agent.config import OrchestrationConfig
 from agent.core.events import EventBus, Events
-from agent.core.orchestrator import ScopedToolRegistry, SubAgentOrchestrator
+from agent.core.orchestrator import SubAgentOrchestrator
 from agent.core.subagent import (
     AgentTeam,
     ConsultRequest,
-    ConsultResponse,
     SubAgentResult,
     SubAgentRole,
     SubAgentStatus,
-    SubAgentTask,
 )
 from agent.tools.registry import ToolDefinition, ToolTier
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -28,7 +24,9 @@ from agent.tools.registry import ToolDefinition, ToolTier
 
 
 def _make_tool_def(
-    name: str, tier: ToolTier = ToolTier.SAFE, enabled: bool = True,
+    name: str,
+    tier: ToolTier = ToolTier.SAFE,
+    enabled: bool = True,
 ) -> ToolDefinition:
     return ToolDefinition(
         name=name,
@@ -61,7 +59,9 @@ def _make_orchestrator(
     agent_loop.llm = MagicMock()
     agent_loop.tool_executor = MagicMock()
     config = OrchestrationConfig(
-        enabled=True, max_concurrent_agents=5, subagent_timeout=30,
+        enabled=True,
+        max_concurrent_agents=5,
+        subagent_timeout=30,
     )
     event_bus = EventBus()
     registry = _make_parent_registry(tools)
@@ -238,30 +238,33 @@ class TestConsultAgent:
     async def test_consult_tool_excluded_at_depth_1(self) -> None:
         """Scoped registry at depth 1 hides consult_agent."""
         consult_tool = _make_tool_def("consult_agent", ToolTier.MODERATE)
-        read_tool = _make_tool_def("read_file", ToolTier.SAFE)
+        # Use "file_read" — a tool in the essential_mcp_tools allowlist
+        read_tool = _make_tool_def("file_read", ToolTier.SAFE)
         orch = _make_orchestrator(tools=[consult_tool, read_tool])
 
         role = SubAgentRole(name="worker", persona="Worker.")
         scoped = orch._create_scoped_registry(role, nesting_depth=1)
 
         assert scoped.get_tool("consult_agent") is None
-        assert scoped.get_tool("read_file") is not None
+        assert scoped.get_tool("file_read") is not None
 
     @pytest.mark.asyncio
     async def test_consult_tool_available_at_depth_0(self) -> None:
         """Scoped registry at depth 0 exposes consult_agent."""
         consult_tool = _make_tool_def("consult_agent", ToolTier.MODERATE)
-        read_tool = _make_tool_def("read_file", ToolTier.SAFE)
+        # Use "file_read" — a tool in the essential_mcp_tools allowlist
+        read_tool = _make_tool_def("file_read", ToolTier.SAFE)
         orch = _make_orchestrator(tools=[consult_tool, read_tool])
 
         role = SubAgentRole(name="worker", persona="Worker.")
         scoped = orch._create_scoped_registry(role, nesting_depth=0)
 
         assert scoped.get_tool("consult_agent") is not None
-        assert scoped.get_tool("read_file") is not None
+        assert scoped.get_tool("file_read") is not None
 
 
 # Helpers for event capture
+
 
 async def _capture(events_list: list[str], name: str) -> None:
     events_list.append(name)

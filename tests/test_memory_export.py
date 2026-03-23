@@ -25,9 +25,9 @@ async def test_export_json_empty(exporter: MemoryExporter, tmp_path: Path) -> No
     stats = await exporter.export_json(output)
 
     assert stats["facts_exported"] == 0
-    assert Path(output).exists()
+    assert Path(output).exists()  # noqa: ASYNC240
 
-    data = json.loads(Path(output).read_text(encoding="utf-8"))
+    data = json.loads(Path(output).read_text(encoding="utf-8"))  # noqa: ASYNC240
     assert data["version"] == EXPORT_VERSION
     assert data["facts"] == []
     assert data["soul"] == ""
@@ -39,7 +39,7 @@ async def test_export_markdown_empty(exporter: MemoryExporter, tmp_path: Path) -
     output = str(tmp_path / "export.md")
     await exporter.export_markdown(output)
 
-    content = Path(output).read_text(encoding="utf-8")
+    content = Path(output).read_text(encoding="utf-8")  # noqa: ASYNC240
     assert "# Agent Memory Export" in content
 
 
@@ -70,7 +70,7 @@ async def test_export_with_soul_loader(tmp_path: Path) -> None:
     output = str(tmp_path / "export.json")
     await exporter.export_json(output)
 
-    data = json.loads(Path(output).read_text(encoding="utf-8"))
+    data = json.loads(Path(output).read_text(encoding="utf-8"))  # noqa: ASYNC240
     assert data["soul"] == "I am a helpful assistant."
 
 
@@ -85,6 +85,6 @@ async def test_export_markdown_with_soul(tmp_path: Path) -> None:
     output = str(tmp_path / "export.md")
     await exporter.export_markdown(output)
 
-    content = Path(output).read_text(encoding="utf-8")
+    content = Path(output).read_text(encoding="utf-8")  # noqa: ASYNC240
     assert "## Soul (Personality)" in content
     assert "I am a helpful assistant." in content

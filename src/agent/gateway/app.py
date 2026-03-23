@@ -9,6 +9,8 @@ Creates and configures the FastAPI app with:
 
 from __future__ import annotations
 
+import asyncio
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -16,7 +18,10 @@ import structlog
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
 
 from agent import __version__
 from agent.core.session import SessionStore
@@ -80,10 +85,20 @@ def create_app(
     Returns:
         Configured FastAPI application.
     """
+    # Disable OpenAPI docs when auth is configured to avoid leaking API schema
+    docs_kwargs: dict[str, str | None] = {}
+    if config.gateway.auth_token:
+        docs_kwargs = {
+            "docs_url": None,
+            "redoc_url": None,
+            "openapi_url": None,
+        }
+
     app = FastAPI(
         title="Agent API",
         version=__version__,
         description="Agent — autonomous AI assistant API",
+        **docs_kwargs,
     )
 
     # --- CORS middleware ---
@@ -91,8 +106,8 @@ def create_app(
         CORSMiddleware,
         allow_origins=config.gateway.cors_origins,
         allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_methods=["GET", "POST", "PUT", "DELETE"],
+        allow_headers=["Authorization", "Content-Type"],
     )
 
     # --- Rate limit middleware ---
@@ -100,6 +115,91 @@ def create_app(
 
     # --- Auth middleware ---
     app.add_middleware(AuthMiddleware, auth_token=config.gateway.auth_token)
+
+    # --- Request body size limit middleware (10MB) ---
+    _max_body_size = 10 * 1024 * 1024  # 10MB
+
+    class BodySizeLimitMiddleware(BaseHTTPMiddleware):
+        """Reject requests with Content-Length exceeding 10MB."""
+
+        async def dispatch(
+            self,
+            request: Request,
+            call_next: RequestResponseEndpoint,
+        ) -> Response:
+            content_length = request.headers.get("content-length")
+            if content_length and int(content_length) > _max_body_size:
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": "Request body too large. Maximum size is 10MB."},
+                )
+            return await call_next(request)
+
+    app.add_middleware(BodySizeLimitMiddleware)
+
+    # --- Security headers middleware ---
+    class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+        """Add security headers to all responses."""
+
+        async def dispatch(
+            self,
+            request: Request,
+            call_next: RequestResponseEndpoint,
+        ) -> Response:
+            response = await call_next(request)
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["X-XSS-Protection"] = "1; mode=block"
+            response.headers["Referrer-Policy"] = "no-referrer"
+            return response
+
+    app.add_middleware(SecurityHeadersMiddleware)
+
+    # --- Request timeout middleware (504 on timeout) ---
+    _request_timeout = config.gateway.request_timeout_seconds
+
+    class RequestTimeoutMiddleware(BaseHTTPMiddleware):
+        """Return 504 Gateway Timeout if request processing exceeds the timeout."""
+
+        async def dispatch(
+            self,
+            request: Request,
+            call_next: RequestResponseEndpoint,
+        ) -> Response:
+            try:
+                return await asyncio.wait_for(
+                    call_next(request),
+                    timeout=_request_timeout,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "request_timeout",
+                    path=request.url.path,
+                    method=request.method,
+                    timeout_seconds=_request_timeout,
+                )
+                return JSONResponse(
+                    status_code=504,
+                    content={"detail": "Request timed out."},
+                )
+
+    app.add_middleware(RequestTimeoutMiddleware)
+
+    # --- Request ID tracking middleware ---
+    class RequestIDMiddleware(BaseHTTPMiddleware):
+        """Read X-Request-ID from request or generate one, and set it on the response."""
+
+        async def dispatch(
+            self,
+            request: Request,
+            call_next: RequestResponseEndpoint,
+        ) -> Response:
+            request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+            response = await call_next(request)
+            response.headers["X-Request-ID"] = request_id
+            return response
+
+    app.add_middleware(RequestIDMiddleware)
 
     # --- Inject state ---
     app.state.config = config

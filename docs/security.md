@@ -120,3 +120,47 @@ Checks:
 - Telegram allowlist
 - Hardcoded secret scan
 - Dependency vulnerability check
+
+## Threat Model
+
+- Designed for single-user local deployment
+- Gateway binds to localhost by default (not exposed to the internet)
+- If exposed, use a reverse proxy with TLS (nginx, Caddy)
+- No multi-tenant isolation (workspaces share the same process)
+- No CSRF protection (API-only, no browser forms)
+
+## Authentication Details
+
+| Channel | Mechanism | Details |
+|---------|-----------|---------|
+| Gateway | Bearer token | `Authorization: Bearer <token>` header or `?token=` query param |
+| WebSocket | Query param | `?token=` at connection time |
+| Telegram | Allowlist | `allowed_users` restricts access by Telegram user ID |
+
+All tokens are compared using constant-time comparison (`secrets.compare_digest`).
+
+## Rate Limiting Details
+
+| Resource | Limit | Configurable |
+|----------|-------|-------------|
+| HTTP requests | 60 per minute per IP | `rate_limit_per_minute` |
+| Auth failures | 5 in 5 minutes → IP lockout | Yes |
+| WebSocket messages | 30 per minute per connection | Yes |
+| Concurrent WebSocket connections | 10 | Yes |
+| Max message size | 100KB | — |
+
+## Data Protection
+
+- Secrets (passwords, API keys, tokens) are automatically masked in the audit log
+- Config secrets are loaded from `.env` (gitignored)
+- Config values interpolated via `${VAR_NAME}` syntax from environment
+- Gateway auth token is never logged
+- `agent config show` masks all secret values in output
+
+## Known Limitations
+
+- **No built-in TLS** — use a reverse proxy for HTTPS
+- **No CSRF tokens** — API-only design, no browser form submissions
+- **No OAuth2/JWT** — static Bearer token only
+- **WebSocket token in URL** — passed via query parameter, visible in logs if proxy is misconfigured
+- **No per-user authentication** — single shared token for all API access

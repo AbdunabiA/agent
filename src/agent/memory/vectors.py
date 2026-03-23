@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from functools import partial
 from typing import Any
 from uuid import uuid4
 
@@ -140,9 +139,7 @@ class VectorStore:
     def _ensure_initialized(self) -> None:
         """Guard: raise if initialize() hasn't been called."""
         if self._collection is None:
-            raise RuntimeError(
-                "VectorStore not initialized. Call initialize() first."
-            )
+            raise RuntimeError("VectorStore not initialized. Call initialize() first.")
 
     async def add(
         self,
@@ -244,7 +241,7 @@ class VectorStore:
                     VectorResult(
                         id=doc_id,
                         text=results["documents"][0][i],
-                        metadata=results["metadatas"][0][i] if results["metadatas"] else {},
+                        metadata=(results["metadatas"][0][i] or {}) if results["metadatas"] else {},
                         distance=results["distances"][0][i] if results["distances"] else 0.0,
                     )
                 )
@@ -268,9 +265,7 @@ class VectorStore:
             session_id: The session ID to filter by.
         """
         self._ensure_initialized()
-        await asyncio.to_thread(
-            self._collection.delete, where={"session_id": session_id}
-        )
+        await asyncio.to_thread(self._collection.delete, where={"session_id": session_id})
         logger.debug("vectors_deleted_by_session", session_id=session_id)
 
     async def count(self) -> int:

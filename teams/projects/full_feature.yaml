@@ -1,13 +1,26 @@
 name: full_feature
-description: "End-to-end feature development — plan, build, test, document"
+description: "End-to-end feature — requirements, design, build, test, review with feedback loop, document"
 stages:
-  - name: planning
+  - name: requirements
     parallel: true
     agents:
       - team: product
         role: product_manager
+      - team: product
+        role: business_analyst
+
+  - name: design
+    parallel: true
+    agents:
       - team: engineering
         role: architect
+      - team: product
+        role: ux_designer
+
+  - name: database
+    agents:
+      - team: engineering
+        role: database_engineer
 
   - name: implementation
     parallel: true
@@ -17,16 +30,43 @@ stages:
       - team: engineering
         role: frontend_developer
 
-  - name: review
+  - name: testing
     parallel: true
     agents:
       - team: quality
         role: qa_engineer
       - team: quality
+        role: integration_tester
+    denied_tools:
+      - assign_task
+      - request_review
+      - ask_team
+    feedback:
+      fix_stage: fix_issues
+      max_retries: 3
+
+  - name: fix_issues
+    feedback_target: true
+    parallel: true
+    agents:
+      - team: engineering
+        role: backend_developer
+      - team: engineering
+        role: frontend_developer
+
+  - name: security_review
+    agents:
+      - team: quality
         role: security_reviewer
+    denied_tools:
+      - file_write
+      - assign_task
+      - request_review
 
   - name: documentation
     parallel: true
     agents:
       - team: content
         role: technical_writer
+      - team: content
+        role: api_docs_writer

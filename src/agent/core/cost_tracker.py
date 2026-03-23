@@ -11,9 +11,12 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
+
+if TYPE_CHECKING:
+    from agent.memory.database import Database
 
 logger = structlog.get_logger(__name__)
 
@@ -99,6 +102,16 @@ class CostTracker:
     def __init__(self) -> None:
         self._entries: list[UsageEntry] = []
         self._start_time = time.time()
+        self._db: Database | None = None
+
+    def set_database(self, db: Database) -> None:
+        """Attach a database for persisting cost entries.
+
+        Args:
+            db: The Database instance to persist entries to.
+        """
+        self._db = db
+        logger.info("cost_tracker_database_set")
 
     def record(
         self,
@@ -131,6 +144,15 @@ class CostTracker:
         )
         self._entries.append(entry)
 
+        if self._db:
+            try:
+                import asyncio
+
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._persist_entry(entry))
+            except RuntimeError:
+                pass  # No event loop running; skip async persistence
+
         logger.debug(
             "cost_recorded",
             model=model,
@@ -139,6 +161,34 @@ class CostTracker:
             cost=f"${cost:.6f}",
         )
         return entry
+
+    async def _persist_entry(self, entry: UsageEntry) -> None:
+        """Persist a cost entry to the database.
+
+        Args:
+            entry: The usage entry to persist.
+        """
+        if not self._db:
+            return
+        try:
+            await self._db.db.execute(
+                """INSERT INTO cost_entries
+                   (model, input_tokens, output_tokens, cost, channel,
+                    session_id, timestamp)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    entry.model,
+                    entry.input_tokens,
+                    entry.output_tokens,
+                    entry.cost,
+                    entry.channel,
+                    entry.session_id,
+                    entry.timestamp.isoformat(),
+                ),
+            )
+            await self._db.db.commit()
+        except Exception as e:
+            logger.warning("cost_entry_persist_failed", error=str(e))
 
     def get_total_cost(self) -> float:
         """Get total estimated cost across all entries.
@@ -218,9 +268,7 @@ class CostTracker:
             "by_channel": by_channel,
         }
 
-    def _aggregate_by_time(
-        self, entries: list[UsageEntry], period: str
-    ) -> list[dict[str, Any]]:
+    def _aggregate_by_time(self, entries: list[UsageEntry], period: str) -> list[dict[str, Any]]:
         """Group entries into time buckets.
 
         Args:

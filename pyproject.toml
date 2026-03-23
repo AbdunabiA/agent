@@ -50,6 +50,11 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.11",
     "pre-commit>=3.8",
+    # Optional module deps needed for full test coverage
+    "chromadb>=1.0,<2",
+    "sentence-transformers>=5.0",
+    "Pillow>=10.0",
+    "pyautogui>=0.9.54",
 ]
 memory = [
     "chromadb>=1.0,<2",
@@ -64,6 +69,9 @@ desktop = [
 ]
 claude-sdk = [
     "claude-code-sdk>=0.1.0",
+]
+email = [
+    "aiosmtplib>=2.0",
 ]
 voice = [
     "faster-whisper>=1.0",
@@ -84,6 +92,7 @@ all = [
     "pyperclip>=1.8",
     "pygetwindow>=0.0.9; sys_platform == 'win32'",
     "claude-code-sdk>=0.1.0",
+    "aiosmtplib>=2.0",
 ]
 
 [project.urls]

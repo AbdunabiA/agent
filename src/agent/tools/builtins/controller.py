@@ -67,6 +67,7 @@ async def assign_work_tool(
     user_id = ""
     try:
         from agent.tools.builtins.scheduler import _user_id_var
+
         user_id = _user_id_var.get("") or ""
     except Exception:
         pass
@@ -77,12 +78,28 @@ async def assign_work_tool(
         priority=priority,
         user_id=user_id,
     )
-    await controller.submit_order(order)
-    return (
-        f"Work order '{order.order_id}' submitted to controller.\n"
-        f"The controller will plan and delegate this work autonomously.\n"
-        f"Use check_work_status to monitor progress."
-    )
+    try:
+        await controller.submit_order(order)
+    except Exception as e:
+        return f"Failed to submit work order: {e}"
+
+    # Emit task accepted event for channel notifications (best-effort)
+    from agent.core.events import Events
+
+    try:
+        if controller.event_bus is not None:
+            await controller.event_bus.emit(
+                Events.TASK_ACCEPTED,
+                {
+                    "task_id": order.order_id,
+                    "user_id": user_id,
+                    "summary": instruction[:2000],
+                },
+            )
+    except Exception:
+        pass  # notification is non-critical
+
+    return f"\u26a1 Task accepted (ID: {order.order_id}). " f"I'll notify you when done."
 
 
 @tool(
@@ -111,9 +128,7 @@ async def check_work_status_tool(order_id: str = "") -> str:
 
 @tool(
     name="direct_controller",
-    description=(
-        "Send a directive to the controller: stop, pause, or redirect a work order."
-    ),
+    description=("Send a directive to the controller: stop, pause, or redirect a work order."),
     tier=ToolTier.MODERATE,
 )
 async def direct_controller_tool(

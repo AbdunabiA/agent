@@ -7,6 +7,7 @@ Post-execution output sanitization and truncation.
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,17 +38,18 @@ class Guardrails:
 
     # Dangerous command patterns that should ALWAYS be blocked
     BLOCKED_PATTERNS: list[str] = [
-        r"rm\s+-rf\s+/(?!\w)",  # rm -rf / (but allow rm -rf /some/path)
+        r"rm\s+(-\w*r\w*f|-\w*f\w*r)\w*\s+/(\s|$|;|&|\|)",  # rm -rf / variants
         r"rm\s+-rf\s+~/?$",  # rm -rf ~ or rm -rf ~/
         r"mkfs\.",  # Format filesystem
         r"dd\s+if=.*of=/dev/",  # Direct disk write
-        r":\(\)\{.*\|.*&\s*\}\s*;",  # Fork bomb
+        r":\(\)\s*\{.*\|.*&",  # Fork bomb (classic)
+        r"\w+\(\)\s*\{\s*\w+\s*\|\s*\w+\s*&",  # Fork bomb (named variant)
         r"chmod\s+-R\s+777\s+/",  # Recursive 777 on root
         r"curl.*\|\s*(ba)?sh",  # Pipe curl to shell
         r"wget.*\|\s*(ba)?sh",  # Pipe wget to shell
         r">\s*/dev/sd[a-z]",  # Overwrite disk device
         r"shutdown|reboot|poweroff",  # System power commands
-        r"\bpasswd\b",  # Password change
+        r"\b(passwd|chpasswd|usermod\s+-p)\b",  # Password change
         r"\buserdel\b|\buseradd\b",  # User management
     ]
 
@@ -93,7 +95,8 @@ class Guardrails:
         # If allowed_commands is not ["*"], check command starts with an allowed command
         if self._custom_allowed != ["*"]:
             cmd_name = command.strip().split()[0] if command.strip() else ""
-            if cmd_name not in self._custom_allowed:
+            cmd_basename = os.path.basename(cmd_name)
+            if cmd_basename not in self._custom_allowed and cmd_name not in self._custom_allowed:
                 return GuardrailResult(
                     allowed=False,
                     reason=f"Command '{cmd_name}' is not in allowed commands list",
@@ -129,7 +132,7 @@ class Guardrails:
             import os as _os
 
             root_resolved = Path(_os.path.expanduser(root)).resolve()
-            if not str(resolved).startswith(str(root_resolved)):
+            if not resolved.is_relative_to(root_resolved):
                 return GuardrailResult(
                     allowed=False,
                     reason=f"Path {path} is outside allowed root {root}",

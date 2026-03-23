@@ -18,14 +18,12 @@ from agent.skills.builder import (
     BLOCKED_PATTERNS,
     GeneratedSkill,
     SkillBuilder,
-    SkillBuildResult,
-    ValidationResult,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _valid_main_py() -> str:
     """Return valid main.py content that passes all validation checks."""
@@ -86,6 +84,7 @@ def _make_llm_response(content: str) -> MagicMock:
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def event_bus() -> EventBus:
     return EventBus()
@@ -126,6 +125,7 @@ def builder(
 # ===========================================================================
 # 1. _validate_code tests
 # ===========================================================================
+
 
 class TestValidateCode:
     """Tests for SkillBuilder._validate_code."""
@@ -272,6 +272,7 @@ class TestValidateCode:
 # 2. _generate_name tests
 # ===========================================================================
 
+
 class TestGenerateName:
     """Tests for SkillBuilder._generate_name."""
 
@@ -319,6 +320,7 @@ class TestGenerateName:
 # 3. build_skill tests
 # ===========================================================================
 
+
 class TestBuildSkill:
     """Tests for SkillBuilder.build_skill — full pipeline."""
 
@@ -330,10 +332,12 @@ class TestBuildSkill:
         tmp_path: Path,
     ) -> None:
         """Successful build: generate code, validate, stage, sandbox test."""
-        generated_json = json.dumps({
-            "skill_md": _valid_skill_md(),
-            "main_py": _valid_main_py(),
-        })
+        generated_json = json.dumps(
+            {
+                "skill_md": _valid_skill_md(),
+                "main_py": _valid_main_py(),
+            }
+        )
         mock_llm.completion.return_value = _make_llm_response(generated_json)
 
         with patch.object(builder, "_sandbox_test") as mock_sandbox:
@@ -360,10 +364,12 @@ class TestBuildSkill:
     ) -> None:
         """When name is None, _generate_name is called first."""
         # First call: _generate_name; second call: _generate_code
-        generated_json = json.dumps({
-            "skill_md": _valid_skill_md(),
-            "main_py": _valid_main_py(),
-        })
+        generated_json = json.dumps(
+            {
+                "skill_md": _valid_skill_md(),
+                "main_py": _valid_main_py(),
+            }
+        )
         mock_llm.completion.side_effect = [
             _make_llm_response("auto-named"),
             _make_llm_response(generated_json),
@@ -390,10 +396,12 @@ class TestBuildSkill:
         mock_llm: AsyncMock,
     ) -> None:
         """Name is lowered, spaces/underscores become dashes, non-alnum stripped."""
-        generated_json = json.dumps({
-            "skill_md": _valid_skill_md(),
-            "main_py": _valid_main_py(),
-        })
+        generated_json = json.dumps(
+            {
+                "skill_md": _valid_skill_md(),
+                "main_py": _valid_main_py(),
+            }
+        )
         mock_llm.completion.return_value = _make_llm_response(generated_json)
 
         with patch.object(builder, "_sandbox_test") as mock_sandbox:
@@ -414,18 +422,19 @@ class TestBuildSkill:
         mock_llm: AsyncMock,
     ) -> None:
         """Validation failure triggers retry with error context."""
-        bad_code = (
-            "class NotASkill:\n"
-            "    pass\n"
+        bad_code = "class NotASkill:\n" "    pass\n"
+        bad_json = json.dumps(
+            {
+                "skill_md": _valid_skill_md(),
+                "main_py": bad_code,
+            }
         )
-        bad_json = json.dumps({
-            "skill_md": _valid_skill_md(),
-            "main_py": bad_code,
-        })
-        good_json = json.dumps({
-            "skill_md": _valid_skill_md(),
-            "main_py": _valid_main_py(),
-        })
+        good_json = json.dumps(
+            {
+                "skill_md": _valid_skill_md(),
+                "main_py": _valid_main_py(),
+            }
+        )
 
         # First attempt fails validation, second succeeds
         mock_llm.completion.side_effect = [
@@ -454,10 +463,12 @@ class TestBuildSkill:
         tmp_path: Path,
     ) -> None:
         """Sandbox test failure triggers retry; staging dir is cleaned up."""
-        generated_json = json.dumps({
-            "skill_md": _valid_skill_md(),
-            "main_py": _valid_main_py(),
-        })
+        generated_json = json.dumps(
+            {
+                "skill_md": _valid_skill_md(),
+                "main_py": _valid_main_py(),
+            }
+        )
         mock_llm.completion.return_value = _make_llm_response(generated_json)
 
         call_count = 0
@@ -469,9 +480,7 @@ class TestBuildSkill:
                 return MagicMock(
                     passed=False, output="", error="ImportError: no module", duration_ms=50
                 )
-            return MagicMock(
-                passed=True, output="Registered 1 tool(s)", error="", duration_ms=50
-            )
+            return MagicMock(passed=True, output="Registered 1 tool(s)", error="", duration_ms=50)
 
         with patch.object(builder, "_sandbox_test", side_effect=sandbox_side_effect):
             result = await builder.build_skill(
@@ -490,10 +499,12 @@ class TestBuildSkill:
     ) -> None:
         """All retries fail -> SkillBuildResult with success=False."""
         bad_code = "class NotASkill:\n    pass\n"
-        bad_json = json.dumps({
-            "skill_md": _valid_skill_md(),
-            "main_py": bad_code,
-        })
+        bad_json = json.dumps(
+            {
+                "skill_md": _valid_skill_md(),
+                "main_py": bad_code,
+            }
+        )
         mock_llm.completion.return_value = _make_llm_response(bad_json)
 
         result = await builder.build_skill(
@@ -513,10 +524,12 @@ class TestBuildSkill:
         event_bus: EventBus,
     ) -> None:
         """Events are emitted for build requested and completed."""
-        generated_json = json.dumps({
-            "skill_md": _valid_skill_md(),
-            "main_py": _valid_main_py(),
-        })
+        generated_json = json.dumps(
+            {
+                "skill_md": _valid_skill_md(),
+                "main_py": _valid_main_py(),
+            }
+        )
         mock_llm.completion.return_value = _make_llm_response(generated_json)
 
         emitted_events: list[tuple[str, dict]] = []
@@ -545,10 +558,12 @@ class TestBuildSkill:
         mock_llm: AsyncMock,
     ) -> None:
         """Permissions not in config.max_permissions are filtered out."""
-        generated_json = json.dumps({
-            "skill_md": _valid_skill_md(),
-            "main_py": _valid_main_py(),
-        })
+        generated_json = json.dumps(
+            {
+                "skill_md": _valid_skill_md(),
+                "main_py": _valid_main_py(),
+            }
+        )
         mock_llm.completion.return_value = _make_llm_response(generated_json)
 
         with patch.object(builder, "_sandbox_test") as mock_sandbox:
@@ -570,10 +585,12 @@ class TestBuildSkill:
         mock_llm: AsyncMock,
     ) -> None:
         """If all requested permissions are blocked, falls back to ['safe']."""
-        generated_json = json.dumps({
-            "skill_md": _valid_skill_md(),
-            "main_py": _valid_main_py(),
-        })
+        generated_json = json.dumps(
+            {
+                "skill_md": _valid_skill_md(),
+                "main_py": _valid_main_py(),
+            }
+        )
         mock_llm.completion.return_value = _make_llm_response(generated_json)
 
         with patch.object(builder, "_sandbox_test") as mock_sandbox:
@@ -595,10 +612,12 @@ class TestBuildSkill:
         mock_llm: AsyncMock,
     ) -> None:
         """A .auto_generated marker file is created on success."""
-        generated_json = json.dumps({
-            "skill_md": _valid_skill_md(),
-            "main_py": _valid_main_py(),
-        })
+        generated_json = json.dumps(
+            {
+                "skill_md": _valid_skill_md(),
+                "main_py": _valid_main_py(),
+            }
+        )
         mock_llm.completion.return_value = _make_llm_response(generated_json)
 
         with patch.object(builder, "_sandbox_test") as mock_sandbox:
@@ -623,13 +642,12 @@ class TestBuildSkill:
 # 4. approve_skill tests
 # ===========================================================================
 
+
 class TestApproveSkill:
     """Tests for SkillBuilder.approve_skill."""
 
     @pytest.mark.asyncio
-    async def test_approve_moves_to_skills_dir(
-        self, builder: SkillBuilder, tmp_path: Path
-    ) -> None:
+    async def test_approve_moves_to_skills_dir(self, builder: SkillBuilder, tmp_path: Path) -> None:
         """Staged skill is moved to the default skills directory."""
         # Create staging dir with a skill
         staging = builder.staging_dir / "my-skill"
@@ -640,7 +658,7 @@ class TestApproveSkill:
         # Without a skill_manager, target is Path("skills") / name
         # Patch Path("skills") to use tmp_path
         target_dir = tmp_path / "active_skills"
-        with patch("agent.skills.builder.Path") as mock_path_cls:
+        with patch("agent.skills.builder.Path"):
             # We need the staging_dir to still work, so only patch the
             # fallback Path("skills") / name call inside approve_skill.
             # Instead, set up a skill_manager mock.
@@ -663,9 +681,7 @@ class TestApproveSkill:
         assert "No staged skill found" in msg
 
     @pytest.mark.asyncio
-    async def test_approve_already_exists(
-        self, builder: SkillBuilder, tmp_path: Path
-    ) -> None:
+    async def test_approve_already_exists(self, builder: SkillBuilder, tmp_path: Path) -> None:
         """Cannot approve if skill already exists in target dir."""
         staging = builder.staging_dir / "my-skill"
         staging.mkdir(parents=True)
@@ -707,6 +723,7 @@ class TestApproveSkill:
 # 5. reject_skill tests
 # ===========================================================================
 
+
 class TestRejectSkill:
     """Tests for SkillBuilder.reject_skill."""
 
@@ -731,6 +748,7 @@ class TestRejectSkill:
 # ===========================================================================
 # 6. list_staged tests
 # ===========================================================================
+
 
 class TestListStaged:
     """Tests for SkillBuilder.list_staged."""
@@ -781,11 +799,15 @@ class TestListStaged:
         s1.mkdir()
         (s1 / "SKILL.md").write_text("---\nname: with-marker\n---")
         (s1 / "main.py").write_text("# code")
-        (s1 / ".auto_generated").write_text(json.dumps({
-            "auto_generated": True,
-            "description": "A cool skill",
-            "created_at": "2025-01-01T00:00:00",
-        }))
+        (s1 / ".auto_generated").write_text(
+            json.dumps(
+                {
+                    "auto_generated": True,
+                    "description": "A cool skill",
+                    "created_at": "2025-01-01T00:00:00",
+                }
+            )
+        )
 
         result = builder.list_staged()
         assert len(result) == 1
@@ -838,6 +860,7 @@ class TestListStaged:
 # ===========================================================================
 # 7. parse_natural_schedule tests
 # ===========================================================================
+
 
 class TestParseNaturalSchedule:
     """Tests for parse_natural_schedule from scheduler.py."""
@@ -939,6 +962,7 @@ class TestParseNaturalSchedule:
 # 8. _stage_skill and _write_marker tests
 # ===========================================================================
 
+
 class TestStagingInternals:
     """Tests for _stage_skill and _write_marker."""
 
@@ -981,6 +1005,7 @@ class TestStagingInternals:
 # 9. _extract_from_markdown tests
 # ===========================================================================
 
+
 class TestExtractFromMarkdown:
     """Tests for the markdown code block fallback parser."""
 
@@ -1017,6 +1042,7 @@ class TestExtractFromMarkdown:
 # 10. _generate_code tests
 # ===========================================================================
 
+
 class TestGenerateCode:
     """Tests for SkillBuilder._generate_code."""
 
@@ -1024,10 +1050,12 @@ class TestGenerateCode:
     async def test_generate_code_parses_json(
         self, builder: SkillBuilder, mock_llm: AsyncMock
     ) -> None:
-        resp_json = json.dumps({
-            "skill_md": "---\nname: test\n---\n",
-            "main_py": "from agent.skills.base import Skill\nclass T(Skill):\n  pass",
-        })
+        resp_json = json.dumps(
+            {
+                "skill_md": "---\nname: test\n---\n",
+                "main_py": "from agent.skills.base import Skill\nclass T(Skill):\n  pass",
+            }
+        )
         mock_llm.completion.return_value = _make_llm_response(resp_json)
 
         result = await builder._generate_code("test", "A test skill", ["safe"])
@@ -1042,10 +1070,12 @@ class TestGenerateCode:
         self, builder: SkillBuilder, mock_llm: AsyncMock
     ) -> None:
         """Previous error is included in the prompt for retry context."""
-        resp_json = json.dumps({
-            "skill_md": "---\nname: test\n---\n",
-            "main_py": "from agent.skills.base import Skill\nclass T(Skill):\n  pass",
-        })
+        resp_json = json.dumps(
+            {
+                "skill_md": "---\nname: test\n---\n",
+                "main_py": "from agent.skills.base import Skill\nclass T(Skill):\n  pass",
+            }
+        )
         mock_llm.completion.return_value = _make_llm_response(resp_json)
 
         await builder._generate_code(
@@ -1089,9 +1119,9 @@ class TestGenerateCode:
     ) -> None:
         """JSON embedded in surrounding text is extracted correctly."""
         response = (
-            'Sure, here is the skill:\n'
+            "Sure, here is the skill:\n"
             '{"skill_md": "---\\nname: embedded\\n---", "main_py": "code"}\n'
-            'Let me know if you need changes.'
+            "Let me know if you need changes."
         )
         mock_llm.completion.return_value = _make_llm_response(response)
 

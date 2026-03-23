@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.core.subagent import AgentTeam, FeedbackConfig, SubAgentRole
+from agent.core.subagent import AgentTeam, SubAgentRole
 from agent.teams.loader import (
     TeamLoadError,
     config_to_team,
@@ -16,7 +16,6 @@ from agent.teams.loader import (
     parse_project_file,
     parse_team_file,
 )
-
 
 # ---------------------------------------------------------------------------
 # discover_team_files
@@ -153,11 +152,7 @@ class TestParseTeamFile:
 
     def test_role_not_dict_raises(self, tmp_path: Path) -> None:
         f = tmp_path / "bad_role.yaml"
-        f.write_text(
-            "name: bad\n"
-            "roles:\n"
-            "  - just a string\n"
-        )
+        f.write_text("name: bad\n" "roles:\n" "  - just a string\n")
 
         with pytest.raises(TeamLoadError, match="Role must be a dict"):
             parse_team_file(f)
@@ -236,12 +231,8 @@ class TestConfigToTeam:
 
 class TestLoadTeamsFromDirectory:
     def test_loads_all_valid_files(self, tmp_path: Path) -> None:
-        (tmp_path / "a.yaml").write_text(
-            "name: alpha\ndescription: A\nroles:\n  - name: a1\n"
-        )
-        (tmp_path / "b.yaml").write_text(
-            "name: beta\ndescription: B\nroles:\n  - name: b1\n"
-        )
+        (tmp_path / "a.yaml").write_text("name: alpha\ndescription: A\nroles:\n  - name: a1\n")
+        (tmp_path / "b.yaml").write_text("name: beta\ndescription: B\nroles:\n  - name: b1\n")
 
         teams = load_teams_from_directory(tmp_path)
 
@@ -249,9 +240,7 @@ class TestLoadTeamsFromDirectory:
         assert names == {"alpha", "beta"}
 
     def test_skips_invalid_files(self, tmp_path: Path) -> None:
-        (tmp_path / "good.yaml").write_text(
-            "name: good\nroles:\n  - name: g1\n"
-        )
+        (tmp_path / "good.yaml").write_text("name: good\nroles:\n  - name: g1\n")
         (tmp_path / "bad.yaml").write_text(":\n  [invalid")
 
         teams = load_teams_from_directory(tmp_path)
@@ -265,8 +254,7 @@ class TestLoadTeamsFromDirectory:
 
     def test_multi_team_file(self, tmp_path: Path) -> None:
         (tmp_path / "multi.yaml").write_text(
-            "- name: x\n  roles:\n    - name: x1\n"
-            "- name: y\n  roles:\n    - name: y1\n"
+            "- name: x\n  roles:\n    - name: x1\n" "- name: y\n  roles:\n    - name: y1\n"
         )
 
         teams = load_teams_from_directory(tmp_path)

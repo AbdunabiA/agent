@@ -6,6 +6,7 @@ from the primary model to a configured fallback.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from collections.abc import AsyncGenerator
@@ -19,6 +20,8 @@ from agent.config import ModelsConfig
 from agent.core.session import TokenUsage, ToolCall
 
 logger = structlog.get_logger(__name__)
+
+_RETRYABLE_ERRORS = ("rate_limit", "timeout", "overloaded", "503", "429", "529")
 
 
 @dataclass
@@ -72,6 +75,23 @@ class LLMProvider:
         # Suppress LiteLLM debug noise
         litellm.suppress_debug_info = True
 
+    async def _retry_with_backoff(self, func, *args, max_retries=2, **kwargs):
+        """Retry an async function with exponential backoff on transient errors."""
+        last_error = None
+        for attempt in range(max_retries + 1):
+            try:
+                return await func(*args, **kwargs)
+            except Exception as e:
+                last_error = e
+                error_str = str(e).lower()
+                if attempt < max_retries and any(r in error_str for r in _RETRYABLE_ERRORS):
+                    delay = min(2**attempt, 8)
+                    logger.info("llm_retry", attempt=attempt + 1, delay=delay, error=str(e))
+                    await asyncio.sleep(delay)
+                else:
+                    raise
+        raise last_error
+
     async def completion(
         self,
         messages: list[dict[str, Any]],
@@ -110,7 +130,8 @@ class LLMProvider:
             kwargs["tools"] = tools
 
         try:
-            response = await litellm.acompletion(
+            response = await self._retry_with_backoff(
+                litellm.acompletion,
                 model=target_model,
                 messages=messages,
                 **kwargs,
@@ -193,17 +214,13 @@ class LLMProvider:
                 if not chunk.choices:
                     # Usage-only chunk (some providers send usage separately)
                     if hasattr(chunk, "usage") and chunk.usage:
-                        usage = TokenUsage(
-                            input_tokens=getattr(
-                                chunk.usage, "prompt_tokens", 0
-                            ) or 0,
-                            output_tokens=getattr(
-                                chunk.usage, "completion_tokens", 0
-                            ) or 0,
-                            total_tokens=getattr(
-                                chunk.usage, "total_tokens", 0
-                            ) or 0,
-                        )
+                        new_total = getattr(chunk.usage, "total_tokens", 0) or 0
+                        if new_total > 0 and (usage is None or new_total >= usage.total_tokens):
+                            usage = TokenUsage(
+                                input_tokens=getattr(chunk.usage, "prompt_tokens", 0) or 0,
+                                output_tokens=getattr(chunk.usage, "completion_tokens", 0) or 0,
+                                total_tokens=new_total,
+                            )
                     continue
 
                 delta = chunk.choices[0].delta
@@ -229,13 +246,11 @@ class LLMProvider:
                             accumulated_tool_calls[idx]["id"] = tc_delta.id
                         if hasattr(tc_delta, "function") and tc_delta.function:
                             if tc_delta.function.name:
-                                accumulated_tool_calls[idx][
-                                    "name"
-                                ] = tc_delta.function.name
+                                accumulated_tool_calls[idx]["name"] = tc_delta.function.name
                             if tc_delta.function.arguments:
-                                accumulated_tool_calls[idx][
-                                    "arguments"
-                                ] += tc_delta.function.arguments
+                                accumulated_tool_calls[idx]["arguments"] += (
+                                    tc_delta.function.arguments
+                                )
 
                 # Finish reason
                 if chunk.choices[0].finish_reason:
@@ -243,17 +258,13 @@ class LLMProvider:
 
                 # Usage (usually in the last chunk)
                 if hasattr(chunk, "usage") and chunk.usage:
-                    usage = TokenUsage(
-                        input_tokens=getattr(
-                            chunk.usage, "prompt_tokens", 0
-                        ) or 0,
-                        output_tokens=getattr(
-                            chunk.usage, "completion_tokens", 0
-                        ) or 0,
-                        total_tokens=getattr(
-                            chunk.usage, "total_tokens", 0
-                        ) or 0,
-                    )
+                    new_total = getattr(chunk.usage, "total_tokens", 0) or 0
+                    if new_total > 0 and (usage is None or new_total >= usage.total_tokens):
+                        usage = TokenUsage(
+                            input_tokens=getattr(chunk.usage, "prompt_tokens", 0) or 0,
+                            output_tokens=getattr(chunk.usage, "completion_tokens", 0) or 0,
+                            total_tokens=new_total,
+                        )
 
             # Parse accumulated tool calls
             tool_calls: list[ToolCall] | None = None
@@ -268,9 +279,10 @@ class LLMProvider:
                             logger.warning(
                                 "tool_call_args_parse_failed",
                                 tool=tc_data["name"],
+                                tool_call_id=tc_data["id"],
                                 raw_args=args[:200] if isinstance(args, str) else str(args)[:200],
                             )
-                            args = {}
+                            args = {"_raw_arguments": args} if isinstance(args, str) else {}
                     tool_calls.append(
                         ToolCall(
                             id=tc_data["id"],
@@ -304,17 +316,14 @@ class LLMProvider:
                 try:
                     # Fallback to non-streaming for simplicity
                     fallback_kwargs = {
-                        k: v for k, v in kwargs.items()
-                        if k not in ("stream", "stream_options")
+                        k: v for k, v in kwargs.items() if k not in ("stream", "stream_options")
                     }
                     fb_response = await litellm.acompletion(
                         model=self.config.fallback,
                         messages=messages,
                         **fallback_kwargs,
                     )
-                    parsed = self._parse_response(
-                        fb_response, self.config.fallback
-                    )
+                    parsed = self._parse_response(fb_response, self.config.fallback)
                     if parsed.content:
                         yield LLMStreamChunk(
                             content=parsed.content,
@@ -370,9 +379,10 @@ class LLMProvider:
                         logger.warning(
                             "tool_call_args_parse_failed",
                             tool=tc.function.name,
+                            tool_call_id=tc.id,
                             raw_args=args[:200],
                         )
-                        args = {}
+                        args = {"_raw_arguments": args} if isinstance(args, str) else {}
                 elif not isinstance(args, dict):
                     args = {}
                 tool_calls.append(

@@ -9,7 +9,11 @@ Auth is enforced via ?token= query parameter when gateway.auth_token is configur
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import json
+import secrets
+import time
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -22,6 +26,12 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 router = APIRouter()
+
+# Maximum concurrent WebSocket connections
+MAX_WS_CONNECTIONS = 10
+
+# Maximum WebSocket message size in characters
+MAX_WS_MESSAGE_SIZE = 100000
 
 
 async def _safe_send(ws: WebSocket, data: dict[str, Any]) -> bool:
@@ -106,7 +116,9 @@ def _verify_token(websocket: WebSocket, token: str | None) -> bool:
     """
     config = websocket.app.state.config
     auth_token = config.gateway.auth_token
-    return not (auth_token and token != auth_token)
+    if not auth_token:
+        return True
+    return secrets.compare_digest(token or "", auth_token)
 
 
 @router.websocket("/ws/events")
@@ -129,12 +141,28 @@ async def websocket_events(websocket: WebSocket, token: str | None = None) -> No
         await websocket.close(code=4001, reason="Unauthorized")
         return
 
+    # Check connection limit
+    total_connections = manager.event_connection_count + manager.chat_connection_count
+    if total_connections >= MAX_WS_CONNECTIONS:
+        await websocket.accept()
+        await websocket.close(code=1013, reason="Maximum connections reached")
+        return
+
     await manager.connect_events(websocket)
     logger.info("ws_events_connected", total=manager.event_connection_count)
 
     try:
         while True:
             data = await websocket.receive_text()
+            if len(data) > MAX_WS_MESSAGE_SIZE:
+                await _safe_send(
+                    websocket,
+                    {
+                        "type": "error",
+                        "message": f"Message too large (max {MAX_WS_MESSAGE_SIZE} chars).",
+                    },
+                )
+                continue
             if data == "ping":
                 await websocket.send_text("pong")
     except WebSocketDisconnect:
@@ -150,48 +178,89 @@ async def _handle_litellm_message(
 ) -> None:
     """Process a chat message via the LiteLLM agent loop (streaming)."""
     final_response = None
-    async for event in agent_loop.process_message_stream(
-        user_message=content,
-        session=session,
-        trigger="user_message",
-    ):
-        if event.type == "chunk":
-            await _safe_send(websocket, {
-                "type": "response.chunk",
-                "content": event.content,
-            })
-        elif event.type == "tool.execute":
-            await _safe_send(websocket, {
-                "type": "tool.execute",
-                "tool": event.data.get("tool", ""),
-                "arguments": event.data.get("arguments", {}),
-            })
-        elif event.type == "tool.result":
-            await _safe_send(websocket, {
-                "type": "tool.result",
-                "tool": event.data.get("tool", ""),
-                "success": event.data.get("success", False),
-                "output": event.data.get("output", ""),
-            })
-        elif event.type == "done":
-            final_response = event.response
+    try:
+        async with asyncio.timeout(300):
+            async for event in agent_loop.process_message_stream(
+                user_message=content,
+                session=session,
+                trigger="user_message",
+            ):
+                if event.type == "chunk":
+                    await _safe_send(
+                        websocket,
+                        {
+                            "type": "response.chunk",
+                            "content": event.content,
+                        },
+                    )
+                elif event.type == "tool.execute":
+                    await _safe_send(
+                        websocket,
+                        {
+                            "type": "tool.execute",
+                            "tool": event.data.get("tool", ""),
+                            "arguments": event.data.get("arguments", {}),
+                        },
+                    )
+                elif event.type == "tool.result":
+                    await _safe_send(
+                        websocket,
+                        {
+                            "type": "tool.result",
+                            "tool": event.data.get("tool", ""),
+                            "success": event.data.get("success", False),
+                            "output": event.data.get("output", ""),
+                        },
+                    )
+                elif event.type == "done":
+                    final_response = event.response
+    except TimeoutError:
+        logger.error("ws_litellm_stream_timeout", session_id=session.id)
+        await _safe_send(
+            websocket,
+            {
+                "type": "error",
+                "message": "Stream timed out after 300 seconds",
+            },
+        )
+    except asyncio.CancelledError:
+        logger.warning("ws_litellm_stream_cancelled", session_id=session.id)
+        await _safe_send(
+            websocket,
+            {
+                "type": "error",
+                "message": "Stream was cancelled",
+            },
+        )
+    except Exception as e:
+        logger.error("ws_litellm_stream_error", session_id=session.id, error=str(e))
+        await _safe_send(
+            websocket,
+            {
+                "type": "error",
+                "message": f"Stream error: {e}",
+            },
+        )
 
     await _safe_send(websocket, {"type": "typing", "status": False})
 
     if final_response:
-        await _safe_send(websocket, {
-            "type": "response.end",
-            "content": final_response.content,
-            "model": final_response.model,
-            "usage": {
-                "input_tokens":
-                    final_response.usage.input_tokens
-                    if final_response.usage else 0,
-                "output_tokens":
-                    final_response.usage.output_tokens
-                    if final_response.usage else 0,
+        await _safe_send(
+            websocket,
+            {
+                "type": "response.end",
+                "content": final_response.content,
+                "model": final_response.model,
+                "usage": {
+                    "input_tokens": final_response.usage.input_tokens
+                    if final_response.usage
+                    else 0,
+                    "output_tokens": final_response.usage.output_tokens
+                    if final_response.usage
+                    else 0,
+                },
             },
-        })
+        )
 
 
 async def _handle_sdk_message(
@@ -206,51 +275,92 @@ async def _handle_sdk_message(
     input_tokens = 0
     output_tokens = 0
 
-    async for event in sdk_service.run_task_stream(
-        prompt=content,
-        task_id=session.id,
-        session_id=getattr(session, "sdk_session_id", None),
-        channel="webchat",
-    ):
-        if event.type == "text":
-            # Only accumulate main agent text, not subagent output
-            if not (event.data and event.data.get("subagent")):
-                accumulated_text += event.content
-                await _safe_send(websocket, {
-                    "type": "response.chunk",
-                    "content": event.content,
-                })
-        elif event.type == "tool_use":
-            await _safe_send(websocket, {
-                "type": "tool.execute",
-                "tool": event.data.get("tool", ""),
-                "arguments": event.data.get("input", {}),
-            })
-        elif event.type == "result":
-            # Capture final metadata
-            input_tokens = event.data.get("input_tokens", 0)
-            output_tokens = event.data.get("output_tokens", 0)
-            sdk_sid = event.data.get("session_id")
-            if sdk_sid:
-                session.sdk_session_id = sdk_sid
-        elif event.type == "error":
-            await _safe_send(websocket, {"type": "typing", "status": False})
-            await _safe_send(websocket, {
+    try:
+        async with asyncio.timeout(300):
+            async for event in sdk_service.run_task_stream(
+                prompt=content,
+                task_id=session.id,
+                session_id=getattr(session, "sdk_session_id", None),
+                channel="webchat",
+            ):
+                if event.type == "text":
+                    # Only accumulate main agent text, not subagent output
+                    if not (event.data and event.data.get("subagent")):
+                        accumulated_text += event.content
+                        await _safe_send(
+                            websocket,
+                            {
+                                "type": "response.chunk",
+                                "content": event.content,
+                            },
+                        )
+                elif event.type == "tool_use":
+                    await _safe_send(
+                        websocket,
+                        {
+                            "type": "tool.execute",
+                            "tool": event.data.get("tool", ""),
+                            "arguments": event.data.get("input", {}),
+                        },
+                    )
+                elif event.type == "result":
+                    # Capture final metadata
+                    input_tokens = event.data.get("input_tokens", 0)
+                    output_tokens = event.data.get("output_tokens", 0)
+                    sdk_sid = event.data.get("session_id")
+                    if sdk_sid:
+                        session.sdk_session_id = sdk_sid
+                elif event.type == "error":
+                    await _safe_send(websocket, {"type": "typing", "status": False})
+                    await _safe_send(
+                        websocket,
+                        {
+                            "type": "error",
+                            "message": event.content,
+                        },
+                    )
+                    return
+    except TimeoutError:
+        logger.error("ws_sdk_stream_timeout", session_id=session.id)
+        await _safe_send(
+            websocket,
+            {
                 "type": "error",
-                "message": event.content,
-            })
-            return
+                "message": "Stream timed out after 300 seconds",
+            },
+        )
+    except asyncio.CancelledError:
+        logger.warning("ws_sdk_stream_cancelled", session_id=session.id)
+        await _safe_send(
+            websocket,
+            {
+                "type": "error",
+                "message": "Stream was cancelled",
+            },
+        )
+    except Exception as e:
+        logger.error("ws_sdk_stream_error", session_id=session.id, error=str(e))
+        await _safe_send(
+            websocket,
+            {
+                "type": "error",
+                "message": f"Stream error: {e}",
+            },
+        )
 
     await _safe_send(websocket, {"type": "typing", "status": False})
-    await _safe_send(websocket, {
-        "type": "response.end",
-        "content": accumulated_text,
-        "model": model,
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
+    await _safe_send(
+        websocket,
+        {
+            "type": "response.end",
+            "content": accumulated_text,
+            "model": model,
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+            },
         },
-    })
+    )
 
 
 @router.websocket("/ws/chat")
@@ -283,6 +393,13 @@ async def websocket_chat(
         await websocket.close(code=4001, reason="Unauthorized")
         return
 
+    # Check connection limit
+    total_connections = manager.event_connection_count + manager.chat_connection_count
+    if total_connections >= MAX_WS_CONNECTIONS:
+        await websocket.accept()
+        await websocket.close(code=1013, reason="Maximum connections reached")
+        return
+
     # Get or create session
     session_store = websocket.app.state.session_store
     agent_loop = websocket.app.state.agent_loop
@@ -300,25 +417,72 @@ async def websocket_chat(
 
     # Tool event forwarding helpers (used only for non-streaming paths like voice)
     async def _forward_tool_execute(data: dict[str, Any]) -> None:
-        await manager.send_to_chat(session.id, {
-            "type": "tool.execute",
-            "tool": data.get("tool", ""),
-            "arguments": data.get("arguments", {}),
-        })
+        await manager.send_to_chat(
+            session.id,
+            {
+                "type": "tool.execute",
+                "tool": data.get("tool", ""),
+                "arguments": data.get("arguments", {}),
+            },
+        )
 
     async def _forward_tool_result(data: dict[str, Any]) -> None:
-        await manager.send_to_chat(session.id, {
-            "type": "tool.result",
-            "tool": data.get("tool", ""),
-            "success": data.get("success", False),
-            "output": data.get("output", ""),
-        })
+        await manager.send_to_chat(
+            session.id,
+            {
+                "type": "tool.result",
+                "tool": data.get("tool", ""),
+                "success": data.get("success", False),
+                "output": data.get("output", ""),
+            },
+        )
 
     from agent.core.events import Events
+
+    # Per-connection rate tracking: max 30 messages per 60 seconds
+    _msg_times: list[float] = []
 
     try:
         while True:
             raw = await websocket.receive_json()
+
+            # --- Per-connection rate limiting ---
+            _now = time.monotonic()
+            _msg_times[:] = [t for t in _msg_times if _now - t < 60]
+            if len(_msg_times) > 30:
+                await _safe_send(
+                    websocket,
+                    {
+                        "type": "error",
+                        "message": "Rate limit: max 30 messages per minute",
+                    },
+                )
+                continue
+            _msg_times.append(_now)
+
+            # --- Validate JSON structure ---
+            if not isinstance(raw, dict) or "type" not in raw:
+                await _safe_send(
+                    websocket,
+                    {
+                        "type": "error",
+                        "message": "Invalid message format",
+                    },
+                )
+                continue
+
+            # Check message size
+            raw_str = json.dumps(raw)
+            if len(raw_str) > MAX_WS_MESSAGE_SIZE:
+                await _safe_send(
+                    websocket,
+                    {
+                        "type": "error",
+                        "message": f"Message too large (max {MAX_WS_MESSAGE_SIZE} chars).",
+                    },
+                )
+                continue
+
             msg_type = raw.get("type")
 
             if msg_type == "ping":
@@ -332,18 +496,24 @@ async def websocket_chat(
                 voice_mime = raw.get("mime_type", "audio/webm")
 
                 if not audio_b64 or not voice_pipeline:
-                    await _safe_send(websocket, {
-                        "type": "error",
-                        "message": "Voice pipeline not available or no audio data",
-                    })
+                    await _safe_send(
+                        websocket,
+                        {
+                            "type": "error",
+                            "message": "Voice pipeline not available or no audio data",
+                        },
+                    )
                     continue
 
                 audio_data = base64.b64decode(audio_b64)
 
-                if not await _safe_send(websocket, {
-                    "type": "response.start",
-                    "session_id": session.id,
-                }):
+                if not await _safe_send(
+                    websocket,
+                    {
+                        "type": "response.start",
+                        "session_id": session.id,
+                    },
+                ):
                     continue
                 await _safe_send(websocket, {"type": "typing", "status": True})
 
@@ -354,11 +524,14 @@ async def websocket_chat(
                     # Transcribe
                     if not voice_pipeline.is_llm_native():
                         stt_result = await voice_pipeline.transcribe(audio_data, voice_mime)
-                        await _safe_send(websocket, {
-                            "type": "voice.transcription",
-                            "text": stt_result.text,
-                            "language": stt_result.language,
-                        })
+                        await _safe_send(
+                            websocket,
+                            {
+                                "type": "voice.transcription",
+                                "text": stt_result.text,
+                                "language": stt_result.language,
+                            },
+                        )
                         user_text = stt_result.text
                     else:
                         # LLM native — for now just send a placeholder
@@ -372,31 +545,37 @@ async def websocket_chat(
                     )
 
                     await _safe_send(websocket, {"type": "typing", "status": False})
-                    await _safe_send(websocket, {
-                        "type": "response.end",
-                        "content": response.content,
-                        "model": response.model,
-                        "usage": {
-                            "input_tokens": response.usage.input_tokens
-                            if response.usage else 0,
-                            "output_tokens": response.usage.output_tokens
-                            if response.usage else 0,
+                    await _safe_send(
+                        websocket,
+                        {
+                            "type": "response.end",
+                            "content": response.content,
+                            "model": response.model,
+                            "usage": {
+                                "input_tokens": response.usage.input_tokens
+                                if response.usage
+                                else 0,
+                                "output_tokens": response.usage.output_tokens
+                                if response.usage
+                                else 0,
+                            },
                         },
-                    })
+                    )
 
                     # Synthesize voice response
                     if voice_pipeline.should_voice_reply("webchat"):
                         tts_result = await voice_pipeline.synthesize(response.content)
                         if tts_result:
-                            audio_out_b64 = base64.b64encode(
-                                tts_result.audio_data
-                            ).decode()
-                            await _safe_send(websocket, {
-                                "type": "voice.audio",
-                                "audio": audio_out_b64,
-                                "mime_type": tts_result.mime_type,
-                                "duration": tts_result.duration_seconds,
-                            })
+                            audio_out_b64 = base64.b64encode(tts_result.audio_data).decode()
+                            await _safe_send(
+                                websocket,
+                                {
+                                    "type": "voice.audio",
+                                    "audio": audio_out_b64,
+                                    "mime_type": tts_result.mime_type,
+                                    "duration": tts_result.duration_seconds,
+                                },
+                            )
 
                 except Exception as e:
                     logger.error("ws_voice_error", session_id=session.id, error=str(e))
@@ -414,10 +593,13 @@ async def websocket_chat(
                     continue
 
                 # Signal response start
-                if not await _safe_send(websocket, {
-                    "type": "response.start",
-                    "session_id": session.id,
-                }):
+                if not await _safe_send(
+                    websocket,
+                    {
+                        "type": "response.start",
+                        "session_id": session.id,
+                    },
+                ):
                     continue
 
                 # Typing indicator on
@@ -436,16 +618,22 @@ async def websocket_chat(
                             if event.type == "text":
                                 if not (event.data and event.data.get("subagent")):
                                     accumulated_text += event.content
-                                    await _safe_send(websocket, {
-                                        "type": "response.chunk",
-                                        "content": event.content,
-                                    })
+                                    await _safe_send(
+                                        websocket,
+                                        {
+                                            "type": "response.chunk",
+                                            "content": event.content,
+                                        },
+                                    )
                             elif event.type == "tool_use":
-                                await _safe_send(websocket, {
-                                    "type": "tool.execute",
-                                    "tool": (event.data or {}).get("tool", ""),
-                                    "arguments": (event.data or {}).get("input", {}),
-                                })
+                                await _safe_send(
+                                    websocket,
+                                    {
+                                        "type": "tool.execute",
+                                        "tool": (event.data or {}).get("tool", ""),
+                                        "arguments": (event.data or {}).get("input", {}),
+                                    },
+                                )
 
                         result = await orchestrator.run_channel_task(
                             prompt=content,
@@ -454,42 +642,51 @@ async def websocket_chat(
                             on_progress=_ws_on_progress,
                         )
                         await _safe_send(
-                            websocket, {"type": "typing", "status": False},
+                            websocket,
+                            {"type": "typing", "status": False},
                         )
 
                         if result is None:
-                            await _safe_send(websocket, {
-                                "type": "error",
-                                "message": "No result from orchestrator",
-                            })
+                            await _safe_send(
+                                websocket,
+                                {
+                                    "type": "error",
+                                    "message": "No result from orchestrator",
+                                },
+                            )
                             continue
 
                         # Use accumulated streamed text, fall back to result
-                        final_content = (
-                            accumulated_text
-                            or getattr(result, "output", "")
-                            or ""
-                        )
+                        final_content = accumulated_text or getattr(result, "output", "") or ""
                         if result.status.value in ("failed", "cancelled"):
-                            await _safe_send(websocket, {
-                                "type": "error",
-                                "message": result.error or (
-                                    "Task cancelled" if result.status.value == "cancelled"
-                                    else "Task failed"
-                                ),
-                            })
+                            await _safe_send(
+                                websocket,
+                                {
+                                    "type": "error",
+                                    "message": result.error
+                                    or (
+                                        "Task cancelled"
+                                        if result.status.value == "cancelled"
+                                        else "Task failed"
+                                    ),
+                                },
+                            )
                         else:
-                            await _safe_send(websocket, {
-                                "type": "response.end",
-                                "content": final_content,
-                                "model": "orchestrator",
-                                "usage": {"input_tokens": 0, "output_tokens": 0},
-                            })
+                            await _safe_send(
+                                websocket,
+                                {
+                                    "type": "response.end",
+                                    "content": final_content,
+                                    "model": "orchestrator",
+                                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                                },
+                            )
 
                         # Update session history for multi-turn context
                         # (skip if task failed — don't store error as assistant message)
                         if result.status.value not in ("failed", "cancelled") and final_content:
                             from agent.core.session import Message
+
                             session.add_message(Message(role="user", content=content))
                             session.add_message(
                                 Message(role="assistant", content=final_content),
@@ -497,12 +694,18 @@ async def websocket_chat(
                     elif sdk_service is not None:
                         # --- Claude SDK backend ---
                         await _handle_sdk_message(
-                            websocket, sdk_service, session, content,
+                            websocket,
+                            sdk_service,
+                            session,
+                            content,
                         )
                     else:
                         # --- LiteLLM backend ---
                         await _handle_litellm_message(
-                            websocket, agent_loop, session, content,
+                            websocket,
+                            agent_loop,
+                            session,
+                            content,
                         )
 
                 except Exception as e:
@@ -512,10 +715,13 @@ async def websocket_chat(
                         error=str(e),
                     )
                     await _safe_send(websocket, {"type": "typing", "status": False})
-                    await _safe_send(websocket, {
-                        "type": "error",
-                        "message": str(e),
-                    })
+                    await _safe_send(
+                        websocket,
+                        {
+                            "type": "error",
+                            "message": str(e),
+                        },
+                    )
 
     except (WebSocketDisconnect, RuntimeError):
         pass
@@ -565,11 +771,14 @@ def setup_event_forwarding(event_bus: EventBus) -> None:
     ]
 
     for event_name in events_to_forward:
+
         async def _forward(data: Any, evt: str = event_name) -> None:
-            await manager.broadcast_event({
-                "event": evt,
-                "timestamp": datetime.now().isoformat(),
-                "data": data,
-            })
+            await manager.broadcast_event(
+                {
+                    "event": evt,
+                    "timestamp": datetime.now().isoformat(),
+                    "data": data,
+                }
+            )
 
         event_bus.on(event_name, _forward)

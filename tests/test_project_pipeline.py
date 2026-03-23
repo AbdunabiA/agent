@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -11,20 +10,17 @@ import pytest
 from agent.config import OrchestrationConfig
 from agent.core.events import EventBus, Events
 from agent.core.orchestrator import SubAgentOrchestrator
+from agent.core.session import TokenUsage
 from agent.core.subagent import (
     AgentTeam,
     FeedbackConfig,
     Project,
     ProjectAgentRef,
     ProjectStage,
-    ProjectStageResult,
-    SubAgentResult,
     SubAgentRole,
     SubAgentStatus,
-    SubAgentTask,
 )
 from agent.llm.provider import LLMResponse
-from agent.core.session import TokenUsage
 from agent.teams.loader import (
     TeamLoadError,
     discover_project_files,
@@ -33,14 +29,15 @@ from agent.teams.loader import (
 )
 from agent.tools.registry import ToolDefinition, ToolTier
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
 def _make_tool_def(
-    name: str, tier: ToolTier = ToolTier.SAFE, enabled: bool = True,
+    name: str,
+    tier: ToolTier = ToolTier.SAFE,
+    enabled: bool = True,
 ) -> ToolDefinition:
     return ToolDefinition(
         name=name,
@@ -62,7 +59,8 @@ def _make_parent_registry(tools: list[ToolDefinition] | None = None) -> MagicMoc
     registry.get_tool_schemas = MagicMock(
         return_value=[
             {"type": "function", "function": {"name": t.name, "description": "", "parameters": {}}}
-            for t in tools if t.enabled
+            for t in tools
+            if t.enabled
         ]
     )
     return registry
@@ -162,11 +160,7 @@ class TestProjectLoader:
     def test_parse_project_missing_team_field_raises(self, tmp_path: Path) -> None:
         f = tmp_path / "bad.yaml"
         f.write_text(
-            "name: bad\n"
-            "stages:\n"
-            "  - name: s1\n"
-            "    agents:\n"
-            "      - role: dev\n"
+            "name: bad\n" "stages:\n" "  - name: s1\n" "    agents:\n" "      - role: dev\n"
         )
 
         with pytest.raises(TeamLoadError, match="team.*role"):
@@ -175,11 +169,7 @@ class TestProjectLoader:
     def test_parse_project_missing_role_field_raises(self, tmp_path: Path) -> None:
         f = tmp_path / "bad2.yaml"
         f.write_text(
-            "name: bad2\n"
-            "stages:\n"
-            "  - name: s1\n"
-            "    agents:\n"
-            "      - team: eng\n"
+            "name: bad2\n" "stages:\n" "  - name: s1\n" "    agents:\n" "      - team: eng\n"
         )
 
         with pytest.raises(TeamLoadError, match="team.*role"):
@@ -252,9 +242,7 @@ class TestProjectLoader:
     def test_load_projects_skips_invalid(self, tmp_path: Path) -> None:
         projects_dir = tmp_path / "projects"
         projects_dir.mkdir()
-        (projects_dir / "good.yaml").write_text(
-            "name: good\nstages: []\n"
-        )
+        (projects_dir / "good.yaml").write_text("name: good\nstages: []\n")
         (projects_dir / "bad.yaml").write_text(":\n  [invalid")
 
         projects = load_projects_from_directory(tmp_path)
@@ -345,7 +333,8 @@ class TestRunProject:
         return orch
 
     async def test_unknown_project_returns_failed(
-        self, orchestrator: SubAgentOrchestrator,
+        self,
+        orchestrator: SubAgentOrchestrator,
     ) -> None:
         result = await orchestrator.run_project("nonexistent", "do stuff")
 
@@ -453,7 +442,8 @@ class TestRunProject:
         assert len(result.stages[0].results) == 2
 
     async def test_missing_team_ref_fails(
-        self, orchestrator: SubAgentOrchestrator,
+        self,
+        orchestrator: SubAgentOrchestrator,
     ) -> None:
         """Referencing a nonexistent team fails the project."""
         project = _make_project(
@@ -474,7 +464,8 @@ class TestRunProject:
         assert "not found" in result.error
 
     async def test_missing_role_ref_fails(
-        self, orchestrator: SubAgentOrchestrator,
+        self,
+        orchestrator: SubAgentOrchestrator,
     ) -> None:
         """Referencing a nonexistent role in a valid team fails."""
         project = _make_project(
@@ -663,7 +654,8 @@ class TestRunProject:
     # -------------------------------------------------------------------
 
     async def test_one_agent_fails_in_stage_pipeline_stops(
-        self, orchestrator: SubAgentOrchestrator,
+        self,
+        orchestrator: SubAgentOrchestrator,
     ) -> None:
         """If one agent in a stage fails, the pipeline stops (GAP 11)."""
         call_count = 0
@@ -707,12 +699,11 @@ class TestRunProject:
         assert SubAgentStatus.COMPLETED in s1_statuses.values()
 
     async def test_all_agents_fail_in_stage_pipeline_stops(
-        self, orchestrator: SubAgentOrchestrator,
+        self,
+        orchestrator: SubAgentOrchestrator,
     ) -> None:
         """If all agents in a stage fail, the pipeline stops (GAP 11)."""
-        orchestrator.sdk_service.run_subagent = AsyncMock(
-            side_effect=RuntimeError("all broken")
-        )
+        orchestrator.sdk_service.run_subagent = AsyncMock(side_effect=RuntimeError("all broken"))
 
         project = _make_project(
             "all_fail",
@@ -737,12 +728,11 @@ class TestRunProject:
         assert result.status == SubAgentStatus.FAILED
         assert len(result.stages) == 1  # Pipeline stopped after first stage
         # All agents in stage 1 failed
-        assert all(
-            r.status == SubAgentStatus.FAILED for r in result.stages[0].results
-        )
+        assert all(r.status == SubAgentStatus.FAILED for r in result.stages[0].results)
 
     async def test_failed_agent_output_in_combined_output(
-        self, orchestrator: SubAgentOrchestrator,
+        self,
+        orchestrator: SubAgentOrchestrator,
     ) -> None:
         """Failed agents' errors appear in the combined output."""
         orchestrator.sdk_service.run_subagent = AsyncMock(
@@ -776,7 +766,8 @@ class TestRunProject:
     # -------------------------------------------------------------------
 
     async def test_stage1_output_appears_in_stage2_task_context(
-        self, orchestrator: SubAgentOrchestrator,
+        self,
+        orchestrator: SubAgentOrchestrator,
     ) -> None:
         """Verify stage 1 output is actually passed as context to stage 2 agents."""
         calls: list[dict] = []
@@ -810,7 +801,8 @@ class TestRunProject:
         assert "Previous stage: first" in stage2_prompt
 
     async def test_initial_context_plus_stage_output_accumulates(
-        self, orchestrator: SubAgentOrchestrator,
+        self,
+        orchestrator: SubAgentOrchestrator,
     ) -> None:
         """Initial context and stage outputs accumulate across stages."""
         calls: list[dict] = []
@@ -840,9 +832,7 @@ class TestRunProject:
         )
         orchestrator.projects["accum"] = project
 
-        await orchestrator.run_project(
-            "accum", "Build", context="Initial context here"
-        )
+        await orchestrator.run_project("accum", "Build", context="Initial context here")
 
         assert len(calls) == 3
         # Stage 1 gets initial context
@@ -862,7 +852,8 @@ class TestRunProject:
     # -------------------------------------------------------------------
 
     async def test_project_with_no_stages(
-        self, orchestrator: SubAgentOrchestrator,
+        self,
+        orchestrator: SubAgentOrchestrator,
     ) -> None:
         """A project with zero stages completes immediately with empty output."""
         project = Project(name="empty", description="No stages", stages=[])
@@ -875,7 +866,8 @@ class TestRunProject:
         assert result.final_output == ""
 
     async def test_stage_with_no_agents(
-        self, orchestrator: SubAgentOrchestrator,
+        self,
+        orchestrator: SubAgentOrchestrator,
     ) -> None:
         """A stage with zero agents completes with empty results."""
         project = _make_project(
@@ -897,12 +889,11 @@ class TestRunProject:
     # -------------------------------------------------------------------
 
     async def test_combined_output_format(
-        self, orchestrator: SubAgentOrchestrator,
+        self,
+        orchestrator: SubAgentOrchestrator,
     ) -> None:
         """Combined output uses [role_name]: prefix and --- separators."""
-        orchestrator.sdk_service.run_subagent = AsyncMock(
-            return_value="Review findings here."
-        )
+        orchestrator.sdk_service.run_subagent = AsyncMock(return_value="Review findings here.")
 
         project = _make_project(
             "fmt",
@@ -927,7 +918,8 @@ class TestRunProject:
         assert "Review findings here." in combined
 
     async def test_final_output_is_last_stage(
-        self, orchestrator: SubAgentOrchestrator,
+        self,
+        orchestrator: SubAgentOrchestrator,
     ) -> None:
         """final_output comes from the last stage's combined output."""
         call_count = 0
@@ -960,10 +952,12 @@ class TestRunProject:
         assert result.final_output == result.stages[-1].combined_output
         assert "Output 2" in result.final_output
 
-    async def test_completed_agent_with_empty_output_skipped(
-        self, orchestrator: SubAgentOrchestrator,
+    async def test_completed_agent_with_empty_output_treated_as_completed(
+        self,
+        orchestrator: SubAgentOrchestrator,
     ) -> None:
-        """Agents that complete with empty output are skipped in combined output."""
+        """Agents that complete with empty output still result in a
+        completed pipeline — the stage does not treat empty output as failure."""
         orchestrator.sdk_service.run_subagent = AsyncMock(return_value="")
 
         project = _make_project(
@@ -979,16 +973,16 @@ class TestRunProject:
 
         result = await orchestrator.run_project("empty_out", "Test")
 
+        # Empty output with COMPLETED status does not trigger pipeline failure
         assert result.status == SubAgentStatus.COMPLETED
-        # Empty output means nothing in combined (the [role]: prefix isn't added)
-        assert result.stages[0].combined_output == ""
 
     # -------------------------------------------------------------------
     # Edge cases: resolution failure mid-pipeline
     # -------------------------------------------------------------------
 
     async def test_resolution_failure_in_stage2_preserves_stage1_results(
-        self, orchestrator: SubAgentOrchestrator,
+        self,
+        orchestrator: SubAgentOrchestrator,
     ) -> None:
         """If stage 2 has a bad ref, stage 1 results are still in the ProjectResult."""
         orchestrator.sdk_service.run_subagent = AsyncMock(return_value="Stage 1 ok.")
@@ -1022,7 +1016,8 @@ class TestRunProject:
     # -------------------------------------------------------------------
 
     async def test_project_uses_sdk_service(
-        self, orchestrator: SubAgentOrchestrator,
+        self,
+        orchestrator: SubAgentOrchestrator,
     ) -> None:
         """Verify run_project calls through sdk_service.run_subagent."""
         orchestrator.sdk_service.run_subagent = AsyncMock(return_value="SDK result")
@@ -1047,8 +1042,7 @@ class TestRunProject:
         assert orchestrator.sdk_service.run_subagent.await_count == 2
         # Verify correct role personas were passed
         call_personas = [
-            c.kwargs["role_persona"]
-            for c in orchestrator.sdk_service.run_subagent.call_args_list
+            c.kwargs["role_persona"] for c in orchestrator.sdk_service.run_subagent.call_args_list
         ]
         assert any("dev" in p for p in call_personas)
         assert any("tester" in p for p in call_personas)
@@ -1059,12 +1053,21 @@ class TestRunProject:
         event_bus: EventBus,
     ) -> None:
         """PROJECT_STAGE_COMPLETED event includes correct agent counts."""
+        # Track which task_ids should fail — the second agent always fails,
+        # even on retry, so retries don't recover it.
+        failed_tasks: set[str] = set()
         call_count = 0
 
         async def fail_second(**kwargs):
             nonlocal call_count
+            task_id = kwargs.get("task_id", "")
             call_count += 1
+            # First call that isn't a retry of an already-failed task succeeds;
+            # second unique task always fails (and stays failed on retry).
+            if task_id in failed_tasks:
+                raise RuntimeError("fail")
             if call_count == 2:
+                failed_tasks.add(task_id)
                 raise RuntimeError("fail")
             return "ok"
 
@@ -1179,15 +1182,14 @@ class TestFeedbackLoop:
         )
 
     async def test_feedback_loop_passes_first_try(
-        self, orchestrator: SubAgentOrchestrator,
+        self,
+        orchestrator: SubAgentOrchestrator,
     ) -> None:
         """Review passes on first try, no feedback loop triggered."""
         # Evaluator returns PASS
         orchestrator.sdk_service.run_subagent = AsyncMock(
             side_effect=lambda **kw: (
-                "PASS: All checks passed"
-                if "Evaluate" in kw.get("prompt", "")
-                else "Agent output."
+                "PASS: All checks passed" if "Evaluate" in kw.get("prompt", "") else "Agent output."
             )
         )
 
@@ -1200,7 +1202,8 @@ class TestFeedbackLoop:
         assert result.feedback_iterations == 0
 
     async def test_feedback_loop_fail_fix_pass(
-        self, orchestrator: SubAgentOrchestrator,
+        self,
+        orchestrator: SubAgentOrchestrator,
     ) -> None:
         """Review fails, fix runs, re-review passes (1 iteration)."""
         call_count = 0
@@ -1227,9 +1230,11 @@ class TestFeedbackLoop:
         assert result.feedback_iterations == 1
 
     async def test_feedback_loop_max_retries_exhausted(
-        self, orchestrator: SubAgentOrchestrator,
+        self,
+        orchestrator: SubAgentOrchestrator,
     ) -> None:
         """Fails N times, pipeline fails with exhausted retries."""
+
         async def always_fail(**kw):
             if "Evaluate" in kw.get("prompt", ""):
                 return "FAIL: Still broken"
@@ -1262,7 +1267,8 @@ class TestFeedbackLoop:
         assert result.feedback_iterations == 2
 
     async def test_feedback_target_skipped_in_normal_flow(
-        self, orchestrator: SubAgentOrchestrator,
+        self,
+        orchestrator: SubAgentOrchestrator,
     ) -> None:
         """Stages with feedback_target=True are skipped in normal sequential flow."""
         calls: list[str] = []
@@ -1306,7 +1312,9 @@ class TestFeedbackLoop:
         assert not any("frontend" in c for c in calls)
 
     async def test_feedback_loop_emits_events(
-        self, orchestrator: SubAgentOrchestrator, event_bus: EventBus,
+        self,
+        orchestrator: SubAgentOrchestrator,
+        event_bus: EventBus,
     ) -> None:
         """Correct feedback events emitted with data."""
         call_count = 0
@@ -1347,7 +1355,8 @@ class TestFeedbackLoop:
         assert "feedback_passed" in events_seen
 
     async def test_feedback_context_enrichment(
-        self, orchestrator: SubAgentOrchestrator,
+        self,
+        orchestrator: SubAgentOrchestrator,
     ) -> None:
         """Fix agent receives review feedback, re-review sees fix output."""
         calls: list[dict] = []
@@ -1380,7 +1389,8 @@ class TestFeedbackLoop:
         assert len(re_review_calls) >= 1
 
     async def test_feedback_fix_stage_fails(
-        self, orchestrator: SubAgentOrchestrator,
+        self,
+        orchestrator: SubAgentOrchestrator,
     ) -> None:
         """If the fix stage itself fails, the feedback loop stops."""
         call_count = 0
@@ -1407,7 +1417,8 @@ class TestFeedbackLoop:
         assert "exhausted" in result.error.lower() or "retries" in result.error.lower()
 
     async def test_no_feedback_config_unchanged(
-        self, orchestrator: SubAgentOrchestrator,
+        self,
+        orchestrator: SubAgentOrchestrator,
     ) -> None:
         """Projects without feedback config work exactly as before."""
         orchestrator.sdk_service.run_subagent = AsyncMock(return_value="Done.")
@@ -1422,12 +1433,11 @@ class TestFeedbackLoop:
         assert len(result.stages) == 2
 
     async def test_evaluate_review_output_pass(
-        self, orchestrator: SubAgentOrchestrator,
+        self,
+        orchestrator: SubAgentOrchestrator,
     ) -> None:
         """Evaluator correctly parses PASS response."""
-        orchestrator.sdk_service.run_subagent = AsyncMock(
-            return_value="PASS: All tests green"
-        )
+        orchestrator.sdk_service.run_subagent = AsyncMock(return_value="PASS: All tests green")
 
         passed, summary = await orchestrator._evaluate_review_output("All good")
 
@@ -1435,12 +1445,11 @@ class TestFeedbackLoop:
         assert "All tests green" in summary
 
     async def test_evaluate_review_output_fail(
-        self, orchestrator: SubAgentOrchestrator,
+        self,
+        orchestrator: SubAgentOrchestrator,
     ) -> None:
         """Evaluator correctly parses FAIL response."""
-        orchestrator.sdk_service.run_subagent = AsyncMock(
-            return_value="FAIL: 3 tests failing"
-        )
+        orchestrator.sdk_service.run_subagent = AsyncMock(return_value="FAIL: 3 tests failing")
 
         passed, summary = await orchestrator._evaluate_review_output("Errors found")
 

@@ -142,7 +142,9 @@ class ToolExecutor:
 
         # 3. Check permissions
         perm_result = await self.permissions.check_permission(
-            tool_def, tool_call.arguments, channel_user_id=channel_user_id,
+            tool_def,
+            tool_call.arguments,
+            channel_user_id=channel_user_id,
         )
         if not perm_result.approved:
             result = ToolResult(
@@ -173,10 +175,12 @@ class ToolExecutor:
             return result
 
         # 5. Execute with timeout
+        max_tool_timeout = 300  # 5 minutes max
         default_timeout = 30
         timeout = tool_call.arguments.get("timeout", default_timeout)
         if not isinstance(timeout, int):
             timeout = default_timeout
+        timeout = min(max(1, int(timeout)), max_tool_timeout)
 
         try:
             raw = await self._execute_with_timeout(tool_def, tool_call.arguments, timeout)
@@ -231,9 +235,7 @@ class ToolExecutor:
         status = "success" if result.success else "error"
         if result.error and "timed out" in result.error:
             status = "timeout"
-        await self._log_audit(
-            result, tool_call.arguments, session_id, trigger, status
-        )
+        await self._log_audit(result, tool_call.arguments, session_id, trigger, status)
 
         return result
 
@@ -281,7 +283,10 @@ class ToolExecutor:
         return final_results
 
     async def _execute_with_timeout(
-        self, tool_def: object, arguments: dict, timeout: int  # noqa: ASYNC109
+        self,
+        tool_def: object,
+        arguments: dict,
+        timeout: int,  # noqa: ASYNC109
     ) -> str | MultimodalToolOutput:
         """Execute a tool function with a timeout.
 
@@ -304,10 +309,7 @@ class ToolExecutor:
         import inspect
 
         sig = inspect.signature(tool_def.function)
-        valid_args = {
-            k: v for k, v in arguments.items()
-            if k in sig.parameters
-        }
+        valid_args = {k: v for k, v in arguments.items() if k in sig.parameters}
 
         try:
             result = await asyncio.wait_for(
@@ -318,9 +320,7 @@ class ToolExecutor:
                 return result
             return str(result) if result is not None else ""
         except TimeoutError as e:
-            raise ToolTimeoutError(
-                f"Tool '{tool_def.name}' timed out after {timeout}s"
-            ) from e
+            raise ToolTimeoutError(f"Tool '{tool_def.name}' timed out after {timeout}s") from e
 
     def _check_guardrails(self, tool_call: ToolCall) -> GuardrailResult:
         """Apply guardrail checks based on tool type.
@@ -343,8 +343,10 @@ class ToolExecutor:
         if tool_call.name in ("file_read", "file_write", "file_list"):
             path = tool_call.arguments.get("path", ".")
             if isinstance(path, str):
-                operation = "read" if tool_call.name == "file_read" else (
-                    "write" if tool_call.name == "file_write" else "list"
+                operation = (
+                    "read"
+                    if tool_call.name == "file_read"
+                    else ("write" if tool_call.name == "file_write" else "list")
                 )
                 return self.guardrails.check_file_path(path, operation)
 

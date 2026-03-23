@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -15,13 +14,14 @@ from agent.core.scheduler import parse_natural_schedule
 from agent.skills.base import SkillMetadata
 from agent.skills.triggers import TriggerMatcher
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_channel(
-    name: str = "telegram", known_user_ids: list[str] | None = None,
+    name: str = "telegram",
+    known_user_ids: list[str] | None = None,
 ) -> MagicMock:
     """Create a mock channel with an async send_message method."""
     channel = MagicMock()
@@ -106,9 +106,7 @@ class TestProactiveMessenger:
 
     # -- send_proactive: channel raises exception -------------------------
 
-    async def test_send_proactive_channel_error(
-        self, bus: EventBus, telegram: MagicMock
-    ) -> None:
+    async def test_send_proactive_channel_error(self, bus: EventBus, telegram: MagicMock) -> None:
         telegram.send_message.side_effect = RuntimeError("connection lost")
         messenger = ProactiveMessenger(bus, channels=[telegram])
 
@@ -118,9 +116,7 @@ class TestProactiveMessenger:
 
     # -- send_proactive: emits PROACTIVE_MESSAGE event --------------------
 
-    async def test_send_proactive_emits_event(
-        self, bus: EventBus, telegram: MagicMock
-    ) -> None:
+    async def test_send_proactive_emits_event(self, bus: EventBus, telegram: MagicMock) -> None:
         emitted: list[dict] = []
 
         async def handler(data: object) -> None:
@@ -171,9 +167,7 @@ class TestProactiveMessenger:
 
     # -- add_channel ------------------------------------------------------
 
-    async def test_add_channel_dynamically(
-        self, bus: EventBus, telegram: MagicMock
-    ) -> None:
+    async def test_add_channel_dynamically(self, bus: EventBus, telegram: MagicMock) -> None:
         messenger = ProactiveMessenger(bus, channels=[])
 
         # No channels yet
@@ -184,9 +178,7 @@ class TestProactiveMessenger:
         assert await messenger.send_proactive("u1", "now it works") is True
         telegram.send_message.assert_awaited_once()
 
-    async def test_add_channel_accessible_by_name(
-        self, bus: EventBus, webchat: MagicMock
-    ) -> None:
+    async def test_add_channel_accessible_by_name(self, bus: EventBus, webchat: MagicMock) -> None:
         messenger = ProactiveMessenger(bus, channels=[])
         messenger.add_channel(webchat)
 
@@ -531,9 +523,7 @@ class TestMonitorManager:
         # Set an initial last_state so a change is detected
         monitor.last_state = "old_state"
 
-        with patch.object(
-            manager, "_get_state", new_callable=AsyncMock, return_value="new_state"
-        ):
+        with patch.object(manager, "_get_state", new_callable=AsyncMock, return_value="new_state"):
             await manager._check_monitor(monitor.id)
 
         proactive.send_proactive.assert_awaited_once()
@@ -551,9 +541,7 @@ class TestMonitorManager:
         )
         monitor.last_state = "same"
 
-        with patch.object(
-            manager, "_get_state", new_callable=AsyncMock, return_value="same"
-        ):
+        with patch.object(manager, "_get_state", new_callable=AsyncMock, return_value="same"):
             await manager._check_monitor(monitor.id)
 
         proactive.send_proactive.assert_not_awaited()
@@ -577,9 +565,7 @@ class TestMonitorManager:
         proactive.send_proactive.assert_not_awaited()
         assert monitor.last_state == "initial_state"
 
-    async def test_check_monitor_nonexistent_id(
-        self, manager: MonitorManager
-    ) -> None:
+    async def test_check_monitor_nonexistent_id(self, manager: MonitorManager) -> None:
         """Checking a non-existent monitor ID should not raise."""
         await manager._check_monitor("ghost")  # Should simply return
 
@@ -600,9 +586,7 @@ class TestMonitorManager:
         )
         monitor.last_state = "200 1000"
 
-        with patch.object(
-            manager, "_get_state", new_callable=AsyncMock, return_value="500 0"
-        ):
+        with patch.object(manager, "_get_state", new_callable=AsyncMock, return_value="500 0"):
             await manager._check_monitor(monitor.id)
 
         assert len(emitted) == 1

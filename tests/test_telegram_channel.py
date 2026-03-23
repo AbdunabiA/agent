@@ -34,9 +34,7 @@ async def _drain_background_tasks(channel: Any) -> None:
     """Await all background tasks spawned by the channel."""
     # Snapshot to avoid dict-changed-size-during-iteration
     all_tasks = [
-        task
-        for tasks in list(channel._background_tasks.values())
-        for task, _desc in list(tasks)
+        task for tasks in list(channel._background_tasks.values()) for task, _desc in list(tasks)
     ]
     for task in all_tasks:
         if not task.done():
@@ -93,9 +91,11 @@ def channel(
 ) -> Any:
     from agent.channels.telegram import TelegramChannel
 
-    with patch("agent.channels.telegram.Bot"), \
-         patch("agent.channels.telegram.Dispatcher"), \
-         patch("agent.channels.telegram.Router"):
+    with (
+        patch("agent.channels.telegram.Bot"),
+        patch("agent.channels.telegram.Dispatcher"),
+        patch("agent.channels.telegram.Router"),
+    ):
         ch = TelegramChannel(
             config=config,
             event_bus=event_bus,
@@ -118,9 +118,11 @@ def restricted_channel(
 ) -> Any:
     from agent.channels.telegram import TelegramChannel
 
-    with patch("agent.channels.telegram.Bot"), \
-         patch("agent.channels.telegram.Dispatcher"), \
-         patch("agent.channels.telegram.Router"):
+    with (
+        patch("agent.channels.telegram.Bot"),
+        patch("agent.channels.telegram.Dispatcher"),
+        patch("agent.channels.telegram.Router"),
+    ):
         ch = TelegramChannel(
             config=config_restricted,
             event_bus=event_bus,
@@ -135,6 +137,7 @@ def restricted_channel(
 # =====================================================================
 # Allowlist
 # =====================================================================
+
 
 class TestAllowlist:
     """Allowlist security checks."""
@@ -153,6 +156,7 @@ class TestAllowlist:
 # =====================================================================
 # Handle text
 # =====================================================================
+
 
 class TestHandleText:
     """Text message processing."""
@@ -293,7 +297,7 @@ class TestHandleText:
         await channel._handle_text(msg)
 
         # Handler returned, but processing hasn't finished yet
-        assert not mock_agent_loop.process_message.return_value.content == "done"
+        assert mock_agent_loop.process_message.return_value.content != "done"
         await processing_started.wait()  # task is running
         assert len(channel._get_active_tasks()) == 1
 
@@ -427,18 +431,23 @@ class TestHandleText:
 # Tool explanation
 # =====================================================================
 
+
 class TestToolExplanation:
     """Tests for _tool_explanation approval message builder."""
 
     def _explain(self, tool_name: str, args: dict[str, Any]) -> str:
         from agent.channels.telegram import _tool_explanation
+
         return _tool_explanation(tool_name, args)
 
     def test_bash_with_description(self) -> None:
-        result = self._explain("Bash", {
-            "command": "ls -la /tmp",
-            "description": "List files in tmp directory",
-        })
+        result = self._explain(
+            "Bash",
+            {
+                "command": "ls -la /tmp",
+                "description": "List files in tmp directory",
+            },
+        )
         assert "List files in tmp directory" in result
         assert "ls -la /tmp" in result
         assert "shell command" in result.lower()
@@ -454,10 +463,13 @@ class TestToolExplanation:
         assert "shell command" in result.lower()
 
     def test_write_file(self) -> None:
-        result = self._explain("Write", {
-            "file_path": "/home/user/app.py",
-            "content": "x" * 200,
-        })
+        result = self._explain(
+            "Write",
+            {
+                "file_path": "/home/user/app.py",
+                "content": "x" * 200,
+            },
+        )
         assert "/home/user/app.py" in result
         assert "200 characters" in result
         assert "write" in result.lower() or "overwrite" in result.lower()
@@ -467,11 +479,14 @@ class TestToolExplanation:
         assert "/tmp/out.txt" in result
 
     def test_edit_shows_diff_preview(self) -> None:
-        result = self._explain("Edit", {
-            "file_path": "/src/main.py",
-            "old_string": "def foo():",
-            "new_string": "def bar():",
-        })
+        result = self._explain(
+            "Edit",
+            {
+                "file_path": "/src/main.py",
+                "old_string": "def foo():",
+                "new_string": "def bar():",
+            },
+        )
         assert "/src/main.py" in result
         assert "def foo():" in result
         assert "def bar():" in result
@@ -479,11 +494,14 @@ class TestToolExplanation:
 
     def test_edit_truncates_long_strings(self) -> None:
         long_old = "x" * 200
-        result = self._explain("Edit", {
-            "file_path": "/f.py",
-            "old_string": long_old,
-            "new_string": "short",
-        })
+        result = self._explain(
+            "Edit",
+            {
+                "file_path": "/f.py",
+                "old_string": long_old,
+                "new_string": "short",
+            },
+        )
         assert "…" in result  # truncated
 
     def test_file_delete(self) -> None:
@@ -492,9 +510,12 @@ class TestToolExplanation:
         assert "permanently delete" in result.lower()
 
     def test_python_exec(self) -> None:
-        result = self._explain("python_exec", {
-            "code": "import os; os.listdir('/')",
-        })
+        result = self._explain(
+            "python_exec",
+            {
+                "code": "import os; os.listdir('/')",
+            },
+        )
         assert "import os" in result
         assert "Python" in result
 
@@ -503,10 +524,13 @@ class TestToolExplanation:
         assert "…" in result
 
     def test_http_request(self) -> None:
-        result = self._explain("http_request", {
-            "method": "POST",
-            "url": "https://api.example.com/data",
-        })
+        result = self._explain(
+            "http_request",
+            {
+                "method": "POST",
+                "url": "https://api.example.com/data",
+            },
+        )
         assert "POST" in result
         assert "https://api.example.com/data" in result
         assert "network request" in result.lower()
@@ -541,25 +565,34 @@ class TestToolExplanation:
         assert len(result) < 500
 
     def test_notebook_edit(self) -> None:
-        result = self._explain("NotebookEdit", {
-            "notebook_path": "/notebooks/analysis.ipynb",
-        })
+        result = self._explain(
+            "NotebookEdit",
+            {
+                "notebook_path": "/notebooks/analysis.ipynb",
+            },
+        )
         assert "analysis.ipynb" in result
         assert "notebook" in result.lower()
 
     def test_unknown_tool_generic_fallback(self) -> None:
-        result = self._explain("my_custom_tool", {
-            "param1": "value1",
-            "param2": "value2",
-        })
+        result = self._explain(
+            "my_custom_tool",
+            {
+                "param1": "value1",
+                "param2": "value2",
+            },
+        )
         assert "my_custom_tool" in result
         assert "param1=value1" in result
 
     def test_unknown_tool_with_description(self) -> None:
-        result = self._explain("my_tool", {
-            "description": "Custom explanation",
-            "param": "val",
-        })
+        result = self._explain(
+            "my_tool",
+            {
+                "description": "Custom explanation",
+                "param": "val",
+            },
+        )
         assert "Custom explanation" in result
         # description key should be excluded from params
         assert "description=" not in result
@@ -593,11 +626,13 @@ class TestToolExplanation:
 # Response positioning (approval-aware)
 # =====================================================================
 
+
 class TestReplaceStatusWithResponse:
     """Tests for _replace_status_with_response — approval-aware positioning."""
 
     async def test_no_approvals_edits_status_message(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """Without approvals, response should edit the status message in-place."""
         status_msg = AsyncMock()
@@ -609,7 +644,8 @@ class TestReplaceStatusWithResponse:
         status_msg.delete.assert_not_called()
 
     async def test_with_approvals_deletes_status_and_sends_new(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """With approvals, status message should be deleted and response sent fresh."""
         status_msg = AsyncMock()
@@ -622,25 +658,26 @@ class TestReplaceStatusWithResponse:
         status_msg.edit_text.assert_not_called()
 
     async def test_empty_response_shows_no_response_message(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """Empty response should show 'No response' in the status message."""
         status_msg = AsyncMock()
         await channel._replace_status_with_response(status_msg, "42", "")
 
-        status_msg.edit_text.assert_called_once_with(
-            "No response was generated. Please try again."
-        )
+        status_msg.edit_text.assert_called_once_with("No response was generated. Please try again.")
 
     async def test_empty_response_no_status_message(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """Empty response with no status message should not crash."""
         # Should not raise
         await channel._replace_status_with_response(None, "42", "")
 
     async def test_no_bot_returns_silently(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """If bot is None, should return without error."""
         channel._bot = None
@@ -648,7 +685,8 @@ class TestReplaceStatusWithResponse:
         await channel._replace_status_with_response(AsyncMock(), "42", "hello")
 
     async def test_no_status_message_sends_normally(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """Without a status message, response is sent as a new message."""
         with patch.object(channel, "send_streamed_response", new_callable=AsyncMock) as mock_send:
@@ -656,7 +694,8 @@ class TestReplaceStatusWithResponse:
             mock_send.assert_called_once_with("42", "fresh response")
 
     async def test_edit_markdown_failure_falls_back_to_plain(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """If Markdown edit fails, should retry without parse_mode."""
         status_msg = AsyncMock()
@@ -671,7 +710,8 @@ class TestReplaceStatusWithResponse:
         assert status_msg.edit_text.call_args_list[1] == ((("simple text",),))
 
     async def test_edit_both_fail_deletes_and_sends_fresh(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """If both edit attempts fail, delete status and send fresh."""
         status_msg = AsyncMock()
@@ -685,7 +725,8 @@ class TestReplaceStatusWithResponse:
             mock_send.assert_called_once()
 
     async def test_long_response_sends_remaining_chunks(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """Long responses should send additional chunks as new messages."""
         status_msg = AsyncMock()
@@ -699,7 +740,8 @@ class TestReplaceStatusWithResponse:
         assert channel._bot.send_message.call_count >= 1
 
     async def test_approvals_flag_per_user_isolation(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """Approvals flag for one user should not affect another."""
         status_msg_a = AsyncMock()
@@ -723,6 +765,7 @@ class TestReplaceStatusWithResponse:
 # Background task management
 # =====================================================================
 
+
 class TestBackgroundTaskManagement:
     """Tests for task registration, unregistration, and listing."""
 
@@ -739,7 +782,8 @@ class TestBackgroundTaskManagement:
         fut.set_result(None)
 
     def test_register_multiple_tasks_same_user(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         loop = asyncio.get_event_loop()
         f1: asyncio.Future[None] = loop.create_future()
@@ -754,7 +798,8 @@ class TestBackgroundTaskManagement:
         f2.set_result(None)
 
     async def test_unregister_removes_done_tasks(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         async def noop() -> None:
             pass
@@ -769,7 +814,8 @@ class TestBackgroundTaskManagement:
         assert "42" not in channel._background_tasks
 
     async def test_unregister_keeps_running_tasks(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         gate = asyncio.Event()
 
@@ -793,7 +839,8 @@ class TestBackgroundTaskManagement:
         assert channel._get_active_tasks("42") == []
 
     async def test_get_active_tasks_filters_done(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         gate = asyncio.Event()
 
@@ -818,7 +865,8 @@ class TestBackgroundTaskManagement:
         await running
 
     async def test_get_active_tasks_all_users(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         gate = asyncio.Event()
 
@@ -844,6 +892,7 @@ class TestBackgroundTaskManagement:
 # =====================================================================
 # /tasks command
 # =====================================================================
+
 
 class TestCmdTasks:
     """Tests for the /tasks command."""
@@ -906,6 +955,7 @@ class TestCmdTasks:
 # /stop command and task cancellation
 # =====================================================================
 
+
 class TestCmdStop:
     """Tests for /stop command and _cancel_user_tasks."""
 
@@ -918,16 +968,15 @@ class TestCmdStop:
         assert "no tasks" in text.lower()
 
     async def test_stop_cancels_running_tasks(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """/stop should cancel all running background tasks."""
         gate = asyncio.Event()
 
         async def blocked() -> None:
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await gate.wait()
-            except asyncio.CancelledError:
-                pass
 
         t1 = asyncio.create_task(blocked())
         t2 = asyncio.create_task(blocked())
@@ -949,16 +998,15 @@ class TestCmdStop:
         msg.answer.assert_not_called()
 
     async def test_stop_only_cancels_own_tasks(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """User A's /stop should not cancel user B's tasks."""
         gate = asyncio.Event()
 
         async def blocked() -> None:
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await gate.wait()
-            except asyncio.CancelledError:
-                pass
 
         task_a = asyncio.create_task(blocked())
         task_b = asyncio.create_task(blocked())
@@ -976,15 +1024,14 @@ class TestCmdStop:
         await task_b
 
     async def test_cancel_user_tasks_returns_count(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         gate = asyncio.Event()
 
         async def blocked() -> None:
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await gate.wait()
-            except asyncio.CancelledError:
-                pass
 
         t1 = asyncio.create_task(blocked())
         t2 = asyncio.create_task(blocked())
@@ -995,17 +1042,16 @@ class TestCmdStop:
         assert count == 2
 
     async def test_cancel_user_tasks_with_sdk(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
         session_store: SessionStore,
     ) -> None:
         """Should also call sdk.cancel_task when SDK is available."""
         gate = asyncio.Event()
 
         async def blocked() -> None:
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await gate.wait()
-            except asyncio.CancelledError:
-                pass
 
         task = asyncio.create_task(blocked())
         channel._register_background_task("111", task, "sdk task")
@@ -1015,8 +1061,9 @@ class TestCmdStop:
         channel.sdk_service = mock_sdk
 
         # Create a session so the cancel can find the task_id
-        session = await session_store.get_or_create(
-            session_id="telegram:111", channel="telegram",
+        await session_store.get_or_create(
+            session_id="telegram:111",
+            channel="telegram",
         )
 
         await channel._cancel_user_tasks("111")
@@ -1024,15 +1071,14 @@ class TestCmdStop:
         mock_sdk.cancel_task.assert_called_once()
 
     async def test_cancel_cleans_up_task_registry(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         gate = asyncio.Event()
 
         async def blocked() -> None:
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await gate.wait()
-            except asyncio.CancelledError:
-                pass
 
         task = asyncio.create_task(blocked())
         channel._register_background_task("42", task, "will cancel")
@@ -1042,7 +1088,8 @@ class TestCmdStop:
         assert "42" not in channel._background_tasks
 
     async def test_cancel_no_tasks_returns_zero(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         assert await channel._cancel_user_tasks("nonexistent") == 0
 
@@ -1050,6 +1097,7 @@ class TestCmdStop:
 # =====================================================================
 # Natural language stop
 # =====================================================================
+
 
 class TestNaturalLanguageStop:
     """Typing 'stop' should cancel tasks instead of being sent to the AI."""
@@ -1062,10 +1110,8 @@ class TestNaturalLanguageStop:
         gate = asyncio.Event()
 
         async def blocked() -> None:
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await gate.wait()
-            except asyncio.CancelledError:
-                pass
 
         task = asyncio.create_task(blocked())
         channel._register_background_task("111", task, "running task")
@@ -1086,10 +1132,8 @@ class TestNaturalLanguageStop:
         gate = asyncio.Event()
 
         async def blocked() -> None:
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await gate.wait()
-            except asyncio.CancelledError:
-                pass
 
         task = asyncio.create_task(blocked())
         channel._register_background_task("111", task, "task")
@@ -1108,10 +1152,8 @@ class TestNaturalLanguageStop:
         gate = asyncio.Event()
 
         async def blocked() -> None:
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await gate.wait()
-            except asyncio.CancelledError:
-                pass
 
         task = asyncio.create_task(blocked())
         channel._register_background_task("111", task, "task")
@@ -1143,10 +1185,8 @@ class TestNaturalLanguageStop:
         gate = asyncio.Event()
 
         async def blocked() -> None:
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await gate.wait()
-            except asyncio.CancelledError:
-                pass
 
         task = asyncio.create_task(blocked())
         channel._register_background_task("111", task, "task")
@@ -1174,6 +1214,7 @@ class TestNaturalLanguageStop:
 # =====================================================================
 # Commands
 # =====================================================================
+
 
 class TestCommands:
     """Bot command handlers."""
@@ -1273,9 +1314,11 @@ class TestCommands:
     ) -> None:
         from agent.channels.telegram import TelegramChannel
 
-        with patch("agent.channels.telegram.Bot"), \
-             patch("agent.channels.telegram.Dispatcher"), \
-             patch("agent.channels.telegram.Router"):
+        with (
+            patch("agent.channels.telegram.Bot"),
+            patch("agent.channels.telegram.Dispatcher"),
+            patch("agent.channels.telegram.Router"),
+        ):
             ch = TelegramChannel(
                 config=config,
                 event_bus=event_bus,
@@ -1293,6 +1336,7 @@ class TestCommands:
 # =====================================================================
 # Split message
 # =====================================================================
+
 
 class TestSplitMessage:
     """Message splitting logic."""
@@ -1342,6 +1386,7 @@ class TestSplitMessage:
 # Lifecycle
 # =====================================================================
 
+
 class TestLifecycle:
     """Start/stop behavior."""
 
@@ -1376,6 +1421,7 @@ class TestLifecycle:
 # Keep typing
 # =====================================================================
 
+
 class TestKeepTyping:
     """Typing indicator loop."""
 
@@ -1405,18 +1451,22 @@ class TestOrchestratorDispatch:
     """Tests for _dispatch_to_agent routing through the orchestrator."""
 
     async def test_dispatch_uses_orchestrator_when_available(
-        self, channel: TelegramChannel, mock_agent_loop: AsyncMock,
+        self,
+        channel: TelegramChannel,
+        mock_agent_loop: AsyncMock,
     ) -> None:
         """When orchestrator is set, _dispatch_to_agent should call run_channel_task."""
         from agent.core.subagent import SubAgentResult, SubAgentStatus
 
         mock_orch = AsyncMock()
-        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
-            task_id="t1",
-            role_name="channel",
-            status=SubAgentStatus.COMPLETED,
-            output="Orchestrated reply",
-        ))
+        mock_orch.run_channel_task = AsyncMock(
+            return_value=SubAgentResult(
+                task_id="t1",
+                role_name="channel",
+                status=SubAgentStatus.COMPLETED,
+                output="Orchestrated reply",
+            )
+        )
         channel.orchestrator = mock_orch
 
         session = MagicMock()
@@ -1424,7 +1474,10 @@ class TestOrchestratorDispatch:
         session.metadata = {}
 
         result = await channel._dispatch_to_agent(
-            "hello", session, mock_agent_loop, user_id="42",
+            "hello",
+            session,
+            mock_agent_loop,
+            user_id="42",
         )
 
         assert result == "Orchestrated reply"
@@ -1433,7 +1486,9 @@ class TestOrchestratorDispatch:
         mock_agent_loop.process_message.assert_not_called()
 
     async def test_dispatch_falls_back_without_orchestrator(
-        self, channel: TelegramChannel, mock_agent_loop: AsyncMock,
+        self,
+        channel: TelegramChannel,
+        mock_agent_loop: AsyncMock,
     ) -> None:
         """Without orchestrator, _dispatch_to_agent should use agent_loop directly."""
         channel.orchestrator = None
@@ -1444,24 +1499,30 @@ class TestOrchestratorDispatch:
         session.metadata = {}
 
         result = await channel._dispatch_to_agent(
-            "hello", session, mock_agent_loop, user_id="42",
+            "hello",
+            session,
+            mock_agent_loop,
+            user_id="42",
         )
 
         assert result == "Agent reply"
         mock_agent_loop.process_message.assert_awaited_once()
 
     async def test_dispatch_cancelled_returns_empty(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """Cancelled orchestrator tasks should return empty string."""
         from agent.core.subagent import SubAgentResult, SubAgentStatus
 
         mock_orch = AsyncMock()
-        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
-            task_id="t1",
-            role_name="channel",
-            status=SubAgentStatus.CANCELLED,
-        ))
+        mock_orch.run_channel_task = AsyncMock(
+            return_value=SubAgentResult(
+                task_id="t1",
+                role_name="channel",
+                status=SubAgentStatus.CANCELLED,
+            )
+        )
         channel.orchestrator = mock_orch
 
         session = MagicMock()
@@ -1469,24 +1530,30 @@ class TestOrchestratorDispatch:
         session.metadata = {}
 
         result = await channel._dispatch_to_agent(
-            "hello", session, MagicMock(), user_id="42",
+            "hello",
+            session,
+            MagicMock(),
+            user_id="42",
         )
 
         assert result == ""
 
     async def test_dispatch_failed_raises(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """Failed orchestrator tasks should raise RuntimeError."""
         from agent.core.subagent import SubAgentResult, SubAgentStatus
 
         mock_orch = AsyncMock()
-        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
-            task_id="t1",
-            role_name="channel",
-            status=SubAgentStatus.FAILED,
-            error="Timed out after 300s.",
-        ))
+        mock_orch.run_channel_task = AsyncMock(
+            return_value=SubAgentResult(
+                task_id="t1",
+                role_name="channel",
+                status=SubAgentStatus.FAILED,
+                error="Timed out after 300s.",
+            )
+        )
         channel.orchestrator = mock_orch
 
         session = MagicMock()
@@ -1495,22 +1562,28 @@ class TestOrchestratorDispatch:
 
         with pytest.raises(RuntimeError, match="Timed out"):
             await channel._dispatch_to_agent(
-                "hello", session, MagicMock(), user_id="42",
+                "hello",
+                session,
+                MagicMock(),
+                user_id="42",
             )
 
     async def test_dispatch_passes_permission_callback(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """Orchestrator should receive on_permission callback."""
         from agent.core.subagent import SubAgentResult, SubAgentStatus
 
         mock_orch = AsyncMock()
-        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
-            task_id="t1",
-            role_name="channel",
-            status=SubAgentStatus.COMPLETED,
-            output="done",
-        ))
+        mock_orch.run_channel_task = AsyncMock(
+            return_value=SubAgentResult(
+                task_id="t1",
+                role_name="channel",
+                status=SubAgentStatus.COMPLETED,
+                output="done",
+            )
+        )
         channel.orchestrator = mock_orch
 
         session = MagicMock()
@@ -1518,14 +1591,18 @@ class TestOrchestratorDispatch:
         session.metadata = {}
 
         await channel._dispatch_to_agent(
-            "hello", session, MagicMock(), user_id="42",
+            "hello",
+            session,
+            MagicMock(),
+            user_id="42",
         )
 
         call_kwargs = mock_orch.run_channel_task.call_args[1]
         assert call_kwargs.get("on_permission") is not None
 
     async def test_cancel_uses_orchestrator(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """_cancel_user_tasks should call orchestrator.cancel when available."""
         mock_orch = AsyncMock()
@@ -1535,10 +1612,8 @@ class TestOrchestratorDispatch:
         gate = asyncio.Event()
 
         async def blocked() -> None:
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await gate.wait()
-            except asyncio.CancelledError:
-                pass
 
         t = asyncio.create_task(blocked())
         channel._register_background_task("42", t, "test task")
@@ -1552,18 +1627,21 @@ class TestOrchestratorDispatch:
         mock_orch.cancel.assert_awaited_once()
 
     async def test_dispatch_completed_empty_output_returns_no_response(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """Completed with empty output should return '[No response]'."""
         from agent.core.subagent import SubAgentResult, SubAgentStatus
 
         mock_orch = AsyncMock()
-        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
-            task_id="t1",
-            role_name="channel",
-            status=SubAgentStatus.COMPLETED,
-            output="",
-        ))
+        mock_orch.run_channel_task = AsyncMock(
+            return_value=SubAgentResult(
+                task_id="t1",
+                role_name="channel",
+                status=SubAgentStatus.COMPLETED,
+                output="",
+            )
+        )
         channel.orchestrator = mock_orch
 
         session = MagicMock()
@@ -1571,23 +1649,29 @@ class TestOrchestratorDispatch:
         session.metadata = {}
 
         result = await channel._dispatch_to_agent(
-            "hello", session, MagicMock(), user_id="42",
+            "hello",
+            session,
+            MagicMock(),
+            user_id="42",
         )
         assert result == "[No response]"
 
     async def test_dispatch_failed_no_error_msg_raises_unknown(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """Failed with no error message should raise 'Unknown error'."""
         from agent.core.subagent import SubAgentResult, SubAgentStatus
 
         mock_orch = AsyncMock()
-        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
-            task_id="t1",
-            role_name="channel",
-            status=SubAgentStatus.FAILED,
-            error=None,
-        ))
+        mock_orch.run_channel_task = AsyncMock(
+            return_value=SubAgentResult(
+                task_id="t1",
+                role_name="channel",
+                status=SubAgentStatus.FAILED,
+                error=None,
+            )
+        )
         channel.orchestrator = mock_orch
 
         session = MagicMock()
@@ -1596,11 +1680,15 @@ class TestOrchestratorDispatch:
 
         with pytest.raises(RuntimeError, match="Unknown error"):
             await channel._dispatch_to_agent(
-                "hello", session, MagicMock(), user_id="42",
+                "hello",
+                session,
+                MagicMock(),
+                user_id="42",
             )
 
     async def test_dispatch_on_progress_updates_status_message(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """on_progress should edit the status message on tool_use events."""
         from agent.core.subagent import SubAgentResult, SubAgentStatus
@@ -1633,8 +1721,11 @@ class TestOrchestratorDispatch:
         session.metadata = {}
 
         await channel._dispatch_to_agent(
-            "hello", session, MagicMock(),
-            status_message=status_msg, user_id="42",
+            "hello",
+            session,
+            MagicMock(),
+            status_message=status_msg,
+            user_id="42",
         )
 
         status_msg.edit_text.assert_awaited_once()
@@ -1642,7 +1733,8 @@ class TestOrchestratorDispatch:
         assert "shell_exec" in edit_text
 
     async def test_dispatch_on_progress_throttles_updates(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """on_progress should throttle edits to at most one per 2 seconds."""
         from agent.core.subagent import SubAgentResult, SubAgentStatus
@@ -1676,15 +1768,19 @@ class TestOrchestratorDispatch:
         session.metadata = {}
 
         await channel._dispatch_to_agent(
-            "hello", session, MagicMock(),
-            status_message=status_msg, user_id="42",
+            "hello",
+            session,
+            MagicMock(),
+            status_message=status_msg,
+            user_id="42",
         )
 
         # First call goes through; second is throttled (<2s apart)
         assert status_msg.edit_text.await_count == 1
 
     async def test_dispatch_on_progress_subagent_prefix(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """Subagent tool_use should show 'Researching' prefix."""
         from agent.core.subagent import SubAgentResult, SubAgentStatus
@@ -1716,26 +1812,32 @@ class TestOrchestratorDispatch:
         session.metadata = {}
 
         await channel._dispatch_to_agent(
-            "hello", session, MagicMock(),
-            status_message=status_msg, user_id="42",
+            "hello",
+            session,
+            MagicMock(),
+            status_message=status_msg,
+            user_id="42",
         )
 
         edit_text = status_msg.edit_text.call_args[0][0]
         assert "Researching" in edit_text
 
     async def test_dispatch_progress_always_provided(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """on_progress is always provided (for text buffering), even without status_message."""
         from agent.core.subagent import SubAgentResult, SubAgentStatus
 
         mock_orch = AsyncMock()
-        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
-            task_id="t1",
-            role_name="channel",
-            status=SubAgentStatus.COMPLETED,
-            output="done",
-        ))
+        mock_orch.run_channel_task = AsyncMock(
+            return_value=SubAgentResult(
+                task_id="t1",
+                role_name="channel",
+                status=SubAgentStatus.COMPLETED,
+                output="done",
+            )
+        )
         channel.orchestrator = mock_orch
 
         session = MagicMock()
@@ -1743,26 +1845,32 @@ class TestOrchestratorDispatch:
         session.metadata = {}
 
         await channel._dispatch_to_agent(
-            "hello", session, MagicMock(),
-            status_message=None, user_id="42",
+            "hello",
+            session,
+            MagicMock(),
+            status_message=None,
+            user_id="42",
         )
 
         call_kwargs = mock_orch.run_channel_task.call_args[1]
         assert call_kwargs.get("on_progress") is not None
 
     async def test_dispatch_no_permission_without_user_id(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """No on_permission should be passed when user_id is None."""
         from agent.core.subagent import SubAgentResult, SubAgentStatus
 
         mock_orch = AsyncMock()
-        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
-            task_id="t1",
-            role_name="channel",
-            status=SubAgentStatus.COMPLETED,
-            output="done",
-        ))
+        mock_orch.run_channel_task = AsyncMock(
+            return_value=SubAgentResult(
+                task_id="t1",
+                role_name="channel",
+                status=SubAgentStatus.COMPLETED,
+                output="done",
+            )
+        )
         channel.orchestrator = mock_orch
 
         session = MagicMock()
@@ -1770,7 +1878,9 @@ class TestOrchestratorDispatch:
         session.metadata = {}
 
         await channel._dispatch_to_agent(
-            "hello", session, MagicMock(),
+            "hello",
+            session,
+            MagicMock(),
             user_id=None,
         )
 
@@ -1778,7 +1888,8 @@ class TestOrchestratorDispatch:
         assert call_kwargs.get("on_permission") is None
 
     async def test_dispatch_resets_had_approvals(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """_had_approvals should be reset to False before orchestrator call."""
         from agent.core.subagent import SubAgentResult, SubAgentStatus
@@ -1786,12 +1897,14 @@ class TestOrchestratorDispatch:
         channel._had_approvals["42"] = True  # leftover from previous request
 
         mock_orch = AsyncMock()
-        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
-            task_id="t1",
-            role_name="channel",
-            status=SubAgentStatus.COMPLETED,
-            output="done",
-        ))
+        mock_orch.run_channel_task = AsyncMock(
+            return_value=SubAgentResult(
+                task_id="t1",
+                role_name="channel",
+                status=SubAgentStatus.COMPLETED,
+                output="done",
+            )
+        )
         channel.orchestrator = mock_orch
 
         session = MagicMock()
@@ -1799,24 +1912,30 @@ class TestOrchestratorDispatch:
         session.metadata = {}
 
         await channel._dispatch_to_agent(
-            "hello", session, MagicMock(), user_id="42",
+            "hello",
+            session,
+            MagicMock(),
+            user_id="42",
         )
 
         assert channel._had_approvals["42"] is False
 
     async def test_dispatch_passes_correct_args_to_orchestrator(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """run_channel_task should receive prompt, task_id=session.id, session."""
         from agent.core.subagent import SubAgentResult, SubAgentStatus
 
         mock_orch = AsyncMock()
-        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
-            task_id="t1",
-            role_name="channel",
-            status=SubAgentStatus.COMPLETED,
-            output="ok",
-        ))
+        mock_orch.run_channel_task = AsyncMock(
+            return_value=SubAgentResult(
+                task_id="t1",
+                role_name="channel",
+                status=SubAgentStatus.COMPLETED,
+                output="ok",
+            )
+        )
         channel.orchestrator = mock_orch
 
         session = MagicMock()
@@ -1824,7 +1943,10 @@ class TestOrchestratorDispatch:
         session.metadata = {}
 
         await channel._dispatch_to_agent(
-            "test prompt", session, MagicMock(), user_id="42",
+            "test prompt",
+            session,
+            MagicMock(),
+            user_id="42",
         )
 
         call_args = mock_orch.run_channel_task.call_args
@@ -1837,7 +1959,8 @@ class TestOrchestratorDispatch:
     # ------------------------------------------------------------------
 
     async def test_cancel_orchestrator_no_session(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """Cancel with orchestrator but no session should still cancel asyncio tasks."""
         mock_orch = AsyncMock()
@@ -1847,10 +1970,8 @@ class TestOrchestratorDispatch:
         gate = asyncio.Event()
 
         async def blocked() -> None:
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await gate.wait()
-            except asyncio.CancelledError:
-                pass
 
         t = asyncio.create_task(blocked())
         channel._register_background_task("99", t, "test")
@@ -1863,7 +1984,8 @@ class TestOrchestratorDispatch:
         mock_orch.cancel.assert_not_awaited()
 
     async def test_cancel_orchestrator_exception_still_cancels_tasks(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """If orchestrator.cancel raises, asyncio tasks should still be cancelled."""
         mock_orch = AsyncMock()
@@ -1873,10 +1995,8 @@ class TestOrchestratorDispatch:
         gate = asyncio.Event()
 
         async def blocked() -> None:
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await gate.wait()
-            except asyncio.CancelledError:
-                pass
 
         t = asyncio.create_task(blocked())
         channel._register_background_task("42", t, "test")
@@ -1889,7 +2009,8 @@ class TestOrchestratorDispatch:
         assert t.cancelled() or t.done()
 
     async def test_cancel_without_orchestrator_with_sdk(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """Without orchestrator, should fall back to SDK cancel_task."""
         channel.orchestrator = None
@@ -1900,10 +2021,8 @@ class TestOrchestratorDispatch:
         gate = asyncio.Event()
 
         async def blocked() -> None:
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await gate.wait()
-            except asyncio.CancelledError:
-                pass
 
         t = asyncio.create_task(blocked())
         channel._register_background_task("42", t, "test")
@@ -1916,7 +2035,8 @@ class TestOrchestratorDispatch:
         mock_sdk.cancel_task.assert_awaited_once()
 
     async def test_cancel_without_orchestrator_without_sdk(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """Without orchestrator or SDK, should just cancel asyncio tasks."""
         channel.orchestrator = None
@@ -1925,10 +2045,8 @@ class TestOrchestratorDispatch:
         gate = asyncio.Event()
 
         async def blocked() -> None:
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await gate.wait()
-            except asyncio.CancelledError:
-                pass
 
         t = asyncio.create_task(blocked())
         channel._register_background_task("42", t, "test")
@@ -1939,7 +2057,8 @@ class TestOrchestratorDispatch:
         assert t.cancelled() or t.done()
 
     async def test_cancel_already_done_tasks_returns_zero(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """Tasks that are already done should not increment the cancelled count."""
         channel.orchestrator = None
@@ -1959,18 +2078,22 @@ class TestOrchestratorDispatch:
     # ------------------------------------------------------------------
 
     async def test_handle_text_uses_orchestrator_e2e(
-        self, channel: TelegramChannel, mock_agent_loop: AsyncMock,
+        self,
+        channel: TelegramChannel,
+        mock_agent_loop: AsyncMock,
     ) -> None:
         """End-to-end: _handle_text should route through orchestrator."""
         from agent.core.subagent import SubAgentResult, SubAgentStatus
 
         mock_orch = AsyncMock()
-        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
-            task_id="t1",
-            role_name="channel",
-            status=SubAgentStatus.COMPLETED,
-            output="Orchestrated response",
-        ))
+        mock_orch.run_channel_task = AsyncMock(
+            return_value=SubAgentResult(
+                task_id="t1",
+                role_name="channel",
+                status=SubAgentStatus.COMPLETED,
+                output="Orchestrated response",
+            )
+        )
         channel.orchestrator = mock_orch
 
         msg = _make_tg_message(text="do something")
@@ -1982,18 +2105,21 @@ class TestOrchestratorDispatch:
         mock_agent_loop.process_message.assert_not_called()
 
     async def test_handle_text_orchestrator_failure_delivers_error(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """When orchestrator returns FAILED, the error message should reach the user."""
         from agent.core.subagent import SubAgentResult, SubAgentStatus
 
         mock_orch = AsyncMock()
-        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
-            task_id="t1",
-            role_name="channel",
-            status=SubAgentStatus.FAILED,
-            error="Concurrency limit reached",
-        ))
+        mock_orch.run_channel_task = AsyncMock(
+            return_value=SubAgentResult(
+                task_id="t1",
+                role_name="channel",
+                status=SubAgentStatus.FAILED,
+                error="Concurrency limit reached",
+            )
+        )
         channel.orchestrator = mock_orch
 
         msg = _make_tg_message(text="do something")
@@ -2007,17 +2133,20 @@ class TestOrchestratorDispatch:
         assert "sorry" in error_text.lower() or "wrong" in error_text.lower()
 
     async def test_handle_text_cancelled_no_response_sent(
-        self, channel: TelegramChannel,
+        self,
+        channel: TelegramChannel,
     ) -> None:
         """When orchestrator returns CANCELLED, status should be cleaned up."""
         from agent.core.subagent import SubAgentResult, SubAgentStatus
 
         mock_orch = AsyncMock()
-        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
-            task_id="t1",
-            role_name="channel",
-            status=SubAgentStatus.CANCELLED,
-        ))
+        mock_orch.run_channel_task = AsyncMock(
+            return_value=SubAgentResult(
+                task_id="t1",
+                role_name="channel",
+                status=SubAgentStatus.CANCELLED,
+            )
+        )
         channel.orchestrator = mock_orch
 
         msg = _make_tg_message(text="do something")
@@ -2039,12 +2168,14 @@ class TestOrchestratorDispatch:
         from agent.core.subagent import SubAgentResult, SubAgentStatus
 
         mock_orch = AsyncMock()
-        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
-            task_id="t1",
-            role_name="channel",
-            status=SubAgentStatus.COMPLETED,
-            output="Got your document",
-        ))
+        mock_orch.run_channel_task = AsyncMock(
+            return_value=SubAgentResult(
+                task_id="t1",
+                role_name="channel",
+                status=SubAgentStatus.COMPLETED,
+                output="Got your document",
+            )
+        )
         channel.orchestrator = mock_orch
 
         msg = _make_tg_message()
@@ -2068,28 +2199,34 @@ class TestOrchestratorDispatch:
 
         from pathlib import Path as _Path
 
-        with patch("agent.channels.telegram._UPLOAD_DIR", _Path("/tmp/test_uploads")):
-            with patch("agent.channels.telegram.os.makedirs"):
-                with patch.object(_Path, "write_bytes"):
-                    await channel._handle_document(msg)
-                    await _drain_background_tasks(channel)
+        with (
+            patch("agent.channels.telegram._UPLOAD_DIR", _Path("/tmp/test_uploads")),
+            patch("agent.channels.telegram.os.makedirs"),
+            patch.object(_Path, "write_bytes"),
+        ):
+            await channel._handle_document(msg)
+            await _drain_background_tasks(channel)
 
         mock_orch.run_channel_task.assert_awaited_once()
         mock_agent_loop.process_message.assert_not_called()
 
     async def test_run_command_routes_through_orchestrator(
-        self, channel: TelegramChannel, mock_agent_loop: AsyncMock,
+        self,
+        channel: TelegramChannel,
+        mock_agent_loop: AsyncMock,
     ) -> None:
         """/run command should route through orchestrator."""
         from agent.core.subagent import SubAgentResult, SubAgentStatus
 
         mock_orch = AsyncMock()
-        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
-            task_id="t1",
-            role_name="channel",
-            status=SubAgentStatus.COMPLETED,
-            output="Review complete",
-        ))
+        mock_orch.run_channel_task = AsyncMock(
+            return_value=SubAgentResult(
+                task_id="t1",
+                role_name="channel",
+                status=SubAgentStatus.COMPLETED,
+                output="Review complete",
+            )
+        )
         channel.orchestrator = mock_orch
 
         msg = _make_tg_message(text="/run review")
@@ -2104,8 +2241,11 @@ class TestOrchestratorDispatch:
 # Intermediate streaming
 # =====================================================================
 
+
 def _make_stream_event(
-    event_type: str, content: str = "", data: dict[str, Any] | None = None,
+    event_type: str,
+    content: str = "",
+    data: dict[str, Any] | None = None,
 ) -> MagicMock:
     """Create a mock SDKStreamEvent-like object."""
     ev = MagicMock()
@@ -2130,8 +2270,11 @@ class TestIntermediateStreaming:
         from agent.core.subagent import SubAgentResult, SubAgentStatus
 
         async def _fake_run_channel_task(
-            prompt: str, task_id: str, session: Any,
-            on_progress: Any = None, on_permission: Any = None,
+            prompt: str,
+            task_id: str,
+            session: Any,
+            on_progress: Any = None,
+            on_permission: Any = None,
         ) -> SubAgentResult:
             if on_progress:
                 for ev in events:
@@ -2157,7 +2300,9 @@ class TestIntermediateStreaming:
         stream_state: dict[str, Any] = {"status_consumed": False}
 
         result = await channel._dispatch_to_agent(
-            "hello", session, AsyncMock(),
+            "hello",
+            session,
+            AsyncMock(),
             status_message=status_msg,
             user_id="111",
             stream_state=stream_state,
@@ -2165,7 +2310,8 @@ class TestIntermediateStreaming:
         return result, stream_state
 
     async def test_intermediate_text_sent_on_tool_use(
-        self, channel: Any,
+        self,
+        channel: Any,
     ) -> None:
         """text -> tool -> text -> end: first text flushed, second returned."""
         events = [
@@ -2175,7 +2321,8 @@ class TestIntermediateStreaming:
         ]
 
         result, state = await self._run_dispatch_with_events(
-            channel, events,
+            channel,
+            events,
             final_output="Let me check that.Here is the answer.",
         )
 
@@ -2189,7 +2336,8 @@ class TestIntermediateStreaming:
         assert state["status_consumed"] is True
 
     async def test_no_tools_no_intermediate_sends(
-        self, channel: Any,
+        self,
+        channel: Any,
     ) -> None:
         """text -> end: no intermediate sends, full text returned."""
         events = [
@@ -2200,7 +2348,9 @@ class TestIntermediateStreaming:
         channel._bot.send_message.reset_mock()
 
         result, state = await self._run_dispatch_with_events(
-            channel, events, final_output="Simple reply with no tools.",
+            channel,
+            events,
+            final_output="Simple reply with no tools.",
         )
 
         # No intermediate messages sent
@@ -2211,7 +2361,8 @@ class TestIntermediateStreaming:
         assert state["status_consumed"] is False
 
     async def test_multiple_tool_rounds(
-        self, channel: Any,
+        self,
+        channel: Any,
     ) -> None:
         """text -> tool -> text -> tool -> text -> end: two flushes."""
         events = [
@@ -2225,7 +2376,8 @@ class TestIntermediateStreaming:
         channel._bot.send_message.reset_mock()
 
         result, state = await self._run_dispatch_with_events(
-            channel, events,
+            channel,
+            events,
             final_output="First thought.Second thought.Final answer.",
         )
 
@@ -2239,7 +2391,8 @@ class TestIntermediateStreaming:
         assert state["status_consumed"] is True
 
     async def test_empty_text_before_tool(
-        self, channel: Any,
+        self,
+        channel: Any,
     ) -> None:
         """tool -> text -> end: no flush, status edited with tool name."""
         events = [
@@ -2250,7 +2403,9 @@ class TestIntermediateStreaming:
         channel._bot.send_message.reset_mock()
 
         result, state = await self._run_dispatch_with_events(
-            channel, events, final_output="Done.",
+            channel,
+            events,
+            final_output="Done.",
         )
 
         # No intermediate sends (no text before tool)
@@ -2261,7 +2416,8 @@ class TestIntermediateStreaming:
         assert state["status_consumed"] is False
 
     async def test_status_deleted_on_first_flush(
-        self, channel: Any,
+        self,
+        channel: Any,
     ) -> None:
         """Verify status_message.delete() called and status_consumed set."""
         from agent.core.subagent import SubAgentResult, SubAgentStatus
@@ -2270,8 +2426,11 @@ class TestIntermediateStreaming:
         status_msg.delete = AsyncMock()
 
         async def _fake_run(
-            prompt: str, task_id: str, session: Any,
-            on_progress: Any = None, on_permission: Any = None,
+            prompt: str,
+            task_id: str,
+            session: Any,
+            on_progress: Any = None,
+            on_permission: Any = None,
         ) -> SubAgentResult:
             if on_progress:
                 await on_progress(_make_stream_event("text", "Checking..."))
@@ -2279,8 +2438,10 @@ class TestIntermediateStreaming:
                     _make_stream_event("tool_use", "", {"tool": "web"}),
                 )
             return SubAgentResult(
-                task_id="t1", role_name="channel",
-                status=SubAgentStatus.COMPLETED, output="Checking...",
+                task_id="t1",
+                role_name="channel",
+                status=SubAgentStatus.COMPLETED,
+                output="Checking...",
             )
 
         mock_orch = AsyncMock()
@@ -2292,8 +2453,11 @@ class TestIntermediateStreaming:
         stream_state: dict[str, Any] = {"status_consumed": False}
 
         await channel._dispatch_to_agent(
-            "test", session, AsyncMock(),
-            status_message=status_msg, user_id="111",
+            "test",
+            session,
+            AsyncMock(),
+            status_message=status_msg,
+            user_id="111",
             stream_state=stream_state,
         )
 
@@ -2301,7 +2465,8 @@ class TestIntermediateStreaming:
         assert stream_state["status_consumed"] is True
 
     async def test_result_content_override(
-        self, channel: Any,
+        self,
+        channel: Any,
     ) -> None:
         """Result event overrides: extract tail after sent text."""
         events = [
@@ -2309,7 +2474,8 @@ class TestIntermediateStreaming:
             _make_stream_event("tool_use", "", {"tool": "calc"}),
             _make_stream_event("text", ""),  # no more text events
             _make_stream_event(
-                "result", "Intro. The real final answer.",
+                "result",
+                "Intro. The real final answer.",
                 {"session_id": "s1"},
             ),
         ]
@@ -2317,7 +2483,8 @@ class TestIntermediateStreaming:
         channel._bot.send_message.reset_mock()
 
         result, state = await self._run_dispatch_with_events(
-            channel, events,
+            channel,
+            events,
             final_output="Intro. The real final answer.",
         )
 
@@ -2325,16 +2492,21 @@ class TestIntermediateStreaming:
         assert result == "The real final answer."
 
     async def test_stream_state_not_provided(
-        self, channel: Any,
+        self,
+        channel: Any,
     ) -> None:
         """stream_state=None should not crash (backward compat)."""
         from agent.core.subagent import SubAgentResult, SubAgentStatus
 
         mock_orch = AsyncMock()
-        mock_orch.run_channel_task = AsyncMock(return_value=SubAgentResult(
-            task_id="t1", role_name="channel",
-            status=SubAgentStatus.COMPLETED, output="Reply",
-        ))
+        mock_orch.run_channel_task = AsyncMock(
+            return_value=SubAgentResult(
+                task_id="t1",
+                role_name="channel",
+                status=SubAgentStatus.COMPLETED,
+                output="Reply",
+            )
+        )
         channel.orchestrator = mock_orch
 
         session = AsyncMock()
@@ -2342,13 +2514,17 @@ class TestIntermediateStreaming:
 
         # No stream_state param — should not crash
         result = await channel._dispatch_to_agent(
-            "test", session, AsyncMock(),
-            status_message=None, user_id="111",
+            "test",
+            session,
+            AsyncMock(),
+            status_message=None,
+            user_id="111",
         )
         assert result == "Reply"
 
     async def test_fallback_path_streams(
-        self, channel: Any,
+        self,
+        channel: Any,
     ) -> None:
         """Buffer-and-flush works through _process_via_sdk_or_loop (SDK path)."""
         events = [
@@ -2381,8 +2557,11 @@ class TestIntermediateStreaming:
         stream_state: dict[str, Any] = {"status_consumed": False}
 
         result = await channel._process_via_sdk_or_loop(
-            "hello", session, AsyncMock(),
-            status_message=status_msg, user_id="111",
+            "hello",
+            session,
+            AsyncMock(),
+            status_message=status_msg,
+            user_id="111",
             stream_state=stream_state,
         )
 
@@ -2400,7 +2579,8 @@ class TestIntermediateStreaming:
         assert result == "Here you go."
 
     async def test_fallback_no_tools_returns_full(
-        self, channel: Any,
+        self,
+        channel: Any,
     ) -> None:
         """SDK path without tools returns full text, no intermediate sends."""
         events = [
@@ -2425,8 +2605,11 @@ class TestIntermediateStreaming:
         channel._bot.send_message.reset_mock()
 
         result = await channel._process_via_sdk_or_loop(
-            "hello", session, AsyncMock(),
-            status_message=None, user_id="111",
+            "hello",
+            session,
+            AsyncMock(),
+            status_message=None,
+            user_id="111",
         )
 
         channel._bot.send_message.assert_not_called()

@@ -1,0 +1,74 @@
+name: mobile_app
+description: "Mobile app development — design, build, test, deploy"
+stages:
+  - name: requirements
+    parallel: true
+    agents:
+      - team: product
+        role: product_manager
+      - team: product
+        role: ux_designer
+
+  - name: design
+    parallel: true
+    agents:
+      - team: design
+        role: ui_designer
+      - team: engineering
+        role: architect
+
+  - name: api_design
+    agents:
+      - team: engineering
+        role: api_designer
+
+  - name: backend
+    agents:
+      - team: engineering
+        role: backend_developer
+
+  - name: mobile
+    agents:
+      - team: engineering
+        role: mobile_developer
+
+  - name: testing
+    parallel: true
+    agents:
+      - team: quality
+        role: qa_engineer
+      - team: quality
+        role: integration_tester
+    denied_tools:
+      - assign_task
+      - request_review
+    feedback:
+      fix_stage: fix_issues
+      max_retries: 3
+
+  - name: fix_issues
+    feedback_target: true
+    parallel: true
+    agents:
+      - team: engineering
+        role: backend_developer
+      - team: engineering
+        role: mobile_developer
+
+  - name: security_review
+    agents:
+      - team: quality
+        role: security_reviewer
+    denied_tools:
+      - file_write
+      - assign_task
+
+  - name: deployment
+    agents:
+      - team: engineering
+        role: devops_engineer
+
+  - name: documentation
+    agents:
+      - team: content
+        role: api_docs_writer

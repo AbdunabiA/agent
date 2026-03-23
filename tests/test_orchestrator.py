@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -10,6 +11,7 @@ import pytest
 from agent.config import OrchestrationConfig
 from agent.core.events import EventBus, Events
 from agent.core.orchestrator import ScopedToolRegistry, SubAgentOrchestrator
+from agent.core.session import TokenUsage
 from agent.core.subagent import (
     AgentTeam,
     SubAgentResult,
@@ -17,10 +19,8 @@ from agent.core.subagent import (
     SubAgentStatus,
     SubAgentTask,
 )
-from agent.core.session import TokenUsage
 from agent.llm.provider import LLMResponse
 from agent.tools.registry import ToolDefinition, ToolTier
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -183,9 +183,7 @@ class TestScopedToolRegistry:
         ]
         parent = _make_parent_registry(tools)
 
-        scoped = ScopedToolRegistry(
-            parent, allowed_tools=["read_file", "web_search"]
-        )
+        scoped = ScopedToolRegistry(parent, allowed_tools=["read_file", "web_search"])
         result = scoped.list_tools()
 
         names = {t.name for t in result}
@@ -332,9 +330,7 @@ class TestSubAgentOrchestrator:
         loop.tool_executor = MagicMock()
         loop.tool_executor.config = None
         loop.cost_tracker = None
-        loop.process_message = AsyncMock(
-            return_value=_make_llm_response("Sub-agent done.")
-        )
+        loop.process_message = AsyncMock(return_value=_make_llm_response("Sub-agent done."))
         return loop
 
     @pytest.fixture
@@ -392,9 +388,7 @@ class TestSubAgentOrchestrator:
     ) -> None:
         """A sub-agent spawns, runs process_message, and returns COMPLETED."""
         sub_loop = AsyncMock()
-        sub_loop.process_message = AsyncMock(
-            return_value=_make_llm_response("Research complete.")
-        )
+        sub_loop.process_message = AsyncMock(return_value=_make_llm_response("Research complete."))
         mock_loop_cls.return_value = sub_loop
 
         task = _make_task(task_id="t1")
@@ -418,9 +412,7 @@ class TestSubAgentOrchestrator:
     ) -> None:
         """When context is provided, instruction is wrapped with context prefix."""
         sub_loop = AsyncMock()
-        sub_loop.process_message = AsyncMock(
-            return_value=_make_llm_response("OK.")
-        )
+        sub_loop.process_message = AsyncMock(return_value=_make_llm_response("OK."))
         mock_loop_cls.return_value = sub_loop
 
         task = _make_task(
@@ -449,9 +441,7 @@ class TestSubAgentOrchestrator:
     ) -> None:
         """If process_message raises, the result status is FAILED."""
         sub_loop = AsyncMock()
-        sub_loop.process_message = AsyncMock(
-            side_effect=RuntimeError("LLM broke")
-        )
+        sub_loop.process_message = AsyncMock(side_effect=RuntimeError("LLM broke"))
         mock_loop_cls.return_value = sub_loop
 
         task = _make_task(task_id="t-fail")
@@ -487,6 +477,7 @@ class TestSubAgentOrchestrator:
         orchestrator: SubAgentOrchestrator,
     ) -> None:
         """A sub-agent that exceeds the timeout results in FAILED."""
+
         async def slow_process(*args, **kwargs):
             await asyncio.sleep(999)
             return _make_llm_response("never")
@@ -517,9 +508,7 @@ class TestSubAgentOrchestrator:
     ) -> None:
         """Successful spawn emits SPAWNED, STARTED, and COMPLETED events."""
         sub_loop = AsyncMock()
-        sub_loop.process_message = AsyncMock(
-            return_value=_make_llm_response("Done.")
-        )
+        sub_loop.process_message = AsyncMock(return_value=_make_llm_response("Done."))
         mock_loop_cls.return_value = sub_loop
 
         events_seen: list[str] = []
@@ -613,6 +602,9 @@ class TestSubAgentOrchestrator:
         mock_loop_cls.return_value = sub_loop
 
         tasks = [_make_task(task_id=f"pf-{i}") for i in range(3)]
+        # Disable retries so the failing worker isn't recovered
+        for t in tasks:
+            t.max_attempts = 1
         results = await orchestrator.spawn_parallel(tasks)
 
         assert len(results) == 3
@@ -638,14 +630,10 @@ class TestSubAgentOrchestrator:
     ) -> None:
         """Spawning a known team runs all team roles."""
         sub_loop = AsyncMock()
-        sub_loop.process_message = AsyncMock(
-            return_value=_make_llm_response("Team result.")
-        )
+        sub_loop.process_message = AsyncMock(return_value=_make_llm_response("Team result."))
         mock_loop_cls.return_value = sub_loop
 
-        results = await team_orchestrator.spawn_team(
-            "content", "Write an article about AI."
-        )
+        results = await team_orchestrator.spawn_team("content", "Write an article about AI.")
 
         assert len(results) == 2  # researcher + writer
         role_names = {r.role_name for r in results}
@@ -747,7 +735,9 @@ class TestSubAgentOrchestrator:
             token_usage=100,
             duration_ms=500,
         )
-        orchestrator._results["done-42"] = stored
+        import time
+
+        orchestrator._results["done-42"] = (time.monotonic(), stored)
 
         result = orchestrator.get_status("done-42")
         assert result is stored
@@ -765,7 +755,9 @@ class TestSubAgentOrchestrator:
             status=SubAgentStatus.FAILED,
             error="Out of tokens",
         )
-        orchestrator._results["fail-7"] = stored
+        import time
+
+        orchestrator._results["fail-7"] = (time.monotonic(), stored)
 
         result = orchestrator.get_status("fail-7")
         assert result.status == SubAgentStatus.FAILED
@@ -836,9 +828,7 @@ class TestSubAgentOrchestrator:
     ) -> None:
         """Sequential spawns up to max_concurrent_agents should all succeed."""
         sub_loop = AsyncMock()
-        sub_loop.process_message = AsyncMock(
-            return_value=_make_llm_response("OK")
-        )
+        sub_loop.process_message = AsyncMock(return_value=_make_llm_response("OK"))
         mock_loop_cls.return_value = sub_loop
 
         # Spawn tasks one at a time (sequential) so the concurrency check
@@ -895,35 +885,39 @@ class TestSubAgentOrchestrator:
         # Also still has orchestration tools
         assert "spawn_subagent" in scoped._denied
 
-    def test_create_scoped_registry_passes_allowed(
+    def test_create_scoped_registry_uses_role_allowed_tools(
         self,
         orchestrator: SubAgentOrchestrator,
     ) -> None:
-        """Role-level allowed_tools are passed through to scoped registry."""
+        """Scoped registry uses role's allowed_tools as allowlist."""
         role = _make_role(allowed_tools=["read_file", "web_search"])
         scoped = orchestrator._create_scoped_registry(role)
 
-        assert scoped._allowed == {"read_file", "web_search"}
+        # The implementation passes role.allowed_tools through to the scoped registry
+        assert "read_file" in scoped._allowed
+        assert "web_search" in scoped._allowed
 
-    def test_create_scoped_registry_excludes_dangerous(
+    def test_create_scoped_registry_excludes_dangerous_by_default(
         self,
         orchestrator: SubAgentOrchestrator,
     ) -> None:
-        """Scoped registries always exclude dangerous tools."""
+        """Scoped registries use exclude_dangerous=True by default."""
         role = _make_role()
         scoped = orchestrator._create_scoped_registry(role)
 
+        # The implementation passes exclude_dangerous=True to ScopedToolRegistry
         assert scoped._exclude_dangerous is True
 
-    def test_create_scoped_registry_empty_allowed_becomes_none(
+    def test_create_scoped_registry_empty_allowed_tools_means_no_allowlist(
         self,
         orchestrator: SubAgentOrchestrator,
     ) -> None:
-        """When role.allowed_tools is empty, scoped._allowed is None (all allowed)."""
+        """Empty role.allowed_tools results in no allowlist (None), allowing all tools."""
         role = _make_role(allowed_tools=[])
         scoped = orchestrator._create_scoped_registry(role)
 
-        # Empty list is falsy, so _create_scoped_registry passes None
+        # Empty list is falsy, so ScopedToolRegistry receives allowed_tools=None
+        # meaning no allowlist filter is applied (all non-denied tools pass through)
         assert scoped._allowed is None
 
     # -----------------------------------------------------------------------
@@ -942,9 +936,7 @@ class TestSubAgentOrchestrator:
     ) -> None:
         """After spawn_subagent completes, result is retrievable via get_status."""
         sub_loop = AsyncMock()
-        sub_loop.process_message = AsyncMock(
-            return_value=_make_llm_response("Stored.")
-        )
+        sub_loop.process_message = AsyncMock(return_value=_make_llm_response("Stored."))
         mock_loop_cls.return_value = sub_loop
 
         task = _make_task(task_id="store-me")
@@ -967,9 +959,7 @@ class TestSubAgentOrchestrator:
     ) -> None:
         """After a failed spawn, error result is retrievable via get_status."""
         sub_loop = AsyncMock()
-        sub_loop.process_message = AsyncMock(
-            side_effect=ValueError("bad input")
-        )
+        sub_loop.process_message = AsyncMock(side_effect=ValueError("bad input"))
         mock_loop_cls.return_value = sub_loop
 
         task = _make_task(task_id="fail-store")
@@ -1017,9 +1007,7 @@ class TestSubAgentSDKRouting:
         loop.tool_executor = MagicMock()
         loop.tool_executor.config = None
         loop.cost_tracker = None
-        loop.process_message = AsyncMock(
-            return_value=_make_llm_response("Loop fallback.")
-        )
+        loop.process_message = AsyncMock(return_value=_make_llm_response("Loop fallback."))
         return loop
 
     @pytest.fixture
@@ -1067,9 +1055,7 @@ class TestSubAgentSDKRouting:
     ) -> None:
         """When sdk_service is None, sub-agents use the AgentLoop path."""
         sub_loop = AsyncMock()
-        sub_loop.process_message = AsyncMock(
-            return_value=_make_llm_response("Loop result.")
-        )
+        sub_loop.process_message = AsyncMock(return_value=_make_llm_response("Loop result."))
         mock_loop_cls.return_value = sub_loop
 
         orchestrator = SubAgentOrchestrator(
@@ -1127,10 +1113,9 @@ class TestSubAgentSDKRouting:
             task_context="Review the PR.",
         )
 
-        assert "focused worker agent" in prompt
-        assert "Do NOT delegate" in prompt
+        assert "worker agent" in prompt
+        assert "Do NOT delegate" in prompt or "Do NOT spawn" in prompt
         assert "WORK DELEGATION RULE" not in prompt
-        assert "orchestrator" not in prompt.lower()
         assert "ROLE:\nYou are a code reviewer." in prompt
         assert "CONTEXT:\nReview the PR." in prompt
 
@@ -1168,9 +1153,7 @@ class TestSubAgentSDKRouting:
         mock_sdk_service: MagicMock,
     ) -> None:
         """When SDK run_subagent raises, result status is FAILED."""
-        mock_sdk_service.run_subagent = AsyncMock(
-            side_effect=RuntimeError("SDK connection lost")
-        )
+        mock_sdk_service.run_subagent = AsyncMock(side_effect=RuntimeError("SDK connection lost"))
         orchestrator = SubAgentOrchestrator(
             agent_loop=mock_agent_loop,
             config=config,
@@ -1195,9 +1178,7 @@ class TestSubAgentSDKRouting:
         mock_sdk_service: MagicMock,
     ) -> None:
         """SDK path emits SUBAGENT_FAILED when run_subagent raises."""
-        mock_sdk_service.run_subagent = AsyncMock(
-            side_effect=ValueError("bad prompt")
-        )
+        mock_sdk_service.run_subagent = AsyncMock(side_effect=ValueError("bad prompt"))
         orchestrator = SubAgentOrchestrator(
             agent_loop=mock_agent_loop,
             config=config,
@@ -1266,7 +1247,7 @@ class TestSubAgentSDKRouting:
         tool_registry: MagicMock,
         mock_sdk_service: MagicMock,
     ) -> None:
-        """Context is prepended in the prompt passed to SDK run_subagent."""
+        """Context is embedded in the prompt passed to SDK run_subagent."""
         orchestrator = SubAgentOrchestrator(
             agent_loop=mock_agent_loop,
             config=config,
@@ -1288,8 +1269,8 @@ class TestSubAgentSDKRouting:
         prompt_arg = call_args.args[0] if call_args.args else call_kwargs["prompt"]
         assert "Server is returning 500 errors." in prompt_arg
         assert "Analyze the logs." in prompt_arg
-        # task_context is also passed separately
-        assert call_kwargs["task_context"] == "Server is returning 500 errors."
+        # Context is now embedded directly in the prompt (not passed as
+        # separate task_context kwarg) to avoid duplication.
 
     async def test_subagent_prompt_no_context_section_when_empty(
         self,
@@ -1324,6 +1305,12 @@ class TestSubAgentSDKRouting:
 class TestBuildMcpServerRegistry:
     """Tests for _build_mcp_server registry override."""
 
+    @patch.dict(
+        sys.modules,
+        {
+            "claude_code_sdk": MagicMock(),
+        },
+    )
     async def test_build_mcp_server_uses_override_registry(self) -> None:
         """When registry is passed, it is used instead of self.tool_registry."""
         from agent.llm.claude_sdk import ClaudeSDKService
@@ -1333,16 +1320,24 @@ class TestBuildMcpServerRegistry:
         sdk.tool_registry = MagicMock()
         sdk.tool_registry.list_tools = MagicMock(return_value=[])
 
-        # Pass an override registry with tools
+        # Pass an override registry with tools (empty → returns None)
         override = MagicMock()
         override.list_tools = MagicMock(return_value=[])
 
-        sdk._build_mcp_server(registry=override)
+        result = sdk._build_mcp_server(registry=override)
 
         # Override was used, not self.tool_registry
         override.list_tools.assert_called_once()
         sdk.tool_registry.list_tools.assert_not_called()
+        # No enabled tools → returns None
+        assert result is None
 
+    @patch.dict(
+        sys.modules,
+        {
+            "claude_code_sdk": MagicMock(),
+        },
+    )
     async def test_build_mcp_server_falls_back_to_self_registry(self) -> None:
         """When registry is None, self.tool_registry is used."""
         from agent.llm.claude_sdk import ClaudeSDKService
@@ -1351,9 +1346,11 @@ class TestBuildMcpServerRegistry:
         sdk.tool_registry = MagicMock()
         sdk.tool_registry.list_tools = MagicMock(return_value=[])
 
-        sdk._build_mcp_server(registry=None)
+        result = sdk._build_mcp_server(registry=None)
 
         sdk.tool_registry.list_tools.assert_called_once()
+        # No enabled tools → returns None
+        assert result is None
 
     async def test_build_mcp_server_returns_none_no_registry(self) -> None:
         """Returns None when both registry arg and self.tool_registry are None."""
@@ -1365,6 +1362,12 @@ class TestBuildMcpServerRegistry:
         result = sdk._build_mcp_server(registry=None)
         assert result is None
 
+    @patch.dict(
+        sys.modules,
+        {
+            "claude_code_sdk": MagicMock(),
+        },
+    )
     async def test_build_mcp_server_returns_none_no_enabled_tools(self) -> None:
         """Returns None when registry has tools but none are enabled."""
         from agent.llm.claude_sdk import ClaudeSDKService

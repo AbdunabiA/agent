@@ -1,0 +1,95 @@
+name: build_saas
+description: "Full SaaS product — spec, architecture, database, backend, frontend, testing, security, deployment, landing page, docs"
+stages:
+  - name: product_spec
+    parallel: true
+    agents:
+      - team: product
+        role: product_manager
+      - team: product
+        role: business_analyst
+
+  - name: architecture
+    parallel: true
+    agents:
+      - team: engineering
+        role: architect
+      - team: engineering
+        role: api_designer
+
+  - name: design
+    parallel: true
+    agents:
+      - team: product
+        role: ux_designer
+      - team: design
+        role: ui_designer
+
+  - name: database
+    agents:
+      - team: data
+        role: data_engineer
+
+  - name: backend
+    agents:
+      - team: engineering
+        role: backend_developer
+
+  - name: frontend
+    agents:
+      - team: engineering
+        role: frontend_developer
+
+  - name: testing
+    parallel: true
+    agents:
+      - team: quality
+        role: qa_engineer
+      - team: quality
+        role: integration_tester
+    denied_tools:
+      - assign_task
+      - request_review
+      - ask_team
+    feedback:
+      fix_stage: fix_issues
+      max_retries: 3
+
+  - name: fix_issues
+    feedback_target: true
+    parallel: true
+    agents:
+      - team: engineering
+        role: backend_developer
+      - team: engineering
+        role: frontend_developer
+
+  - name: security_audit
+    agents:
+      - team: quality
+        role: security_reviewer
+    denied_tools:
+      - file_write
+      - assign_task
+      - request_review
+
+  - name: deployment
+    agents:
+      - team: engineering
+        role: devops_engineer
+
+  - name: landing_page
+    parallel: true
+    agents:
+      - team: content
+        role: copywriter
+      - team: product
+        role: growth_hacker
+
+  - name: documentation
+    parallel: true
+    agents:
+      - team: content
+        role: technical_writer
+      - team: content
+        role: api_docs_writer

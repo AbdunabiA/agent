@@ -13,7 +13,17 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import aiosqlite
 import structlog
+from litellm.exceptions import (
+    APIConnectionError as LiteLLMConnectionError,
+)
+from litellm.exceptions import (
+    APIError as LiteLLMAPIError,
+)
+from litellm.exceptions import (
+    Timeout as LiteLLMTimeout,
+)
 
 from agent.config import AgentPersonaConfig
 from agent.core.events import EventBus, Events
@@ -36,6 +46,9 @@ if TYPE_CHECKING:
     from agent.tools.executor import ToolExecutor, ToolResult
 
 logger = structlog.get_logger(__name__)
+
+_MAX_BACKGROUND_TASKS = 20
+_BACKGROUND_TASK_TIMEOUT = 60
 
 
 @dataclass
@@ -115,7 +128,7 @@ class AgentLoop:
         if self.session_store:
             try:
                 await self.session_store.save_message(session.id, message)
-            except Exception as e:
+            except (aiosqlite.Error, OSError) as e:
                 logger.debug("message_persist_failed", error=str(e))
 
     async def process_message(
@@ -205,7 +218,13 @@ class AgentLoop:
                     messages=messages,
                     **kwargs,
                 )
-            except Exception as e:
+            except (
+                LiteLLMAPIError,
+                LiteLLMConnectionError,
+                LiteLLMTimeout,
+                ConnectionError,
+                TimeoutError,
+            ) as e:
                 logger.error("llm_call_failed", error=str(e), iteration=iteration)
                 raise
 
@@ -222,12 +241,15 @@ class AgentLoop:
 
             # No tool calls -> final response
             if not response.tool_calls:
-                await self._add_and_persist(session, Message(
-                    role="assistant",
-                    content=response.content,
-                    model=response.model,
-                    usage=response.usage,
-                ))
+                await self._add_and_persist(
+                    session,
+                    Message(
+                        role="assistant",
+                        content=response.content,
+                        model=response.model,
+                        usage=response.usage,
+                    ),
+                )
                 await self.event_bus.emit(
                     Events.MESSAGE_OUTGOING,
                     {
@@ -249,28 +271,23 @@ class AgentLoop:
                 # Fire-and-forget memory operations (tracked for cleanup)
                 if trigger == "user_message":
                     if self.fact_extractor:
-                        task = asyncio.create_task(
-                            self._safe_extract_facts(session)
-                        )
-                        self._background_tasks.add(task)
-                        task.add_done_callback(self._background_tasks.discard)
+                        self._spawn_background_task(self._safe_extract_facts(session))
                     if self.summarizer:
-                        task = asyncio.create_task(
-                            self._safe_summarize(session)
-                        )
-                        self._background_tasks.add(task)
-                        task.add_done_callback(self._background_tasks.discard)
+                        self._spawn_background_task(self._safe_summarize(session))
 
                 return response
 
             # Has tool calls -> execute them
-            await self._add_and_persist(session, Message(
-                role="assistant",
-                content=response.content or "",
-                tool_calls=response.tool_calls,
-                model=response.model,
-                usage=response.usage,
-            ))
+            await self._add_and_persist(
+                session,
+                Message(
+                    role="assistant",
+                    content=response.content or "",
+                    tool_calls=response.tool_calls,
+                    model=response.model,
+                    usage=response.usage,
+                ),
+            )
 
             # Execute tool calls
             for tool_call in response.tool_calls:
@@ -283,16 +300,21 @@ class AgentLoop:
                     },
                 )
 
-                result = await self._execute_tool_call(
-                    tool_call, session, trigger, plan
-                )
+                result = await self._execute_tool_call(tool_call, session, trigger, plan)
+
+                # Check URLs in tool output for broken links
+                if "http" in result.output:
+                    result.output = await self._check_urls_in_output(result.output)
 
                 # Add tool result to session (multimodal if images present)
-                await self._add_and_persist(session, Message(
-                    role="tool",
-                    content=self._build_tool_content(result),
-                    tool_call_id=tool_call.id,
-                ))
+                await self._add_and_persist(
+                    session,
+                    Message(
+                        role="tool",
+                        content=self._build_tool_content(result),
+                        tool_call_id=tool_call.id,
+                    ),
+                )
 
                 await self.event_bus.emit(
                     Events.TOOL_RESULT,
@@ -307,9 +329,8 @@ class AgentLoop:
                 if plan and hasattr(plan, "status"):
                     from agent.core.planner import PlanStatus
 
-                    if (
-                        plan.status == PlanStatus.IN_PROGRESS
-                        and plan.current_step < len(plan.steps)
+                    if plan.status == PlanStatus.IN_PROGRESS and plan.current_step < len(
+                        plan.steps
                     ):
                         step = plan.steps[plan.current_step]
                         if result.success:
@@ -326,26 +347,42 @@ class AgentLoop:
         logger.warning("max_iterations_reached", iterations=max_iterations)
 
         # Force a final response
-        await self._add_and_persist(session, Message(
-            role="system",
-            content=(
-                f"You have reached the maximum of {max_iterations} tool-calling "
-                "iterations. Summarize what you've accomplished and what remains."
+        await self._add_and_persist(
+            session,
+            Message(
+                role="system",
+                content=(
+                    f"You have reached the maximum of {max_iterations} tool-calling "
+                    "iterations. Summarize what you've accomplished and what remains."
+                ),
             ),
-        ))
+        )
 
         final = await self.llm.completion(
             messages=self._build_messages(
-                session, plan, relevant_facts, vector_results, tool_schemas,
+                session,
+                plan,
+                relevant_facts,
+                vector_results,
+                tool_schemas,
             )
         )
-        await self._add_and_persist(session, Message(
-            role="assistant",
-            content=final.content,
-            model=final.model,
-            usage=final.usage,
-        ))
+        await self._add_and_persist(
+            session,
+            Message(
+                role="assistant",
+                content=final.content,
+                model=final.model,
+                usage=final.usage,
+            ),
+        )
         return final
+
+    async def _check_urls_in_output(self, output: str) -> str:
+        """Verify URLs in tool output, marking broken ones."""
+        from agent.utils.url_check import check_urls_in_output
+
+        return await check_urls_in_output(output)
 
     async def _execute_tool_call(
         self,
@@ -382,7 +419,9 @@ class AgentLoop:
         # Extract channel_user_id from session ID (format: "channel:user_id")
         channel_user_id = None
         if ":" in session.id:
-            channel_user_id = session.id.split(":", 1)[1]
+            parts = session.id.split(":", 1)
+            if len(parts) == 2 and parts[1]:
+                channel_user_id = parts[1]
 
         try:
             return await self.tool_executor.execute(
@@ -391,7 +430,7 @@ class AgentLoop:
                 trigger=trigger,
                 channel_user_id=channel_user_id,
             )
-        except Exception as e:
+        except (TimeoutError, OSError, ValueError) as e:
             # Error recovery
             if self.recovery:
                 category = self.recovery.classify_error(e, tool_call.name)
@@ -421,7 +460,8 @@ class AgentLoop:
             )
 
     def _build_tool_content(
-        self, result: ToolResult,
+        self,
+        result: ToolResult,
     ) -> str | list[dict[str, Any]]:
         """Build tool message content, with image blocks if present.
 
@@ -437,12 +477,14 @@ class AgentLoop:
         if result.output:
             blocks.append({"type": "text", "text": result.output})
         for img in result.images:
-            blocks.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:{img.media_type};base64,{img.base64_data}",
-                },
-            })
+            blocks.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{img.media_type};base64,{img.base64_data}",
+                    },
+                }
+            )
         return blocks
 
     def _build_messages(
@@ -496,8 +538,7 @@ class AgentLoop:
         if self.tool_executor:
             with contextlib.suppress(Exception):
                 enabled_tools = [
-                    t.name for t in self.tool_executor.registry.list_tools()
-                    if t.enabled
+                    t.name for t in self.tool_executor.registry.list_tools() if t.enabled
                 ]
 
         tool_names = set(enabled_tools)
@@ -550,9 +591,36 @@ class AgentLoop:
         except Exception as e:
             logger.warning("summarization_failed", error=str(e))
 
-    async def _query_memory(
-        self, user_message: str
-    ) -> tuple[list | None, list | None]:
+    async def _run_with_timeout(self, coro: Any) -> None:
+        """Run a coroutine with a timeout, catching all exceptions.
+
+        Args:
+            coro: The coroutine to execute with a timeout.
+        """
+        try:
+            await asyncio.wait_for(coro, timeout=_BACKGROUND_TASK_TIMEOUT)
+        except TimeoutError:
+            logger.warning("background_task_timeout", timeout=_BACKGROUND_TASK_TIMEOUT)
+        except Exception as e:
+            logger.warning("background_task_failed", error=str(e))
+
+    def _spawn_background_task(self, coro: Any) -> None:
+        """Spawn a background task if under the concurrency limit.
+
+        Args:
+            coro: The coroutine to run as a background task.
+        """
+        if len(self._background_tasks) >= _MAX_BACKGROUND_TASKS:
+            logger.warning(
+                "background_task_limit_reached",
+                limit=_MAX_BACKGROUND_TASKS,
+            )
+            return
+        task = asyncio.create_task(self._run_with_timeout(coro))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _query_memory(self, user_message: str) -> tuple[list | None, list | None]:
         """Query fact store and vector store in parallel.
 
         Args:
@@ -569,7 +637,7 @@ class AgentLoop:
                 return None
             try:
                 return await self.fact_store.get_relevant(limit=15)
-            except Exception as e:
+            except (aiosqlite.Error, OSError) as e:
                 logger.warning("fact_retrieval_failed", error=str(e))
                 return None
 
@@ -582,9 +650,7 @@ class AgentLoop:
                 logger.warning("vector_search_failed", error=str(e))
                 return None
 
-        relevant_facts, vector_results = await asyncio.gather(
-            _get_facts(), _get_vectors()
-        )
+        relevant_facts, vector_results = await asyncio.gather(_get_facts(), _get_vectors())
         return relevant_facts, vector_results
 
     async def process_message_stream(
@@ -609,9 +675,7 @@ class AgentLoop:
             )
 
         # Add user message to session
-        await self._add_and_persist(
-            session, Message(role="user", content=user_message)
-        )
+        await self._add_and_persist(session, Message(role="user", content=user_message))
 
         await self.event_bus.emit(
             Events.MESSAGE_INCOMING,
@@ -657,9 +721,7 @@ class AgentLoop:
                 model = ""
                 finish_reason = "stop"
 
-                async for chunk in self.llm.stream_completion(
-                    messages=messages, **kwargs
-                ):
+                async for chunk in self.llm.stream_completion(messages=messages, **kwargs):
                     if chunk.done:
                         tool_calls = chunk.tool_calls
                         usage = chunk.usage
@@ -667,14 +729,16 @@ class AgentLoop:
                         finish_reason = chunk.finish_reason or "stop"
                     elif chunk.content:
                         accumulated_content += chunk.content
-                        yield StreamEvent(
-                            type="chunk", content=chunk.content
-                        )
+                        yield StreamEvent(type="chunk", content=chunk.content)
 
-            except Exception as e:
-                logger.error(
-                    "llm_stream_failed", error=str(e), iteration=iteration
-                )
+            except (
+                LiteLLMAPIError,
+                LiteLLMConnectionError,
+                LiteLLMTimeout,
+                ConnectionError,
+                TimeoutError,
+            ) as e:
+                logger.error("llm_stream_failed", error=str(e), iteration=iteration)
                 raise
 
             response = LLMResponse(
@@ -720,29 +784,17 @@ class AgentLoop:
                     "llm_response_streamed",
                     session_id=session.id,
                     model=response.model,
-                    input_tokens=response.usage.input_tokens
-                    if response.usage
-                    else 0,
-                    output_tokens=response.usage.output_tokens
-                    if response.usage
-                    else 0,
+                    input_tokens=response.usage.input_tokens if response.usage else 0,
+                    output_tokens=response.usage.output_tokens if response.usage else 0,
                     iterations=iteration,
                 )
 
                 # Fire-and-forget memory operations
                 if trigger == "user_message":
                     if self.fact_extractor:
-                        task = asyncio.create_task(
-                            self._safe_extract_facts(session)
-                        )
-                        self._background_tasks.add(task)
-                        task.add_done_callback(self._background_tasks.discard)
+                        self._spawn_background_task(self._safe_extract_facts(session))
                     if self.summarizer:
-                        task = asyncio.create_task(
-                            self._safe_summarize(session)
-                        )
-                        self._background_tasks.add(task)
-                        task.add_done_callback(self._background_tasks.discard)
+                        self._spawn_background_task(self._safe_summarize(session))
 
                 yield StreamEvent(type="done", response=response)
                 return
@@ -768,9 +820,11 @@ class AgentLoop:
                 await self.event_bus.emit(Events.TOOL_EXECUTE, tool_data)
                 yield StreamEvent(type="tool.execute", data=tool_data)
 
-                result = await self._execute_tool_call(
-                    tool_call, session, trigger, plan
-                )
+                result = await self._execute_tool_call(tool_call, session, trigger, plan)
+
+                # Check URLs in tool output for broken links
+                if "http" in result.output:
+                    result.output = await self._check_urls_in_output(result.output)
 
                 await self._add_and_persist(
                     session,
@@ -794,9 +848,8 @@ class AgentLoop:
                 if plan and hasattr(plan, "status"):
                     from agent.core.planner import PlanStatus
 
-                    if (
-                        plan.status == PlanStatus.IN_PROGRESS
-                        and plan.current_step < len(plan.steps)
+                    if plan.status == PlanStatus.IN_PROGRESS and plan.current_step < len(
+                        plan.steps
                     ):
                         step = plan.steps[plan.current_step]
                         if result.success:
@@ -827,7 +880,11 @@ class AgentLoop:
         final_model = ""
         async for chunk in self.llm.stream_completion(
             messages=self._build_messages(
-                session, plan, relevant_facts, vector_results, tool_schemas,
+                session,
+                plan,
+                relevant_facts,
+                vector_results,
+                tool_schemas,
             )
         ):
             if chunk.done:

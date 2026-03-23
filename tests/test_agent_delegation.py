@@ -9,12 +9,11 @@ import pytest
 
 from agent.config import OrchestrationConfig
 from agent.core.events import EventBus, Events
-from agent.core.orchestrator import ScopedToolRegistry, SubAgentOrchestrator
+from agent.core.orchestrator import SubAgentOrchestrator
 from agent.core.subagent import (
     AgentTeam,
     DelegationMode,
     DelegationRequest,
-    DelegationResult,
     SubAgentResult,
     SubAgentRole,
     SubAgentStatus,
@@ -22,14 +21,15 @@ from agent.core.subagent import (
 )
 from agent.tools.registry import ToolDefinition, ToolTier
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
 def _make_tool_def(
-    name: str, tier: ToolTier = ToolTier.SAFE, enabled: bool = True,
+    name: str,
+    tier: ToolTier = ToolTier.SAFE,
+    enabled: bool = True,
 ) -> ToolDefinition:
     return ToolDefinition(
         name=name,
@@ -62,7 +62,9 @@ def _make_orchestrator(
     agent_loop.llm = MagicMock()
     agent_loop.tool_executor = MagicMock()
     config = OrchestrationConfig(
-        enabled=True, max_concurrent_agents=5, subagent_timeout=30,
+        enabled=True,
+        max_concurrent_agents=5,
+        subagent_timeout=30,
     )
     event_bus = EventBus()
     registry = _make_parent_registry(tools)
@@ -160,7 +162,9 @@ class TestDelegation:
                 status=SubAgentStatus.COMPLETED,
                 output="All green.",
             )
-            orch._results[task.task_id] = result
+            import time
+
+            orch._results[task.task_id] = (time.monotonic(), result)
             return result
 
         with patch.object(orch, "spawn_subagent", side_effect=instant_spawn):
@@ -311,11 +315,12 @@ class TestDelegation:
     async def test_delegate_tool_excluded_at_depth_1(self) -> None:
         """Scoped registry at depth 1 hides delegate_to_specialist."""
         delegate_tool = _make_tool_def("delegate_to_specialist", ToolTier.MODERATE)
-        read_tool = _make_tool_def("read_file", ToolTier.SAFE)
+        # Use "file_read" — a tool in the essential_mcp_tools allowlist
+        read_tool = _make_tool_def("file_read", ToolTier.SAFE)
         orch = _make_orchestrator(tools=[delegate_tool, read_tool])
 
         role = SubAgentRole(name="worker", persona="Worker.")
         scoped = orch._create_scoped_registry(role, nesting_depth=1)
 
         assert scoped.get_tool("delegate_to_specialist") is None
-        assert scoped.get_tool("read_file") is not None
+        assert scoped.get_tool("file_read") is not None

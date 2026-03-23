@@ -149,7 +149,7 @@ class SkillBuilder:
 
     def __init__(
         self,
-        llm: LLMProvider,
+        llm: LLMProvider | None,
         config: SkillBuilderConfig,
         event_bus: EventBus,
         skill_manager: SkillManager | None = None,
@@ -183,10 +183,13 @@ class SkillBuilder:
         """
         from agent.core.events import Events
 
-        await self.event_bus.emit(Events.SKILL_BUILD_REQUESTED, {
-            "description": description,
-            "name": name,
-        })
+        await self.event_bus.emit(
+            Events.SKILL_BUILD_REQUESTED,
+            {
+                "description": description,
+                "name": name,
+            },
+        )
 
         # Cap permissions
         if permissions is None:
@@ -211,9 +214,7 @@ class SkillBuilder:
         last_error = ""
         for attempt in range(self.config.max_retries):
             # Step 2: Generate code
-            generated = await self._generate_code(
-                name, description, permissions, last_error
-            )
+            generated = await self._generate_code(name, description, permissions, last_error)
 
             # Step 3: Validate
             validation = self._validate_code(generated)
@@ -256,11 +257,14 @@ class SkillBuilder:
                 retries=attempt,
             )
 
-            await self.event_bus.emit(Events.SKILL_BUILD_COMPLETED, {
-                "name": name,
-                "success": True,
-                "retries": attempt,
-            })
+            await self.event_bus.emit(
+                Events.SKILL_BUILD_COMPLETED,
+                {
+                    "name": name,
+                    "success": True,
+                    "retries": attempt,
+                },
+            )
 
             logger.info("skill_build_succeeded", name=name, retries=attempt)
             return result
@@ -273,11 +277,14 @@ class SkillBuilder:
             retries=self.config.max_retries,
         )
 
-        await self.event_bus.emit(Events.SKILL_BUILD_COMPLETED, {
-            "name": name,
-            "success": False,
-            "error": result.error,
-        })
+        await self.event_bus.emit(
+            Events.SKILL_BUILD_COMPLETED,
+            {
+                "name": name,
+                "success": False,
+                "error": result.error,
+            },
+        )
 
         return result
 
@@ -379,8 +386,19 @@ class SkillBuilder:
             },
             {"role": "user", "content": description},
         ]
-        response = await self.llm.completion(messages=messages)
-        name = response.content.strip().strip("'\"` \n")
+        system_msg = (
+            "Generate a short kebab-case skill name (e.g. 'weather-fetch', "
+            "'code-review') for the described capability. "
+            "Reply with ONLY the name, nothing else."
+        )
+        if self.llm is not None:
+            response = await self.llm.completion(messages=messages)
+            content = response.content
+        else:
+            from agent.llm.fallback import llm_complete
+
+            content = await llm_complete(prompt=description, system=system_msg)
+        name = content.strip().strip("'\"` \n")
         return name or "custom-skill"
 
     async def _generate_code(
@@ -427,8 +445,18 @@ class SkillBuilder:
             },
         ]
 
-        response = await self.llm.completion(messages=messages)
-        content = response.content.strip()
+        if self.llm is not None:
+            response = await self.llm.completion(messages=messages)
+            content = response.content.strip()
+        else:
+            from agent.llm.fallback import llm_complete
+
+            content = (
+                await llm_complete(
+                    prompt=f"Create a skill named '{name}' that: {description}",
+                    system=messages[0]["content"],
+                )
+            ).strip()
 
         # Parse JSON response
         try:
@@ -625,14 +653,14 @@ class SkillBuilder:
         start = asyncio.get_event_loop().time()
         try:
             proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-c", test_script,
+                sys.executable,
+                "-c",
+                test_script,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(skill_path.parent),
             )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=15.0
-            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
             duration_ms = int((asyncio.get_event_loop().time() - start) * 1000)
 
             output = stdout.decode(errors="ignore").strip()

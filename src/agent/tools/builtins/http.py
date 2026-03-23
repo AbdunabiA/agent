@@ -85,3 +85,23 @@ async def http_request(
         return f"[ERROR] HTTP error: {e}"
     except Exception as e:
         return f"[ERROR] Request failed: {e}"
+
+
+@tool(
+    name="verify_url",
+    description="Check if a URL is accessible. Returns HTTP status and content type.",
+    tier=ToolTier.SAFE,
+)
+async def verify_url(url: str) -> str:
+    """Send HEAD request to verify a URL is accessible."""
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            response = await client.head(url)
+        content_type = response.headers.get("content-type", "unknown")
+        return f"Status: {response.status_code}, Content-Type: {content_type}, URL: {url}"
+    except httpx.TimeoutException:
+        return f"[ERROR] URL timed out: {url}"
+    except httpx.ConnectError:
+        return f"[ERROR] Could not connect to: {url}"
+    except Exception as e:
+        return f"[ERROR] Failed to verify URL: {e}"

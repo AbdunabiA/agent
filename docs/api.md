@@ -323,15 +323,74 @@ Query params: `limit`, `after`, `before`, `event_types`.
 
 ## WebSocket
 
-### Connect
+### WebSocket Chat
 
+Endpoint: `ws://localhost:8765/api/v1/ws/chat`
+
+Query params:
+
+| Param | Required | Description |
+|-------|----------|-------------|
+| `token` | If auth configured | Bearer token for authentication |
+| `session_id` | No | Resume an existing session |
+
+**Client → Server messages:**
+
+```json
+// Send a chat message
+{"type": "message", "content": "Hello"}
+
+// Keepalive ping
+{"type": "ping"}
+
+// Voice input (base64-encoded audio)
+{"type": "voice.data", "data": "<base64>", "mime": "audio/ogg"}
 ```
-ws://localhost:8765/api/v1/ws
+
+**Server → Client messages:**
+
+```json
+// Streaming text chunk
+{"type": "chunk", "content": "partial response..."}
+
+// Completion (full response)
+{"type": "done", "response": "full response", "session_id": "abc-123"}
+
+// Typing indicator
+{"type": "typing", "status": true}
+
+// Error
+{"type": "error", "message": "description"}
+
+// Keepalive response
+{"type": "pong"}
+
+// Tool execution started
+{"type": "tool_start", "tool": "shell_exec", "input": {"command": "ls"}}
+
+// Tool execution result
+{"type": "tool_result", "tool": "shell_exec", "status": "success", "duration_ms": 150}
 ```
 
-### Event Stream
+**Limits:**
 
-After connecting, the server pushes real-time events:
+| Limit | Value |
+|-------|-------|
+| Max concurrent connections | 10 |
+| Max message size | 100KB |
+| Max messages per minute | 30 per connection |
+
+### WebSocket Events
+
+Endpoint: `ws://localhost:8765/api/v1/ws/events`
+
+Query params:
+
+| Param | Required | Description |
+|-------|----------|-------------|
+| `token` | If auth configured | Bearer token for authentication |
+
+Receives real-time events from the agent. This is a read-only stream — no client messages expected.
 
 ```json
 {

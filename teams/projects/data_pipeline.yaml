@@ -1,0 +1,59 @@
+name: data_pipeline
+description: "Data pipeline — schema design, ETL, ML model, analytics dashboard"
+stages:
+  - name: requirements
+    agents:
+      - team: product
+        role: business_analyst
+
+  - name: schema_design
+    agents:
+      - team: data
+        role: data_engineer
+
+  - name: pipeline_implementation
+    parallel: true
+    agents:
+      - team: data
+        role: data_engineer
+      - team: engineering
+        role: backend_developer
+
+  - name: ml_model
+    agents:
+      - team: data
+        role: ml_engineer
+
+  - name: analytics
+    agents:
+      - team: data
+        role: data_analyst
+
+  - name: review
+    parallel: true
+    agents:
+      - team: engineering
+        role: code_reviewer
+      - team: quality
+        role: security_reviewer
+    denied_tools:
+      - file_write
+      - assign_task
+      - request_review
+    feedback:
+      fix_stage: fix_issues
+      max_retries: 2
+
+  - name: fix_issues
+    feedback_target: true
+    parallel: true
+    agents:
+      - team: data
+        role: data_engineer
+      - team: engineering
+        role: backend_developer
+
+  - name: documentation
+    agents:
+      - team: content
+        role: technical_writer

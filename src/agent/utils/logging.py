@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import logging.handlers
 import sys
 from collections.abc import MutableMapping
 from typing import Any
@@ -30,9 +31,7 @@ _NOISY_LOGGERS = (
 )
 
 
-def _clean_renderer(
-    _logger: Any, _method: str, event_dict: MutableMapping[str, Any]
-) -> str:
+def _clean_renderer(_logger: Any, _method: str, event_dict: MutableMapping[str, Any]) -> str:
     """Render log events as clean human-readable messages.
 
     At INFO+, shows only the event text.
@@ -120,6 +119,17 @@ def setup_logging(config: LoggingConfig) -> None:
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
     root_logger.addHandler(handler)
+
+    # Optional file-based logging with rotation
+    if config.log_file:
+        file_handler = logging.handlers.RotatingFileHandler(
+            config.log_file,
+            maxBytes=config.log_max_bytes,
+            backupCount=config.log_backup_count,
+        )
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+
     root_logger.setLevel(log_level)
 
     # Quiet down noisy third-party loggers

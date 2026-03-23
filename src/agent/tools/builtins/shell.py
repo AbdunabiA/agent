@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import pathlib
 
 from agent.tools.registry import ToolTier, tool
 
@@ -38,7 +39,26 @@ async def shell_exec(
     Returns:
         Combined stdout and stderr output.
     """
+    # Defense-in-depth: guardrails check before execution
+    from agent.config import get_config
+    from agent.core.guardrails import Guardrails
+
+    config = get_config()
+    guardrails = Guardrails(config.tools)
+    check = guardrails.check_command(command)
+    if not check.allowed:
+        return f"[BLOCKED] {check.reason}"
+
     cwd = os.path.expanduser(working_dir) if working_dir else None  # noqa: ASYNC240
+
+    # Validate working_dir is within filesystem root
+    if cwd is not None:
+        cwd_path = pathlib.Path(cwd).resolve()  # noqa: ASYNC240
+        fs_root = pathlib.Path(  # noqa: ASYNC240
+            os.path.expanduser(config.tools.filesystem.root)  # noqa: ASYNC240
+        ).resolve()
+        if not cwd_path.is_relative_to(fs_root):
+            return f"[BLOCKED] Working directory {working_dir} is outside allowed root {fs_root}"
 
     process = await asyncio.create_subprocess_shell(
         command,
@@ -48,9 +68,7 @@ async def shell_exec(
     )
 
     try:
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(), timeout=timeout
-        )
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
     except TimeoutError:
         process.kill()
         await process.communicate()

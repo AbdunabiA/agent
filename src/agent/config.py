@@ -121,12 +121,36 @@ class ToolsFilesystemConfig(BaseModel):
     ]
 
 
+class GitHubConfig(BaseModel):
+    """GitHub API integration configuration."""
+
+    enabled: bool = False
+    token: str | None = None
+    default_owner: str | None = None
+    default_repo: str | None = None
+
+
+class EmailToolConfig(BaseModel):
+    """Email sending/reading configuration."""
+
+    enabled: bool = False
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = 587
+    imap_host: str = "imap.gmail.com"
+    imap_port: int = 993
+    email: str | None = None
+    password: str | None = None
+    use_tls: bool = True
+
+
 class ToolsConfig(BaseModel):
     """Tool execution configuration."""
 
     shell: ToolsShellConfig = ToolsShellConfig()
     browser: ToolsBrowserConfig = ToolsBrowserConfig()
     filesystem: ToolsFilesystemConfig = ToolsFilesystemConfig()
+    github: GitHubConfig = GitHubConfig()
+    email: EmailToolConfig = EmailToolConfig()
 
 
 class MemoryConfig(BaseModel):
@@ -187,13 +211,13 @@ class OrchestrationConfig(BaseModel):
 
     enabled: bool = False
     max_concurrent_agents: int = 5
-    default_max_iterations: int = 5
-    subagent_timeout: int = 300
+    default_max_iterations: int = 200
+    subagent_timeout: int = 1800
     teams: list[AgentTeamConfig] = []
     teams_directory: str = "teams"
     use_controller: bool = False
     controller_model: str | None = None
-    controller_max_turns: int = 30
+    controller_max_turns: int = 200
 
 
 class GatewayConfig(BaseModel):
@@ -203,6 +227,13 @@ class GatewayConfig(BaseModel):
     port: int = 8765
     auth_token: str | None = None
     cors_origins: list[str] = ["http://localhost:5173"]
+    max_request_body_mb: int = 10
+    request_timeout_seconds: int = 60
+    max_ws_connections: int = 10
+    max_ws_message_size: int = 100_000
+    rate_limit_per_minute: int = 60
+    auth_lockout_attempts: int = 5
+    auth_lockout_minutes: int = 5
 
 
 class LoggingConfig(BaseModel):
@@ -210,13 +241,19 @@ class LoggingConfig(BaseModel):
 
     level: str = "INFO"
     format: str = "console"  # "console" or "json"
+    log_file: str | None = None
+    log_max_bytes: int = 50 * 1024 * 1024  # 50MB
+    log_backup_count: int = 5
 
 
 class AgentPersonaConfig(BaseModel):
     """Agent identity and behavior configuration."""
 
     name: str = "Agent"
-    persona: str = "You are a helpful autonomous AI assistant."
+    persona: str = (
+        "You are a helpful autonomous AI assistant running locally. "
+        "You are proactive, concise, and always try to be helpful."
+    )
     max_iterations: int = 10
     heartbeat_interval: str = "30m"
 
@@ -530,11 +567,7 @@ def _auto_select_models(config: AgentConfig) -> None:
     If the configured default model's provider has no key, switch to a
     provider that does. Same for fallback.
     """
-    available = {
-        name
-        for name, prov in config.models.providers.items()
-        if prov.api_key
-    }
+    available = {name for name, prov in config.models.providers.items() if prov.api_key}
 
     if not available:
         # No LiteLLM API keys — auto-switch to claude-sdk if auth exists
@@ -677,8 +710,7 @@ def update_config_section(section: str, data: dict[str, Any]) -> AgentConfig:
     """
     if section not in EDITABLE_SECTIONS:
         raise ValueError(
-            f"Unknown config section: {section}. "
-            f"Valid: {', '.join(EDITABLE_SECTIONS)}"
+            f"Unknown config section: {section}. " f"Valid: {', '.join(EDITABLE_SECTIONS)}"
         )
 
     # Strip secret fields so they can't be set from the dashboard
@@ -729,9 +761,7 @@ def _save_config_to_disk(config: AgentConfig) -> None:
     logger.info("config_saved", path=str(path))
 
 
-def _merge_preserving_secrets(
-    existing: dict[str, Any], new: dict[str, Any]
-) -> dict[str, Any]:
+def _merge_preserving_secrets(existing: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
     """Merge new config into existing, keeping raw secret values (e.g. ${ENV_VAR})."""
     result: dict[str, Any] = {}
     for key in set(existing) | set(new):
@@ -790,11 +820,7 @@ def _build_field_meta(
             sub_fields: dict[str, Any] = {}
             for sub_name, sub_value in field_value.items():
                 sub_is_secret = _is_secret_field(sub_name)
-                sub_masked = (
-                    mask_secret(str(sub_value))
-                    if sub_is_secret and sub_value
-                    else None
-                )
+                sub_masked = mask_secret(str(sub_value)) if sub_is_secret and sub_value else None
                 sub_meta: dict[str, Any] = {
                     "value": sub_masked if sub_masked is not None else sub_value,
                     "type": _python_type_name(sub_value),
@@ -804,7 +830,10 @@ def _build_field_meta(
                     sub_meta["options"] = ["", "acceptEdits", "bypassPermissions"]
                 elif sub_name == "provider" and field_name == "stt":
                     sub_meta["options"] = [
-                        "llm_native", "whisper_api", "whisper_local", "deepgram",
+                        "llm_native",
+                        "whisper_api",
+                        "whisper_local",
+                        "deepgram",
                     ]
                 elif sub_name == "provider" and field_name == "tts":
                     sub_meta["options"] = ["edge_tts", "openai"]

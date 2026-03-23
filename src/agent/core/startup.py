@@ -84,6 +84,7 @@ class Application:
 
         self._channels: list[BaseChannel] = []
         self._background_tasks: set[asyncio.Task[None]] = set()
+        self._critical_failures: list[str] = []
 
     async def initialize(self) -> None:
         """Wire all components in dependency order.
@@ -121,15 +122,24 @@ class Application:
                 display_name=self.workspace.display_name,
             )
         except Exception as e:
-            logger.debug("workspace_resolve_skipped", error=str(e))
+            logger.warning(
+                "workspace_resolve_skipped",
+                error=str(e),
+                hint="Agent will run without workspace isolation",
+            )
 
         # 0.5. Database (before everything else)
         try:
             self.database = Database(self.config.memory.db_path)
             await self.database.connect()
         except Exception as e:
-            logger.warning("database_init_failed", error=str(e))
+            logger.error(
+                "database_init_failed",
+                error=str(e),
+                impact="Sessions, facts, audit log, and scheduled tasks will be unavailable",
+            )
             self.database = None
+            self._critical_failures.append("database")
 
         # 1. Core infrastructure
         self.event_bus = EventBus()
@@ -148,6 +158,21 @@ class Application:
                 backend=self.config.models.backend,
             )
 
+        # Validate LLM connectivity
+        if self.llm:
+            try:
+                test_ok = await self.llm.test_connection(
+                    model=self.config.models.default,
+                )
+                if not test_ok:
+                    logger.warning(
+                        "llm_key_validation_failed",
+                        hint="API key may be invalid",
+                    )
+                    self._critical_failures.append("llm_validation")
+            except Exception as e:
+                logger.warning("llm_key_test_error", error=str(e))
+
         self.session_store = SessionStore(db=self.database)
 
         # 2. Safety components
@@ -159,6 +184,7 @@ class Application:
 
         # 2.5. Auto-install missing optional dependencies
         from agent.core.deps import ensure_dependencies
+
         ensure_dependencies()
 
         # 3. Register built-in tools
@@ -174,12 +200,8 @@ class Application:
             guardrails=self.guardrails,
         )
 
-        # 5. Planner (requires LLM for planning via LiteLLM)
-        self.planner = (
-            Planner(llm=self.llm, config=self.config.agent)
-            if _llm_available and self.llm
-            else None
-        )
+        # 5. Planner (uses LiteLLM or SDK via fallback)
+        self.planner = Planner(llm=self.llm, config=self.config.agent)
 
         # 5.5. Phase 4: Memory components
         from agent.memory.extraction import FactExtractor
@@ -191,6 +213,7 @@ class Application:
 
             # Wire the fact store into memory tools so they can access it
             from agent.tools.builtins.memory import set_fact_store
+
             set_fact_store(self.fact_store)
 
         self.soul_loader = SoulLoader(self.config.memory.soul_path)
@@ -217,24 +240,30 @@ class Application:
             except Exception:
                 pass
 
-        self.fact_extractor = FactExtractor(
-            llm=self.llm,
-            fact_store=self.fact_store,
-            enabled=self.config.memory.auto_extract and self.fact_store is not None,
-        ) if self.fact_store and _llm_available and self.llm else None
+        # FactExtractor and Summarizer are initially created if LiteLLM
+        # is available. If only SDK is available, they're created later
+        # in the deferred memory setup (section 6.7) after SDK init.
+        self.fact_extractor = (
+            FactExtractor(
+                llm=self.llm,
+                fact_store=self.fact_store,
+                enabled=self.config.memory.auto_extract and self.fact_store is not None,
+            )
+            if self.fact_store and _llm_available and self.llm
+            else None
+        )
 
         if self.vector_store and _llm_available and self.llm:
             from agent.memory.summarizer import ConversationSummarizer
 
-            self.summarizer = ConversationSummarizer(
-                llm=self.llm, vector_store=self.vector_store
-            )
+            self.summarizer = ConversationSummarizer(llm=self.llm, vector_store=self.vector_store)
 
         # 6. Agent loop
         # Get platform capabilities for system prompt injection
         platform_capabilities = None
         try:
             from agent.desktop.platform_utils import get_capabilities_summary
+
             platform_capabilities = get_capabilities_summary()
         except Exception:
             pass
@@ -282,7 +311,18 @@ class Application:
                         event_bus=self.event_bus,
                     )
                     self.sdk_service._idle_timeout = sdk_cfg.idle_timeout
-                    ok, msg = await self.sdk_service.check_available()
+                    ok, msg = False, "not checked"
+                    for _attempt in range(3):
+                        ok, msg = await self.sdk_service.check_available()
+                        if ok:
+                            break
+                        if _attempt < 2:
+                            logger.info(
+                                "claude_sdk_check_retry",
+                                attempt=_attempt + 1,
+                                reason=msg,
+                            )
+                            await asyncio.sleep(2)
                     if ok:
                         logger.info("claude_sdk_ready", working_dir=sdk_cfg.working_dir)
                     else:
@@ -297,11 +337,35 @@ class Application:
                 logger.warning("claude_sdk_init_failed", error=str(e))
                 self.sdk_service = None
 
+        # 6.6. Configure universal LLM fallback (LiteLLM → SDK)
+        from agent.llm.fallback import configure as configure_llm_fallback
+
+        configure_llm_fallback(llm=self.llm, sdk_service=self.sdk_service)
+
+        # 6.7. Deferred memory setup — create FactExtractor/Summarizer
+        # with SDK fallback if they weren't created with LiteLLM above.
+        _any_llm = _llm_available or self.sdk_service is not None
+        if self.fact_extractor is None and self.fact_store and _any_llm:
+            self.fact_extractor = FactExtractor(
+                llm=self.llm,
+                fact_store=self.fact_store,
+                enabled=self.config.memory.auto_extract,
+            )
+            from agent.tools.builtins.memory import set_fact_store
+
+            set_fact_store(self.fact_store)
+
+        if self.summarizer is None and self.vector_store and _any_llm:
+            from agent.memory.summarizer import ConversationSummarizer
+
+            self.summarizer = ConversationSummarizer(llm=self.llm, vector_store=self.vector_store)
+
         # 7. Scheduler & heartbeat (with persistence and proactive support)
         self.scheduler = TaskScheduler(self.event_bus, database=self.database)
 
         # Proactive messenger (for heartbeat notifications)
         from agent.core.proactive import ProactiveMessenger
+
         self.proactive = ProactiveMessenger(event_bus=self.event_bus)
 
         self.heartbeat = HeartbeatDaemon(
@@ -311,27 +375,33 @@ class Application:
             fact_store=self.fact_store,
             scheduler=self.scheduler,
             proactive=self.proactive,
+            sdk_service=self.sdk_service,
         )
 
         # Wire scheduler into tools so the LLM can set reminders
         from agent.tools.builtins.scheduler import set_scheduler
+
         set_scheduler(self.scheduler)
 
         # Monitor manager
         from agent.core.monitors import MonitorManager
+
         self.monitor_manager = MonitorManager(
             event_bus=self.event_bus,
             proactive=self.proactive,
         )
         from agent.tools.builtins.monitor import set_monitor_manager
+
         set_monitor_manager(self.monitor_manager)
 
         # Trigger matcher for skill hints
         from agent.skills.triggers import TriggerMatcher
+
         self.trigger_matcher = TriggerMatcher()
 
         # Wire event bus into send_file tool so the LLM can send files
         from agent.tools.builtins.send_file import set_file_send_bus
+
         set_file_send_bus(self.event_bus)
 
         # Wire event bus + scheduler into telegram posting tools
@@ -339,6 +409,7 @@ class Application:
             set_telegram_post_bus,
             set_telegram_post_scheduler,
         )
+
         set_telegram_post_bus(self.event_bus)
         set_telegram_post_scheduler(self.scheduler)
 
@@ -363,12 +434,11 @@ class Application:
                         self.trigger_matcher.register_skill(loaded.metadata)
 
         # 7.7. Skill builder (self-building skills)
-        if self.config.skills.builder.enabled and _llm_available:
+        if self.config.skills.builder.enabled and _any_llm:
             try:
                 from agent.skills.builder import SkillBuilder
                 from agent.tools.builtins.skill_builder import set_skill_builder
 
-                assert self.llm is not None
                 self.skill_builder = SkillBuilder(
                     llm=self.llm,
                     config=self.config.skills.builder,
@@ -408,6 +478,48 @@ class Application:
                     self.config.orchestration.teams_directory,
                 )
 
+                # Create WorkingMemory, AgentTracer, and TaskBoard if database is available
+                working_memory = None
+                self.tracer = None
+                task_board = None
+                if self.database:
+                    from agent.core.task_board import TaskBoard
+                    from agent.core.working_memory import WorkingMemory
+                    from agent.observability.tracer import AgentTracer
+
+                    working_memory = WorkingMemory(self.database)
+                    self.tracer = AgentTracer(self.database)
+                    task_board = TaskBoard(self.database)
+
+                # Create PromptBuilderAgent when SDK and WorkingMemory are available
+                prompt_builder = None
+                if self.sdk_service is not None:
+                    try:
+                        from agent.core.prompt_builder_agent import PromptBuilderAgent
+
+                        # RoleRegistry may not exist yet — create a temporary one
+                        # for the builder, or reuse the one created below for the
+                        # controller.
+                        pb_registry = None
+                        try:
+                            from agent.core.role_registry import RoleRegistry as _PBRoleRegistry
+
+                            pb_registry = _PBRoleRegistry(
+                                self.config.orchestration.teams_directory,
+                            )
+                        except Exception:
+                            pass
+
+                        prompt_builder = PromptBuilderAgent(
+                            sdk_service=self.sdk_service,
+                            working_memory=working_memory,
+                            tracer=self.tracer,
+                            role_registry=pb_registry,
+                        )
+                        logger.info("prompt_builder_agent_ready")
+                    except Exception as e:
+                        logger.warning("prompt_builder_init_failed", error=str(e))
+
                 self.orchestrator = SubAgentOrchestrator(
                     agent_loop=self.agent_loop,
                     config=self.config.orchestration,
@@ -415,6 +527,10 @@ class Application:
                     tool_registry=registry,
                     teams=teams,
                     sdk_service=self.sdk_service,
+                    working_memory=working_memory,
+                    tracer=self.tracer,
+                    task_board=task_board,
+                    prompt_builder=prompt_builder,
                 )
 
                 # Register projects
@@ -423,9 +539,7 @@ class Application:
 
                 # Validate project agent references against loaded teams (GAP 18)
                 team_names = {t.name for t in teams}
-                team_roles: dict[str, set[str]] = {
-                    t.name: {r.name for r in t.roles} for t in teams
-                }
+                team_roles: dict[str, set[str]] = {t.name: {r.name for r in t.roles} for t in teams}
                 for proj in projects:
                     for stage in proj.stages:
                         for agent_ref in stage.agents:
@@ -436,9 +550,7 @@ class Application:
                                     stage=stage.name,
                                     team=agent_ref.team,
                                 )
-                            elif agent_ref.role not in team_roles.get(
-                                agent_ref.team, set()
-                            ):
+                            elif agent_ref.role not in team_roles.get(agent_ref.team, set()):
                                 logger.warning(
                                     "project_ref_invalid_role",
                                     project=proj.name,
@@ -447,10 +559,7 @@ class Application:
                                     role=agent_ref.role,
                                 )
                         # Validate discussion moderator reference
-                        if (
-                            stage.discussion
-                            and stage.discussion.moderator
-                        ):
+                        if stage.discussion and stage.discussion.moderator:
                             mod = stage.discussion.moderator
                             if mod.team not in team_names:
                                 logger.warning(
@@ -460,9 +569,7 @@ class Application:
                                     team=mod.team,
                                     context="discussion.moderator",
                                 )
-                            elif mod.role not in team_roles.get(
-                                mod.team, set()
-                            ):
+                            elif mod.role not in team_roles.get(mod.team, set()):
                                 logger.warning(
                                     "project_ref_invalid_role",
                                     project=proj.name,
@@ -488,6 +595,13 @@ class Application:
                                     )
 
                 set_orchestrator(self.orchestrator)
+
+                # Wire TaskBoard into collaboration tools
+                if task_board is not None:
+                    from agent.tools.builtins.collaboration import set_task_board
+
+                    set_task_board(task_board)
+
                 logger.info(
                     "orchestrator_ready",
                     teams=len(teams),
@@ -499,18 +613,23 @@ class Application:
                 if self.config.orchestration.use_controller:
                     try:
                         from agent.core.controller import ControllerAgent
+                        from agent.core.role_registry import RoleRegistry
                         from agent.tools.builtins.controller import set_controller
+
+                        role_registry = RoleRegistry(
+                            self.config.orchestration.teams_directory,
+                        )
 
                         self.controller = ControllerAgent(
                             orchestrator=self.orchestrator,
                             sdk_service=self.sdk_service,
                             event_bus=self.event_bus,
                             config=self.config.orchestration,
+                            role_registry=role_registry,
                         )
                         set_controller(self.controller)
 
                         # Import controller tools to register them
-                        import agent.tools.builtins.controller  # noqa: F811
 
                         # Hide orchestration tools from the main agent
                         # (but keep them in the global registry so the
@@ -518,17 +637,29 @@ class Application:
                         from agent.core.orchestrator import ScopedToolRegistry
 
                         _orchestration_tools = {
-                            "spawn_subagent", "spawn_parallel_agents",
-                            "spawn_team", "list_agent_teams",
-                            "get_subagent_status", "cancel_subagent",
-                            "run_project", "list_projects",
-                            "consult_agent", "delegate_to_specialist",
+                            "spawn_subagent",
+                            "spawn_parallel_agents",
+                            "spawn_team",
+                            "list_agent_teams",
+                            "get_subagent_status",
+                            "cancel_subagent",
+                            "run_project",
+                            "list_projects",
+                            "consult_agent",
+                            "delegate_to_specialist",
                         }
-                        self.agent_loop._default_tool_registry = ScopedToolRegistry(
+                        scoped = ScopedToolRegistry(
                             parent=registry,
                             denied_tools=_orchestration_tools,
                             exclude_dangerous=False,
                         )
+                        self.agent_loop._default_tool_registry = scoped
+
+                        # Also scope the SDK service so the main agent's
+                        # SDK path (MCP server + permission checks) hides
+                        # orchestration tools — matching the LiteLLM path.
+                        if self.sdk_service is not None:
+                            self.sdk_service._scoped_tool_registry = scoped
 
                         logger.info("controller_agent_ready")
                     except Exception as e:
@@ -536,6 +667,39 @@ class Application:
                         self.controller = None
             except Exception as e:
                 logger.warning("orchestrator_init_failed", error=str(e))
+
+        # 7.9. Project planner service (requires orchestrator + SDK)
+        if self.orchestrator and self.sdk_service:
+            try:
+                from agent.core.project_planner import ProjectPlannerService
+                from agent.tools.builtins.planner_tools import set_planner_service
+
+                # Reuse the role_registry from the controller if available
+                planner_role_registry = self.controller.role_registry if self.controller else None
+                if planner_role_registry is None:
+                    try:
+                        from agent.core.role_registry import RoleRegistry as _PRoleRegistry
+
+                        planner_role_registry = _PRoleRegistry(
+                            self.config.orchestration.teams_directory,
+                        )
+                    except Exception:
+                        pass
+
+                planner_service = ProjectPlannerService(
+                    orchestrator=self.orchestrator,
+                    sdk_service=self.sdk_service,
+                    event_bus=self.event_bus,
+                    role_registry=planner_role_registry,
+                    working_memory=working_memory,
+                )
+                set_planner_service(planner_service)
+
+                # Import planner tools to register them
+
+                logger.info("project_planner_service_ready")
+            except Exception as e:
+                logger.warning("project_planner_init_failed", error=str(e))
 
         # 8. Voice pipeline
         try:
@@ -588,6 +752,7 @@ class Application:
                     audit_log=self.audit,
                     cost_tracker=self.cost_tracker,
                     orchestrator=self.orchestrator,
+                    tracer=getattr(self, "tracer", None),
                 )
                 self._channels.append(telegram)
                 self.permissions.set_approval_channel(telegram)
@@ -612,14 +777,24 @@ class Application:
                 logger.warning("webchat_init_failed", error=str(e))
 
         # 11. Emit started event
-        await self.event_bus.emit(Events.AGENT_STARTED, {
-            "channels": [ch.name for ch in self._channels],
-        })
-
-        logger.info(
-            "application_initialized",
-            channels=len(self._channels),
+        await self.event_bus.emit(
+            Events.AGENT_STARTED,
+            {
+                "channels": [ch.name for ch in self._channels],
+            },
         )
+
+        if self._critical_failures:
+            logger.warning(
+                "application_initialized_with_failures",
+                channels=len(self._channels),
+                failed_components=self._critical_failures,
+            )
+        else:
+            logger.info(
+                "application_initialized",
+                channels=len(self._channels),
+            )
 
     @staticmethod
     async def _warmup_embeddings(model: Any) -> None:
@@ -713,11 +888,13 @@ class Application:
                     allowed = getattr(channel.config, "allowed_users", [])
                     if allowed:
                         for user_id in allowed:
-                            await channel.send_message(OutgoingMessage(
-                                content=greeting,
-                                channel_user_id=str(user_id),
-                                parse_mode="Markdown",
-                            ))
+                            await channel.send_message(
+                                OutgoingMessage(
+                                    content=greeting,
+                                    channel_user_id=str(user_id),
+                                    parse_mode="Markdown",
+                                )
+                            )
                     else:
                         # No allowed_users filter — greeting sent on first interaction
                         logger.info(
@@ -772,8 +949,8 @@ class Application:
 
                 try:
                     end = description.index("]", len("[scheduled_post:"))
-                    meta = _json.loads(description[len("[scheduled_post:"):end])
-                    post_text = description[end + 2:]  # skip "] "
+                    meta = _json.loads(description[len("[scheduled_post:") : end])
+                    post_text = description[end + 2 :]  # skip "] "
                     post_data = {
                         "chat_id": meta.get("chat_id", ""),
                         "text": post_text,
@@ -840,6 +1017,7 @@ class Application:
         if self.sdk_service:
             try:
                 from agent.llm.claude_sdk import ClaudeSDKService
+
                 sdk: ClaudeSDKService = self.sdk_service  # type: ignore[assignment]
                 await sdk.stop_reaper()
                 for task_id in list(sdk._clients.keys()):
@@ -850,6 +1028,7 @@ class Application:
         # Cleanup browser resources
         try:
             from agent.tools.builtins.browser import cleanup_browser
+
             await cleanup_browser()
         except Exception:
             pass

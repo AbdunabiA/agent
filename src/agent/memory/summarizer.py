@@ -44,7 +44,7 @@ class ConversationSummarizer:
         summary = await summarizer.summarize_if_needed(session, threshold=20)
     """
 
-    def __init__(self, llm: LLMProvider, vector_store: VectorStore) -> None:
+    def __init__(self, llm: LLMProvider | None, vector_store: VectorStore) -> None:
         self.llm = llm
         self.vector_store = vector_store
 
@@ -77,13 +77,22 @@ class ConversationSummarizer:
 
         prompt_text = SUMMARY_PROMPT.format(messages=formatted)
 
-        response = await self.llm.completion(
-            messages=[{"role": "user", "content": prompt_text}],
-            temperature=0.3,
-            max_tokens=512,
-        )
+        if self.llm is not None:
+            response = await self.llm.completion(
+                messages=[{"role": "user", "content": prompt_text}],
+                temperature=0.3,
+                max_tokens=512,
+            )
+            summary = response.content.strip()
+        else:
+            from agent.llm.fallback import llm_complete
 
-        summary = response.content.strip()
+            content = await llm_complete(
+                prompt=prompt_text,
+                temperature=0.3,
+                max_tokens=512,
+            )
+            summary = content.strip()
 
         # Store in vector store with metadata
         await self.vector_store.add(
@@ -105,9 +114,7 @@ class ConversationSummarizer:
 
         return summary
 
-    async def summarize_if_needed(
-        self, session: Session, threshold: int = 20
-    ) -> str | None:
+    async def summarize_if_needed(self, session: Session, threshold: int = 20) -> str | None:
         """Summarize the session only if it has enough messages.
 
         Args:

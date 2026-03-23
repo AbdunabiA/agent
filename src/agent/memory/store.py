@@ -73,26 +73,31 @@ class FactStore:
         now = datetime.now().isoformat()
         fact_id = str(uuid4())
 
-        await self.db.db.execute(
-            """INSERT INTO facts (id, key, value, category, confidence, source,
-                                  created_at, updated_at, accessed_at, access_count)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-               ON CONFLICT(key) DO UPDATE SET
-                   value = excluded.value,
-                   category = excluded.category,
-                   confidence = excluded.confidence,
-                   source = excluded.source,
-                   updated_at = excluded.updated_at
-            """,
-            (fact_id, key, value, category, confidence, source, now, now, now),
-        )
-        await self.db.db.commit()
+        # Use BEGIN IMMEDIATE to prevent race conditions between the
+        # INSERT...ON CONFLICT and the subsequent SELECT.
+        await self.db.db.execute("BEGIN IMMEDIATE")
+        try:
+            await self.db.db.execute(
+                """INSERT INTO facts (id, key, value, category, confidence, source,
+                                      created_at, updated_at, accessed_at, access_count)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                   ON CONFLICT(key) DO UPDATE SET
+                       value = excluded.value,
+                       category = excluded.category,
+                       confidence = excluded.confidence,
+                       source = excluded.source,
+                       updated_at = excluded.updated_at
+                """,
+                (fact_id, key, value, category, confidence, source, now, now, now),
+            )
 
-        # Fetch the actual row (could be inserted or updated)
-        async with self.db.db.execute(
-            "SELECT * FROM facts WHERE key = ?", (key,)
-        ) as cursor:
-            row = await cursor.fetchone()
+            async with self.db.db.execute("SELECT * FROM facts WHERE key = ?", (key,)) as cursor:
+                row = await cursor.fetchone()
+
+            await self.db.db.execute("COMMIT")
+        except Exception:
+            await self.db.db.execute("ROLLBACK")
+            raise
 
         fact = _row_to_fact(row)
         logger.debug("fact_set", key=key, category=category, source=source)
@@ -115,9 +120,7 @@ class FactStore:
         )
         await self.db.db.commit()
 
-        async with self.db.db.execute(
-            "SELECT * FROM facts WHERE key = ?", (key,)
-        ) as cursor:
+        async with self.db.db.execute("SELECT * FROM facts WHERE key = ?", (key,)) as cursor:
             row = await cursor.fetchone()
 
         if not row:
@@ -134,13 +137,20 @@ class FactStore:
         Returns:
             True if deleted, False if not found.
         """
-        cursor = await self.db.db.execute(
-            "DELETE FROM facts WHERE key = ?", (key,)
-        )
+        cursor = await self.db.db.execute("DELETE FROM facts WHERE key = ?", (key,))
         await self.db.db.commit()
         deleted = cursor.rowcount > 0
         if deleted:
             logger.debug("fact_deleted", key=key)
+        return deleted
+
+    async def delete_by_id(self, fact_id: str) -> bool:
+        """Delete a fact by its ID. Returns True if deleted."""
+        cursor = await self.db.db.execute("DELETE FROM facts WHERE id = ?", (fact_id,))
+        await self.db.db.commit()
+        deleted = cursor.rowcount > 0
+        if deleted:
+            logger.debug("fact_deleted_by_id", fact_id=fact_id)
         return deleted
 
     async def search(self, prefix: str, limit: int = 50, offset: int = 0) -> list[Fact]:
@@ -165,7 +175,10 @@ class FactStore:
         return [_row_to_fact(row) for row in rows]
 
     async def get_by_category(
-        self, category: str, limit: int = 50, offset: int = 0,
+        self,
+        category: str,
+        limit: int = 50,
+        offset: int = 0,
     ) -> list[Fact]:
         """Get all facts in a category.
 
@@ -203,8 +216,10 @@ class FactStore:
         async with self.db.db.execute(
             """SELECT *,
                 confidence *
-                (1.0 / (1.0 + julianday('now') - julianday(accessed_at))) *
-                (1.0 + ln(1.0 + access_count)) AS relevance
+                (1.0 / (1.0 + MIN(
+                    julianday('now') - julianday(COALESCE(accessed_at, created_at)),
+                    365))) *
+                (1.0 + ln(1.0 + COALESCE(access_count, 0))) AS relevance
                FROM facts
                ORDER BY relevance DESC
                LIMIT ?

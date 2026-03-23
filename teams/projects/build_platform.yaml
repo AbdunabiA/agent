@@ -1,0 +1,142 @@
+name: build_platform
+description: "Multi-component platform — shared backend + API, website, admin panel, mobile app, landing page. Each stage is a small, verifiable step."
+stages:
+  # ═══════════════════════════════════════════
+  # PHASE 1: FOUNDATION (must complete first)
+  # ═══════════════════════════════════════════
+
+  - name: product_requirements
+    agents:
+      - team: product
+        role: product_manager
+
+  - name: system_architecture
+    agents:
+      - team: engineering
+        role: architect
+
+  - name: api_contracts
+    agents:
+      - team: engineering
+        role: api_designer
+
+  - name: database_schema
+    agents:
+      - team: data
+        role: data_engineer
+
+  # ═══════════════════════════════════════════
+  # PHASE 2: BACKEND (shared by all clients)
+  # ═══════════════════════════════════════════
+
+  - name: backend_models
+    agents:
+      - team: engineering
+        role: backend_developer
+
+  - name: backend_auth
+    agents:
+      - team: engineering
+        role: backend_developer
+
+  - name: backend_api_endpoints
+    agents:
+      - team: engineering
+        role: backend_developer
+
+  - name: backend_tests
+    agents:
+      - team: quality
+        role: qa_engineer
+    denied_tools:
+      - assign_task
+      - request_review
+    feedback:
+      fix_stage: backend_fixes
+      max_retries: 2
+
+  - name: backend_fixes
+    feedback_target: true
+    agents:
+      - team: engineering
+        role: backend_developer
+
+  # ═══════════════════════════════════════════
+  # PHASE 3: FRONTENDS (can be sequential)
+  # ═══════════════════════════════════════════
+
+  - name: website_frontend
+    agents:
+      - team: engineering
+        role: frontend_developer
+
+  - name: admin_panel
+    agents:
+      - team: engineering
+        role: fullstack_developer
+
+  - name: mobile_app
+    agents:
+      - team: engineering
+        role: mobile_developer
+
+  # ═══════════════════════════════════════════
+  # PHASE 4: LANDING & MARKETING
+  # ═══════════════════════════════════════════
+
+  - name: landing_page
+    parallel: true
+    agents:
+      - team: content
+        role: copywriter
+      - team: design
+        role: ui_designer
+
+  # ═══════════════════════════════════════════
+  # PHASE 5: QUALITY & SECURITY
+  # ═══════════════════════════════════════════
+
+  - name: integration_testing
+    agents:
+      - team: quality
+        role: integration_tester
+    denied_tools:
+      - assign_task
+      - request_review
+    feedback:
+      fix_stage: integration_fixes
+      max_retries: 3
+
+  - name: integration_fixes
+    feedback_target: true
+    parallel: true
+    agents:
+      - team: engineering
+        role: backend_developer
+      - team: engineering
+        role: frontend_developer
+
+  - name: security_audit
+    agents:
+      - team: quality
+        role: security_reviewer
+    denied_tools:
+      - file_write
+      - assign_task
+
+  # ═══════════════════════════════════════════
+  # PHASE 6: DEPLOYMENT & DOCS
+  # ═══════════════════════════════════════════
+
+  - name: deployment
+    agents:
+      - team: engineering
+        role: devops_engineer
+
+  - name: documentation
+    parallel: true
+    agents:
+      - team: content
+        role: technical_writer
+      - team: content
+        role: api_docs_writer

@@ -80,7 +80,7 @@ class SubAgentRole:
     model: str | None = None  # Override parent model
     allowed_tools: list[str] = field(default_factory=list)
     denied_tools: list[str] = field(default_factory=list)
-    max_iterations: int = 5
+    max_iterations: int = 200
     max_tokens_budget: int | None = None
 
 
@@ -96,6 +96,13 @@ class SubAgentTask:
     task_id: str = field(default_factory=lambda: str(uuid4())[:12])
     nesting_depth: int = 0
     status: SubAgentStatus = SubAgentStatus.PENDING
+    findings: list[str] = field(default_factory=list)
+    timeout_seconds: int = 1800
+    max_attempts: int = 3
+    critical: bool = False
+    project_task_id: str | None = None
+    parent_span_id: str | None = None
+    stage_denied_tools: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -111,6 +118,7 @@ class SubAgentResult:
     duration_ms: int = 0
     tool_calls_made: int = 0
     iterations: int = 0
+    findings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -222,6 +230,7 @@ class ProjectStage:
     feedback_target: bool = False  # skipped in normal flow, only triggered by loops
     mode: str = "standard"  # "standard" or "discussion"
     discussion: DiscussionConfig | None = None
+    denied_tools: list[str] = field(default_factory=list)  # stage-level tool denials
 
 
 @dataclass
@@ -259,3 +268,38 @@ class ProjectResult:
     duration_ms: int = 0
     error: str | None = None
     feedback_iterations: int = 0  # total iterations across all stages
+    stage_errors: list[str] = field(default_factory=list)  # aggregated error messages
+    plan_history: list[list[str]] = field(default_factory=list)  # stage name lists per replan
+    quality_reports: dict[str, dict] = field(default_factory=dict)  # stage → quality report
+
+
+@dataclass
+class ReplanDecision:
+    """Decision from the pipeline evaluator after a stage completes."""
+
+    action: str = "continue"  # "continue", "replan", "skip_to", "abort"
+    reason: str = ""
+    restart_from: int = 0  # stage index to restart from (for replan)
+    target_stage: int = 0  # stage index to skip to
+
+
+@dataclass
+class QualityIssue:
+    """A single quality issue found during evaluation."""
+
+    severity: str = "minor"  # "critical", "major", "minor", "suggestion"
+    category: str = "correctness"  # "correctness", "security", "performance", "style"
+    description: str = ""
+    file_path: str | None = None
+    suggested_fix: str = ""
+
+
+@dataclass
+class QualityReport:
+    """Structured quality evaluation of a stage's output."""
+
+    passed: bool = True
+    confidence: float = 1.0  # 0.0 - 1.0
+    issues: list[QualityIssue] = field(default_factory=list)
+    summary: str = ""
+    recommended_action: str = "proceed"  # "proceed", "fix_and_retry", "redesign", "abort"

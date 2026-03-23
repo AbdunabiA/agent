@@ -201,9 +201,9 @@ class TestRollbackTools:
             manager = RollbackManager(backup_dir=os.path.join(tmpdir, "backups"))
 
             original = os.path.join(tmpdir, "test.txt")
-            Path(original).write_text("original")
+            Path(original).write_text("original")  # noqa: ASYNC240
             entry = manager.create_backup(original)
-            Path(original).write_text("modified")
+            Path(original).write_text("modified")  # noqa: ASYNC240
 
             with patch("agent.core.rollback.get_rollback_manager", return_value=manager):
                 from agent.core.rollback import file_rollback
@@ -211,16 +211,16 @@ class TestRollbackTools:
                 result = await file_rollback(backup_id=entry.id)
 
             assert "Restored" in result
-            assert Path(original).read_text() == "original"
+            assert Path(original).read_text() == "original"  # noqa: ASYNC240
 
     async def test_file_rollback_by_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = RollbackManager(backup_dir=os.path.join(tmpdir, "backups"))
 
             original = os.path.join(tmpdir, "test.txt")
-            Path(original).write_text("original")
+            Path(original).write_text("original")  # noqa: ASYNC240
             manager.create_backup(original)
-            Path(original).write_text("modified")
+            Path(original).write_text("modified")  # noqa: ASYNC240
 
             with patch("agent.core.rollback.get_rollback_manager", return_value=manager):
                 from agent.core.rollback import file_rollback
@@ -242,7 +242,7 @@ class TestRollbackTools:
             manager = RollbackManager(backup_dir=os.path.join(tmpdir, "backups"))
 
             original = os.path.join(tmpdir, "test.txt")
-            Path(original).write_text("content")
+            Path(original).write_text("content")  # noqa: ASYNC240
             manager.create_backup(original)
 
             with patch("agent.core.rollback.get_rollback_manager", return_value=manager):
@@ -272,12 +272,14 @@ class TestFileWriteIntegration:
             manager = RollbackManager(backup_dir=os.path.join(tmpdir, "backups"))
 
             original = os.path.join(tmpdir, "test.txt")
-            Path(original).write_text("original content")
+            Path(original).write_text("original content")  # noqa: ASYNC240
 
             patch_target = "agent.tools.builtins.filesystem.get_rollback_manager"
             fs_patch = "agent.tools.builtins.filesystem._get_fs_config"
-            with patch(patch_target, return_value=manager), \
-                 patch(fs_patch, return_value=("/", tmpdir, [])):
+            with (
+                patch(patch_target, return_value=manager),
+                patch(fs_patch, return_value=("/", tmpdir, [])),
+            ):
                 from agent.tools.builtins.filesystem import file_write
 
                 await file_write(path=original, content="new content")
@@ -285,22 +287,24 @@ class TestFileWriteIntegration:
             # Backup should have been created
             backups = manager.list_backups()
             assert len(backups) == 1
-            assert Path(backups[0].backup_path).read_text() == "original content"
+            assert Path(backups[0].backup_path).read_text() == "original content"  # noqa: ASYNC240
 
             # File should have new content
-            assert Path(original).read_text() == "new content"
+            assert Path(original).read_text() == "new content"  # noqa: ASYNC240
 
     async def test_append_does_not_create_backup(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = RollbackManager(backup_dir=os.path.join(tmpdir, "backups"))
 
             original = os.path.join(tmpdir, "test.txt")
-            Path(original).write_text("original")
+            Path(original).write_text("original")  # noqa: ASYNC240
 
             patch_target = "agent.tools.builtins.filesystem.get_rollback_manager"
             fs_patch = "agent.tools.builtins.filesystem._get_fs_config"
-            with patch(patch_target, return_value=manager), \
-                 patch(fs_patch, return_value=("/", tmpdir, [])):
+            with (
+                patch(patch_target, return_value=manager),
+                patch(fs_patch, return_value=("/", tmpdir, [])),
+            ):
                 from agent.tools.builtins.filesystem import file_write
 
                 await file_write(path=original, content=" appended", append=True)
@@ -316,8 +320,10 @@ class TestFileWriteIntegration:
 
             patch_target = "agent.tools.builtins.filesystem.get_rollback_manager"
             fs_patch = "agent.tools.builtins.filesystem._get_fs_config"
-            with patch(patch_target, return_value=manager), \
-                 patch(fs_patch, return_value=("/", tmpdir, [])):
+            with (
+                patch(patch_target, return_value=manager),
+                patch(fs_patch, return_value=("/", tmpdir, [])),
+            ):
                 from agent.tools.builtins.filesystem import file_write
 
                 await file_write(path=new_file, content="new content")

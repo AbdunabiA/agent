@@ -105,6 +105,90 @@ Parameters:
   max_results (int, optional): Number of results (default: 5)
 ```
 
+## Email
+
+### `email` — Send and Read Emails
+
+- **Tier**: Moderate
+
+Send and read emails via SMTP/IMAP. Supports sending plain text and HTML emails, reading inbox messages, searching by subject/sender, and replying to existing threads.
+
+```
+Parameters:
+  action (str, required): One of "send", "read", "search", "reply"
+  to (str, optional): Recipient email address (for send/reply)
+  subject (str, optional): Email subject (for send/search)
+  body (str, optional): Email body. Starts with "<html" → sent as HTML
+  message_id (str, optional): Message-ID header value (for reply)
+  folder (str, optional): IMAP folder (default: "INBOX")
+  limit (int, optional): Max messages to return (default: 10)
+```
+
+#### Setup
+
+1. **Gmail App Password** (recommended for Gmail):
+   - Go to Google Account → Security → 2-Step Verification → App Passwords
+   - Generate a new app password for "Mail"
+   - Use that password (not your real Google password)
+
+2. **Configuration in agent.yaml**:
+   ```yaml
+   tools:
+     email:
+       enabled: true
+       smtp_host: smtp.gmail.com
+       smtp_port: 587
+       imap_host: imap.gmail.com
+       imap_port: 993
+       email: ${EMAIL_ADDRESS}
+       password: ${EMAIL_PASSWORD}
+       use_tls: true
+   ```
+
+3. **Environment variables in .env**:
+   ```
+   EMAIL_ADDRESS=you@gmail.com
+   EMAIL_PASSWORD=your-app-password
+   ```
+
+#### Examples
+
+**Send an email:**
+```
+action: "send"
+to: "colleague@example.com"
+subject: "Meeting notes"
+body: "Here are the notes from today's meeting..."
+```
+
+**Read latest inbox messages:**
+```
+action: "read"
+limit: 5
+```
+
+**Search emails by subject:**
+```
+action: "search"
+subject: "invoice"
+limit: 10
+```
+
+**Reply to a message:**
+```
+action: "reply"
+message_id: "<abc123@mail.gmail.com>"
+body: "Thanks, I'll review this today."
+```
+
+#### Security Note
+
+Always use app-specific passwords, never your real account password. App passwords can be revoked individually without affecting your main account. For Gmail, 2-Step Verification must be enabled to generate app passwords.
+
+#### Optional Dependency
+
+Install `aiosmtplib` for async SMTP sending: `pip install agent-ai[email]`. Without it, the tool falls back to the stdlib `smtplib` (synchronous, run in a thread executor).
+
 ## Browser Automation
 
 Requires the `playwright` package (`pip install playwright && playwright install`).
@@ -496,6 +580,178 @@ Closes a window by its title.
 Parameters:
   title (str, required): Window title to match
 ```
+
+## GitHub Integration
+
+### `github` — Interact with GitHub API
+
+- **Tier**: Moderate
+
+A comprehensive GitHub tool that supports managing repositories, issues, pull requests, file contents, and GitHub Actions workflows.
+
+### Setup
+
+1. Go to **GitHub Settings** > **Developer Settings** > **Personal Access Tokens** > **Fine-grained tokens** (or classic tokens).
+2. Create a token with the following permissions:
+   - **repo** — full control of private repositories
+   - **workflow** — update GitHub Actions workflows
+3. Add the token to your `.env` file:
+   ```
+   GITHUB_TOKEN=ghp_your_token_here
+   ```
+4. Enable the tool in `agent.yaml`:
+   ```yaml
+   tools:
+     github:
+       enabled: true
+       token: ${GITHUB_TOKEN}
+       default_owner: your-username
+       default_repo: your-repo
+   ```
+
+Setting `default_owner` and `default_repo` lets you omit them from every call.
+
+### Actions
+
+#### `list_repos` — List your repositories
+
+Returns the 20 most recently updated repositories for the authenticated user.
+
+```
+Parameters:
+  action (str, required): "list_repos"
+```
+
+**Example**: `github(action="list_repos")`
+
+#### `create_repo` — Create a new repository
+
+```
+Parameters:
+  action (str, required): "create_repo"
+  title (str, required): Repository name
+  body (str, optional): Repository description
+```
+
+**Example**: `github(action="create_repo", title="my-new-project", body="A cool project")`
+
+#### `list_issues` — List open issues
+
+```
+Parameters:
+  action (str, required): "list_issues"
+  owner (str, optional): Repository owner (uses default if empty)
+  repo (str, optional): Repository name (uses default if empty)
+```
+
+**Example**: `github(action="list_issues", owner="octocat", repo="Hello-World")`
+
+#### `create_issue` — Create an issue
+
+```
+Parameters:
+  action (str, required): "create_issue"
+  owner (str, optional): Repository owner
+  repo (str, optional): Repository name
+  title (str, required): Issue title
+  body (str, optional): Issue description
+  labels (str, optional): Comma-separated labels (e.g. "bug,urgent")
+```
+
+**Example**: `github(action="create_issue", title="Fix login bug", body="Login fails on mobile", labels="bug,priority")`
+
+#### `close_issue` — Close an issue
+
+```
+Parameters:
+  action (str, required): "close_issue"
+  owner (str, optional): Repository owner
+  repo (str, optional): Repository name
+  number (int, required): Issue number
+```
+
+**Example**: `github(action="close_issue", number=42)`
+
+#### `list_prs` — List open pull requests
+
+```
+Parameters:
+  action (str, required): "list_prs"
+  owner (str, optional): Repository owner
+  repo (str, optional): Repository name
+```
+
+**Example**: `github(action="list_prs")`
+
+#### `create_pr` — Create a pull request
+
+```
+Parameters:
+  action (str, required): "create_pr"
+  owner (str, optional): Repository owner
+  repo (str, optional): Repository name
+  title (str, required): PR title
+  body (str, optional): PR description
+  branch (str, optional): Head branch (default: "main")
+```
+
+**Example**: `github(action="create_pr", title="Add feature X", body="Implements feature X", branch="feature-x")`
+
+#### `get_file` — Read a file from a repository
+
+Retrieves and decodes file contents from a repository.
+
+```
+Parameters:
+  action (str, required): "get_file"
+  owner (str, optional): Repository owner
+  repo (str, optional): Repository name
+  path (str, required): File path in the repository
+  branch (str, optional): Branch name (default: "main")
+```
+
+**Example**: `github(action="get_file", path="src/main.py", branch="develop")`
+
+#### `push_file` — Create or update a file
+
+Creates a new file or updates an existing one. Automatically fetches the SHA for updates.
+
+```
+Parameters:
+  action (str, required): "push_file"
+  owner (str, optional): Repository owner
+  repo (str, optional): Repository name
+  path (str, required): File path in the repository
+  content (str, required): File content to write
+  title (str, optional): Commit message (default: "Update {path}")
+  branch (str, optional): Branch name (default: "main")
+```
+
+**Example**: `github(action="push_file", path="README.md", content="# My Project\nHello!", title="Update README")`
+
+#### `list_actions` — List recent workflow runs
+
+```
+Parameters:
+  action (str, required): "list_actions"
+  owner (str, optional): Repository owner
+  repo (str, optional): Repository name
+```
+
+**Example**: `github(action="list_actions")`
+
+#### `trigger_action` — Trigger a workflow dispatch
+
+```
+Parameters:
+  action (str, required): "trigger_action"
+  owner (str, optional): Repository owner
+  repo (str, optional): Repository name
+  path (str, required): Workflow file name (e.g. "ci.yml")
+  branch (str, optional): Branch to run against (default: "main")
+```
+
+**Example**: `github(action="trigger_action", path="deploy.yml", branch="release")`
 
 ## Managing Tools
 

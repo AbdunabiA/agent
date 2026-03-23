@@ -20,7 +20,6 @@ import pytest
 from agent.llm.claude_sdk import ClaudeSDKService, SDKTaskStatus
 from agent.tools.registry import ToolTier
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -155,7 +154,8 @@ class TestReapIdleClients:
         # Manually call the reap logic (not the loop)
         now = time.monotonic()
         idle_ids = [
-            tid for tid, last in service._last_activity.items()
+            tid
+            for tid, last in service._last_activity.items()
             if (now - last) > service._idle_timeout and tid in service._clients
         ]
         for tid in idle_ids:
@@ -174,7 +174,8 @@ class TestReapIdleClients:
 
         now = time.monotonic()
         idle_ids = [
-            tid for tid, last in service._last_activity.items()
+            tid
+            for tid, last in service._last_activity.items()
             if (now - last) > service._idle_timeout and tid in service._clients
         ]
         assert len(idle_ids) == 0
@@ -191,7 +192,8 @@ class TestReapIdleClients:
 
         now = time.monotonic()
         idle_ids = [
-            tid for tid, last in service._last_activity.items()
+            tid
+            for tid, last in service._last_activity.items()
             if (now - last) > service._idle_timeout and tid in service._clients
         ]
         for tid in idle_ids:
@@ -233,9 +235,7 @@ class TestResumeSessionTracking:
         assert service._last_session_ids["user1"] == "sess-abc-123"
 
     @pytest.mark.asyncio
-    async def test_run_task_stream_retry_on_resume_failure(
-        self, service: ClaudeSDKService
-    ):
+    async def test_run_task_stream_retry_on_resume_failure(self, service: ClaudeSDKService):
         """If resume fails, should retry without resume (fresh session)."""
         call_count = 0
 
@@ -256,9 +256,7 @@ class TestResumeSessionTracking:
         service._run_task_impl = fake_impl  # type: ignore[assignment]
 
         events = []
-        async for event in service.run_task_stream(
-            "hello", task_id="t1", session_id="old-session"
-        ):
+        async for event in service.run_task_stream("hello", task_id="t1", session_id="old-session"):
             events.append(event)
 
         # Should have retried: got "Success" from retry
@@ -266,9 +264,7 @@ class TestResumeSessionTracking:
         assert call_count == 2
 
     @pytest.mark.asyncio
-    async def test_run_task_stream_no_retry_without_session(
-        self, service: ClaudeSDKService
-    ):
+    async def test_run_task_stream_no_retry_without_session(self, service: ClaudeSDKService):
         """If no session_id and error occurs, should NOT retry."""
 
         async def fake_impl(
@@ -394,13 +390,15 @@ class TestToolGenerationDriftDetection:
             disconnect_called = True
             await original_disconnect(task_id)
 
-        with patch.object(svc, "_query_memory", new_callable=AsyncMock, return_value=(None, None)):
-            with patch.object(svc, "disconnect_client", side_effect=tracking_disconnect):
-                with patch("claude_code_sdk.ClaudeCodeOptions") as MockOpts:
-                    MockOpts.return_value = MagicMock()
-                    with patch("claude_code_sdk.ClaudeSDKClient") as MockClient:
-                        MockClient.return_value = AsyncMock()
-                        await svc._ensure_client("user1")
+        with (
+            patch.object(svc, "_query_memory", new_callable=AsyncMock, return_value=(None, None)),
+            patch.object(svc, "disconnect_client", side_effect=tracking_disconnect),
+            patch("claude_code_sdk.ClaudeCodeOptions") as mock_opts,
+            patch("claude_code_sdk.ClaudeSDKClient") as mock_client,
+        ):
+            mock_opts.return_value = MagicMock()
+            mock_client.return_value = AsyncMock()
+            await svc._ensure_client("user1")
 
         assert disconnect_called
 
@@ -483,13 +481,15 @@ class TestPromptFingerprint:
             disconnect_called = True
             await original_disconnect(task_id)
 
-        with patch.object(svc, "_query_memory", new_callable=AsyncMock, return_value=(None, None)):
-            with patch.object(svc, "disconnect_client", side_effect=tracking_disconnect):
-                with patch("claude_code_sdk.ClaudeCodeOptions") as MockOpts:
-                    MockOpts.return_value = MagicMock()
-                    with patch("claude_code_sdk.ClaudeSDKClient") as MockClient:
-                        MockClient.return_value = AsyncMock()
-                        await svc._ensure_client("user1")
+        with (
+            patch.object(svc, "_query_memory", new_callable=AsyncMock, return_value=(None, None)),
+            patch.object(svc, "disconnect_client", side_effect=tracking_disconnect),
+            patch("claude_code_sdk.ClaudeCodeOptions") as mock_opts,
+            patch("claude_code_sdk.ClaudeSDKClient") as mock_client,
+        ):
+            mock_opts.return_value = MagicMock()
+            mock_client.return_value = AsyncMock()
+            await svc._ensure_client("user1")
 
         assert disconnect_called
 
@@ -592,16 +592,24 @@ class TestEnsureClientResume:
             async def connect(self):
                 pass
 
-        with patch.object(service, "_query_memory", new_callable=AsyncMock, return_value=(None, None)):
-            with patch("claude_code_sdk.ClaudeSDKClient", FakeClient):
-                with patch("claude_code_sdk.ClaudeCodeOptions") as MockOptions:
-                    mock_opts = MagicMock()
-                    MockOptions.return_value = mock_opts
-                    await service._ensure_client("user1", session_id="explicit-sess")
+        mem_patch = patch.object(
+            service,
+            "_query_memory",
+            new_callable=AsyncMock,
+            return_value=(None, None),
+        )
+        with (
+            mem_patch,
+            patch("claude_code_sdk.ClaudeSDKClient", FakeClient),
+            patch("claude_code_sdk.ClaudeCodeOptions") as mock_options,
+        ):
+            mock_opts = MagicMock()
+            mock_options.return_value = mock_opts
+            await service._ensure_client("user1", session_id="explicit-sess")
 
-                    # Check that resume was passed to ClaudeCodeOptions
-                    call_kwargs = MockOptions.call_args[1]
-                    assert call_kwargs.get("resume") == "explicit-sess"
+            # Check that resume was passed to ClaudeCodeOptions
+            call_kwargs = mock_options.call_args[1]
+            assert call_kwargs.get("resume") == "explicit-sess"
 
         # Cleanup
         await service.disconnect_client("user1")
@@ -611,34 +619,48 @@ class TestEnsureClientResume:
         """Without explicit session_id, should use _last_session_ids."""
         service._last_session_ids["user1"] = "stored-sess-456"
 
-        with patch.object(service, "_query_memory", new_callable=AsyncMock, return_value=(None, None)):
-            with patch("claude_code_sdk.ClaudeCodeOptions") as MockOptions:
-                mock_opts = MagicMock()
-                MockOptions.return_value = mock_opts
-                with patch("claude_code_sdk.ClaudeSDKClient") as MockClient:
-                    mock_client = AsyncMock()
-                    MockClient.return_value = mock_client
-                    await service._ensure_client("user1")
+        mem_patch = patch.object(
+            service,
+            "_query_memory",
+            new_callable=AsyncMock,
+            return_value=(None, None),
+        )
+        with (
+            mem_patch,
+            patch("claude_code_sdk.ClaudeCodeOptions") as mock_options,
+            patch("claude_code_sdk.ClaudeSDKClient") as mock_client_cls,
+        ):
+            mock_opts = MagicMock()
+            mock_options.return_value = mock_opts
+            mock_client_cls.return_value = AsyncMock()
+            await service._ensure_client("user1")
 
-                    call_kwargs = MockOptions.call_args[1]
-                    assert call_kwargs.get("resume") == "stored-sess-456"
+            call_kwargs = mock_options.call_args[1]
+            assert call_kwargs.get("resume") == "stored-sess-456"
 
         await service.disconnect_client("user1")
 
     @pytest.mark.asyncio
     async def test_no_resume_when_no_session(self, service: ClaudeSDKService):
         """When no session_id exists, resume should not be in options."""
-        with patch.object(service, "_query_memory", new_callable=AsyncMock, return_value=(None, None)):
-            with patch("claude_code_sdk.ClaudeCodeOptions") as MockOptions:
-                mock_opts = MagicMock()
-                MockOptions.return_value = mock_opts
-                with patch("claude_code_sdk.ClaudeSDKClient") as MockClient:
-                    mock_client = AsyncMock()
-                    MockClient.return_value = mock_client
-                    await service._ensure_client("user1")
+        mem_patch = patch.object(
+            service,
+            "_query_memory",
+            new_callable=AsyncMock,
+            return_value=(None, None),
+        )
+        with (
+            mem_patch,
+            patch("claude_code_sdk.ClaudeCodeOptions") as mock_options,
+            patch("claude_code_sdk.ClaudeSDKClient") as mock_client_cls,
+        ):
+            mock_opts = MagicMock()
+            mock_options.return_value = mock_opts
+            mock_client_cls.return_value = AsyncMock()
+            await service._ensure_client("user1")
 
-                    call_kwargs = MockOptions.call_args[1]
-                    assert "resume" not in call_kwargs
+            call_kwargs = mock_options.call_args[1]
+            assert "resume" not in call_kwargs
 
         await service.disconnect_client("user1")
 
@@ -655,12 +677,14 @@ class TestEnsureClientStoresState:
     async def test_stores_prompt_fingerprint(self, service_with_soul):
         svc = service_with_soul
 
-        with patch.object(svc, "_query_memory", new_callable=AsyncMock, return_value=(None, None)):
-            with patch("claude_code_sdk.ClaudeCodeOptions") as MockOptions:
-                MockOptions.return_value = MagicMock()
-                with patch("claude_code_sdk.ClaudeSDKClient") as MockClient:
-                    MockClient.return_value = AsyncMock()
-                    await svc._ensure_client("user1")
+        with (
+            patch.object(svc, "_query_memory", new_callable=AsyncMock, return_value=(None, None)),
+            patch("claude_code_sdk.ClaudeCodeOptions") as mock_options,
+            patch("claude_code_sdk.ClaudeSDKClient") as mock_client,
+        ):
+            mock_options.return_value = MagicMock()
+            mock_client.return_value = AsyncMock()
+            await svc._ensure_client("user1")
 
         assert "user1" in svc._prompt_fingerprints
         assert len(svc._prompt_fingerprints["user1"]) == 16
@@ -675,24 +699,34 @@ class TestEnsureClientStoresState:
         async def t1() -> str:
             return ""
 
-        with patch.object(svc, "_query_memory", new_callable=AsyncMock, return_value=(None, None)):
-            with patch("claude_code_sdk.ClaudeCodeOptions") as MockOptions:
-                MockOptions.return_value = MagicMock()
-                with patch("claude_code_sdk.ClaudeSDKClient") as MockClient:
-                    MockClient.return_value = AsyncMock()
-                    await svc._ensure_client("user1")
+        with (
+            patch.object(svc, "_query_memory", new_callable=AsyncMock, return_value=(None, None)),
+            patch("claude_code_sdk.ClaudeCodeOptions") as mock_options,
+            patch("claude_code_sdk.ClaudeSDKClient") as mock_client,
+        ):
+            mock_options.return_value = MagicMock()
+            mock_client.return_value = AsyncMock()
+            await svc._ensure_client("user1")
 
         assert svc._tool_generations["user1"] == reg._generation
         await svc.disconnect_client("user1")
 
     @pytest.mark.asyncio
     async def test_stores_last_activity(self, service: ClaudeSDKService):
-        with patch.object(service, "_query_memory", new_callable=AsyncMock, return_value=(None, None)):
-            with patch("claude_code_sdk.ClaudeCodeOptions") as MockOptions:
-                MockOptions.return_value = MagicMock()
-                with patch("claude_code_sdk.ClaudeSDKClient") as MockClient:
-                    MockClient.return_value = AsyncMock()
-                    await service._ensure_client("user1")
+        mem_patch = patch.object(
+            service,
+            "_query_memory",
+            new_callable=AsyncMock,
+            return_value=(None, None),
+        )
+        with (
+            mem_patch,
+            patch("claude_code_sdk.ClaudeCodeOptions") as mock_options,
+            patch("claude_code_sdk.ClaudeSDKClient") as mock_client,
+        ):
+            mock_options.return_value = MagicMock()
+            mock_client.return_value = AsyncMock()
+            await service._ensure_client("user1")
 
         assert "user1" in service._last_activity
         assert service._last_activity["user1"] > 0
@@ -752,9 +786,7 @@ class TestQueryLockSerialization:
         # Launch two concurrent queries for the same task
         async def collect(prompt):
             events = []
-            async for event in service._run_task_impl(
-                prompt, task_id="user1"
-            ):
+            async for event in service._run_task_impl(prompt, task_id="user1"):
                 events.append(event)
             return events
 
@@ -766,7 +798,10 @@ class TestQueryLockSerialization:
 
         # They should NOT interleave — must be fully sequential
         assert execution_order == [
-            "start:msg1", "end:msg1", "start:msg2", "end:msg2",
+            "start:msg1",
+            "end:msg1",
+            "start:msg2",
+            "end:msg2",
         ]
 
     @pytest.mark.asyncio
@@ -788,9 +823,7 @@ class TestQueryLockSerialization:
 
         async def collect(task_id, prompt):
             events = []
-            async for event in service._run_task_impl(
-                prompt, task_id=task_id
-            ):
+            async for event in service._run_task_impl(prompt, task_id=task_id):
                 events.append(event)
             return events
 
@@ -856,7 +889,9 @@ class TestStaleResultSkipping:
         stale_result = self._make_result(session_id="old-session")
         real_assistant = self._make_assistant("Hello!")
         real_result = self._make_result(
-            session_id="new-session", duration_ms=2000, total_cost_usd=0.01,
+            session_id="new-session",
+            duration_ms=2000,
+            total_cost_usd=0.01,
         )
 
         parsed_messages = [stale_result, real_assistant, real_result]
@@ -987,6 +1022,7 @@ class TestStaleResultSkipping:
     @pytest.mark.asyncio
     async def test_receive_messages_exception_unknown_type(self):
         """If receive_messages raises 'Unknown message type', should be caught."""
+
         async def mock_receive_messages():
             raise Exception("Unknown message type: foo_bar")
             yield  # make it a generator  # noqa: E501
@@ -1003,6 +1039,7 @@ class TestStaleResultSkipping:
     @pytest.mark.asyncio
     async def test_receive_messages_exception_other_reraises(self):
         """Non 'Unknown message type' exceptions should propagate."""
+
         async def mock_receive_messages():
             raise RuntimeError("Connection lost")
             yield  # make it a generator  # noqa: E501
@@ -1027,16 +1064,18 @@ class TestPermissionProtocolPatch:
     def _ensure_patch(self):
         """Ensure SDK patch is applied before each test."""
         from agent.llm.claude_sdk import sdk_available
+
         sdk_available()
 
     def test_patch_applied(self):
         """Patch should be applied when sdk_available() is called."""
-        from agent.llm.claude_sdk import _SDK_PATCHED, sdk_available
+        from agent.llm.claude_sdk import sdk_available
 
         # Ensure the patch is triggered
         sdk_available()
         # Re-import to get updated value
         from agent.llm import claude_sdk
+
         assert claude_sdk._SDK_PATCHED is True
 
     def test_patched_method_exists(self):

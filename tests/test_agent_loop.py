@@ -170,3 +170,115 @@ class TestAgentLoop:
         session = Session()
         with pytest.raises(Exception, match="LLM Error"):
             await agent_loop.process_message("Hi", session)
+
+
+# ---------------------------------------------------------------------------
+# URL verification edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestUrlVerification:
+    """Tests for _check_urls_in_output in the agent loop."""
+
+    @pytest.fixture
+    def persona_config(self) -> AgentPersonaConfig:
+        return AgentPersonaConfig(name="TestAgent")
+
+    @pytest.fixture
+    def event_bus(self) -> EventBus:
+        return EventBus()
+
+    @pytest.fixture
+    def mock_llm(self) -> LLMProvider:
+        config = ModelsConfig(default="gpt-4o-mini")
+        return LLMProvider(config)
+
+    @pytest.fixture
+    def agent_loop(
+        self,
+        mock_llm: LLMProvider,
+        persona_config: AgentPersonaConfig,
+        event_bus: EventBus,
+    ) -> AgentLoop:
+        return AgentLoop(llm=mock_llm, config=persona_config, event_bus=event_bus)
+
+    async def test_check_urls_no_urls_returns_unchanged(self, agent_loop: AgentLoop) -> None:
+        """Output without any URLs should pass through unchanged."""
+        output = "This is plain text with no links."
+        result = await agent_loop._check_urls_in_output(output)
+        assert result == output
+
+    async def test_check_urls_marks_broken_404(self, agent_loop: AgentLoop) -> None:
+        """Output with a broken URL should get [BROKEN:404] appended."""
+        import httpx as httpx_mod
+
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 404
+
+        mock_client = AsyncMock()
+        mock_client.head = AsyncMock(return_value=mock_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch.object(httpx_mod, "AsyncClient", return_value=mock_client):
+            output = "Check this: https://example.com/missing-page for details."
+            result = await agent_loop._check_urls_in_output(output)
+        assert "[BROKEN:404]" in result
+
+    async def test_check_urls_marks_unreachable(self, agent_loop: AgentLoop) -> None:
+        """Output with an unreachable URL should get [UNREACHABLE] appended."""
+        import httpx as httpx_mod
+
+        mock_client = AsyncMock()
+        mock_client.head = AsyncMock(side_effect=Exception("Connection failed"))
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch.object(httpx_mod, "AsyncClient", return_value=mock_client):
+            output = "Visit https://down.example.com for info."
+            result = await agent_loop._check_urls_in_output(output)
+        assert "[UNREACHABLE]" in result
+
+    async def test_check_urls_max_5_urls(self, agent_loop: AgentLoop) -> None:
+        """With 10 URLs, only the first 5 should be checked."""
+        import httpx as httpx_mod
+
+        call_count = 0
+
+        async def counting_head(url, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            resp = AsyncMock()
+            resp.status_code = 200
+            return resp
+
+        mock_client = AsyncMock()
+        mock_client.head = AsyncMock(side_effect=counting_head)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch.object(httpx_mod, "AsyncClient", return_value=mock_client):
+            urls = [f"https://example.com/page{i}" for i in range(10)]
+            output = " ".join(urls)
+            await agent_loop._check_urls_in_output(output)
+
+        assert call_count == 5
+
+    async def test_check_urls_valid_url_unchanged(self, agent_loop: AgentLoop) -> None:
+        """A working URL (status 200) should remain unchanged in the output."""
+        import httpx as httpx_mod
+
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+
+        mock_client = AsyncMock()
+        mock_client.head = AsyncMock(return_value=mock_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch.object(httpx_mod, "AsyncClient", return_value=mock_client):
+            output = "See https://example.com for details."
+            result = await agent_loop._check_urls_in_output(output)
+        assert result == output
+        assert "[BROKEN" not in result
+        assert "[UNREACHABLE]" not in result

@@ -8,13 +8,16 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
+from datetime import datetime
+from pathlib import Path
 
 import aiosqlite
 import structlog
 
 logger = structlog.get_logger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 8
 
 SCHEMA_SQL = """
 -- Facts table: structured key-value memory
@@ -127,6 +130,36 @@ class Database:
         self._db.row_factory = aiosqlite.Row
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA foreign_keys=ON")
+        await self._db.execute("PRAGMA cache_size = -10000")
+        await self._db.execute("PRAGMA synchronous = NORMAL")
+        await self._db.execute("PRAGMA temp_store = MEMORY")
+        await self._db.execute("PRAGMA busy_timeout = 10000")
+
+        # Corruption detection
+        async with self._db.execute("PRAGMA integrity_check(1)") as cursor:
+            row = await cursor.fetchone()
+            result = row[0] if row else "ok"
+        if result != "ok":
+            logger.error(
+                "database_corruption_detected",
+                path=self.db_path,
+                result=result,
+            )
+            await self._db.close()
+            self._db = None
+            corrupt_path = self.db_path + ".corrupt"
+            await asyncio.to_thread(os.rename, self.db_path, corrupt_path)
+            logger.info("database_renamed_corrupt", corrupt_path=corrupt_path)
+            # Reconnect to create a fresh database
+            self._db = await aiosqlite.connect(self.db_path)
+            self._db.row_factory = aiosqlite.Row
+            await self._db.execute("PRAGMA journal_mode=WAL")
+            await self._db.execute("PRAGMA foreign_keys=ON")
+            await self._db.execute("PRAGMA cache_size = -10000")
+            await self._db.execute("PRAGMA synchronous = NORMAL")
+            await self._db.execute("PRAGMA temp_store = MEMORY")
+            await self._db.execute("PRAGMA busy_timeout = 10000")
+
         await self._migrate()
         logger.info("database_connected", path=self.db_path)
 
@@ -134,9 +167,7 @@ class Database:
         """Run schema migrations if needed."""
         current = 0
         try:
-            async with self._db.execute(
-                "SELECT MAX(version) FROM schema_version"
-            ) as cursor:
+            async with self._db.execute("SELECT MAX(version) FROM schema_version") as cursor:
                 row = await cursor.fetchone()
                 if row and row[0] is not None:
                     current = row[0]
@@ -152,6 +183,30 @@ class Database:
         if current < 2:
             await self._migrate_v2()
             current = 2
+
+        if current < 3:
+            await self._migrate_v3()
+            current = 3
+
+        if current < 4:
+            await self._migrate_v4()
+            current = 4
+
+        if current < 5:
+            await self._migrate_v5()
+            current = 5
+
+        if current < 6:
+            await self._migrate_v6()
+            current = 6
+
+        if current < 7:
+            await self._migrate_v7()
+            current = 7
+
+        if current < 8:
+            await self._migrate_v8()
+            current = 8
 
         if starting_version < SCHEMA_VERSION:
             await self._db.execute(
@@ -172,15 +227,159 @@ class Database:
             columns = {row[1] for row in await cursor.fetchall()}
 
         if "user_id" not in columns:
-            await self._db.execute(
-                "ALTER TABLE scheduled_tasks ADD COLUMN user_id TEXT"
-            )
+            await self._db.execute("ALTER TABLE scheduled_tasks ADD COLUMN user_id TEXT")
         if "next_run" not in columns:
-            await self._db.execute(
-                "ALTER TABLE scheduled_tasks ADD COLUMN next_run TEXT"
-            )
+            await self._db.execute("ALTER TABLE scheduled_tasks ADD COLUMN next_run TEXT")
         await self._db.commit()
         logger.info("database_migrated_v2")
+
+    async def _migrate_v3(self) -> None:
+        """Migration v2 -> v3: Add task_memory table for WorkingMemory."""
+        from agent.core.working_memory import WorkingMemory
+
+        await self._db.executescript(WorkingMemory.migration_sql())
+        # Best-effort FTS5 — silently skip if not compiled in
+        try:
+            await self._db.executescript(WorkingMemory.fts_sql())
+        except Exception:
+            logger.info("database_fts5_unavailable", note="artifact search will use LIKE")
+        await self._db.commit()
+        logger.info("database_migrated_v3")
+
+    async def _migrate_v4(self) -> None:
+        """Migration v3 -> v4: Add agent_spans table for AgentTracer."""
+        from agent.observability.tracer import AgentTracer
+
+        await self._db.executescript(AgentTracer.migration_sql())
+        await self._db.commit()
+        logger.info("database_migrated_v4")
+
+    async def _migrate_v5(self) -> None:
+        """Migration v4 -> v5: Add task_tickets table for TaskBoard."""
+        from agent.core.task_board import TaskBoard
+
+        await self._db.executescript(TaskBoard.migration_sql())
+        await self._db.commit()
+        logger.info("database_migrated_v5")
+
+    async def _migrate_v6(self) -> None:
+        """Migration v5 -> v6: Add cost_entries table for CostTracker."""
+        await self._db.executescript("""
+            CREATE TABLE IF NOT EXISTS cost_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                cost REAL NOT NULL,
+                channel TEXT NOT NULL DEFAULT 'cli',
+                session_id TEXT NOT NULL DEFAULT '',
+                timestamp TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_cost_entries_model ON cost_entries(model);
+            CREATE INDEX IF NOT EXISTS idx_cost_entries_timestamp ON cost_entries(timestamp);
+        """)
+        await self._db.commit()
+        logger.info("database_migrated_v6")
+
+    async def _migrate_v7(self) -> None:
+        """Migration v6 -> v7: Add request_id column to audit_log."""
+        async with self._db.execute("PRAGMA table_info(audit_log)") as cursor:
+            columns = {row[1] for row in await cursor.fetchall()}
+
+        if "request_id" not in columns:
+            await self._db.execute(
+                "ALTER TABLE audit_log ADD COLUMN request_id TEXT NOT NULL DEFAULT ''"
+            )
+        await self._db.commit()
+        logger.info("database_migrated_v7")
+
+    async def _migrate_v8(self) -> None:
+        """Migration v7 -> v8: Agent messages table + working memory columns."""
+        # Inter-agent message bus table
+        await self._db.executescript("""
+            CREATE TABLE IF NOT EXISTS agent_messages (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                from_role TEXT NOT NULL,
+                to_role TEXT,
+                to_team TEXT,
+                thread_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                msg_type TEXT NOT NULL DEFAULT 'question',
+                reply_to TEXT,
+                timestamp REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_messages_task
+                ON agent_messages(task_id);
+            CREATE INDEX IF NOT EXISTS idx_messages_thread
+                ON agent_messages(thread_id);
+            CREATE INDEX IF NOT EXISTS idx_messages_to_role
+                ON agent_messages(task_id, to_role);
+        """)
+
+        # Working memory validation columns (if table exists)
+        try:
+            async with self._db.execute(
+                "PRAGMA table_info(working_memory)",
+            ) as cursor:
+                columns = {row[1] for row in await cursor.fetchall()}
+
+            if columns and "validated_by" not in columns:
+                await self._db.execute(
+                    "ALTER TABLE working_memory " "ADD COLUMN validated_by TEXT DEFAULT ''"
+                )
+                await self._db.execute(
+                    "ALTER TABLE working_memory " "ADD COLUMN validated_at TEXT DEFAULT ''"
+                )
+                await self._db.execute(
+                    "ALTER TABLE working_memory " "ADD COLUMN status TEXT DEFAULT 'pending'"
+                )
+        except Exception:
+            pass  # working_memory may not exist yet
+
+        await self._db.commit()
+        logger.info("database_migrated_v8")
+
+    async def checkpoint(self) -> None:
+        """Run WAL checkpoint to keep WAL file size manageable."""
+        if self._db:
+            await self._db.execute("PRAGMA wal_checkpoint(PASSIVE)")
+
+    async def backup(self, backup_dir: str = "./data/backups") -> str:
+        """Create a timestamped backup of the database file.
+
+        Checkpoints the WAL and copies the database file to the backup directory.
+
+        Args:
+            backup_dir: Directory to store backups. Created if it does not exist.
+
+        Returns:
+            Path to the backup file.
+        """
+        backup_path = Path(backup_dir)
+        await asyncio.to_thread(backup_path.mkdir, parents=True, exist_ok=True)
+
+        await self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        db_name = Path(self.db_path).stem
+        dest = backup_path / f"{db_name}_{timestamp}.db"
+        await asyncio.to_thread(shutil.copy2, self.db_path, str(dest))
+
+        logger.info("database_backup_created", path=str(dest))
+        return str(dest)
+
+    def get_size_mb(self) -> float:
+        """Return the database file size in megabytes.
+
+        Returns:
+            File size in MB, or 0.0 if the file does not exist.
+        """
+        try:
+            size_bytes = Path(self.db_path).stat().st_size
+            return size_bytes / (1024 * 1024)
+        except OSError:
+            return 0.0
 
     async def close(self) -> None:
         """Close the database connection."""

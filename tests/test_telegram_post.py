@@ -5,13 +5,12 @@ from __future__ import annotations
 import os
 import tempfile
 from datetime import timedelta
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from agent.tools.builtins import telegram_post
-
 
 # -----------------------------------------------------------------------
 # Fixtures
@@ -74,7 +73,8 @@ class TestPostToChannel:
         telegram_post._global_event_bus = bus
 
         result = await telegram_post.post_to_channel(
-            chat_id="@mychannel", text="Hello world",
+            chat_id="@mychannel",
+            text="Hello world",
         )
 
         assert "Posted to @mychannel" in result
@@ -88,28 +88,33 @@ class TestPostToChannel:
 
     async def test_no_event_bus(self) -> None:
         result = await telegram_post.post_to_channel(
-            chat_id="@ch", text="hello",
+            chat_id="@ch",
+            text="hello",
         )
         assert "ERROR" in result
 
     async def test_empty_text(self) -> None:
         telegram_post._global_event_bus = _make_event_bus()
         result = await telegram_post.post_to_channel(
-            chat_id="@ch", text="",
+            chat_id="@ch",
+            text="",
         )
         assert "ERROR" in result
 
     async def test_empty_chat_id(self) -> None:
         telegram_post._global_event_bus = _make_event_bus()
         result = await telegram_post.post_to_channel(
-            chat_id="", text="hello",
+            chat_id="",
+            text="hello",
         )
         assert "ERROR" in result
 
     async def test_with_photo_missing(self) -> None:
         telegram_post._global_event_bus = _make_event_bus()
         result = await telegram_post.post_to_channel(
-            chat_id="@ch", text="hello", photo_path="/nonexistent/photo.jpg",
+            chat_id="@ch",
+            text="hello",
+            photo_path="/nonexistent/photo.jpg",
         )
         assert "ERROR" in result
         assert "not found" in result.lower()
@@ -124,7 +129,9 @@ class TestPostToChannel:
 
         try:
             result = await telegram_post.post_to_channel(
-                chat_id="@ch", text="check this out", photo_path=photo,
+                chat_id="@ch",
+                text="check this out",
+                photo_path=photo,
             )
             assert "Posted to @ch" in result
             assert "with photo" in result
@@ -138,7 +145,9 @@ class TestPostToChannel:
         telegram_post._global_event_bus = bus
 
         result = await telegram_post.post_to_channel(
-            chat_id="@ch", text="important", pin=True,
+            chat_id="@ch",
+            text="important",
+            pin=True,
         )
         assert "pinned" in result
         data = bus.emit.call_args[0][1]
@@ -156,7 +165,8 @@ class TestSendTelegramMessage:
         telegram_post._global_event_bus = bus
 
         result = await telegram_post.send_telegram_message(
-            user_id="12345", text="Hello!",
+            user_id="12345",
+            text="Hello!",
         )
 
         assert "sent to user 12345" in result
@@ -168,21 +178,24 @@ class TestSendTelegramMessage:
 
     async def test_no_event_bus(self) -> None:
         result = await telegram_post.send_telegram_message(
-            user_id="123", text="hi",
+            user_id="123",
+            text="hi",
         )
         assert "ERROR" in result
 
     async def test_empty_text(self) -> None:
         telegram_post._global_event_bus = _make_event_bus()
         result = await telegram_post.send_telegram_message(
-            user_id="123", text="  ",
+            user_id="123",
+            text="  ",
         )
         assert "ERROR" in result
 
     async def test_empty_user_id(self) -> None:
         telegram_post._global_event_bus = _make_event_bus()
         result = await telegram_post.send_telegram_message(
-            user_id="", text="hello",
+            user_id="",
+            text="hello",
         )
         assert "ERROR" in result
 
@@ -205,7 +218,9 @@ class TestSchedulePost:
         telegram_post._global_scheduler = scheduler
 
         result = await telegram_post.schedule_post(
-            chat_id="@ch", text="scheduled post", delay="30m",
+            chat_id="@ch",
+            text="scheduled post",
+            delay="30m",
         )
 
         assert "scheduled" in result.lower()
@@ -222,7 +237,9 @@ class TestSchedulePost:
         telegram_post._global_scheduler = MagicMock()
 
         result = await telegram_post.schedule_post(
-            chat_id="@ch", text="hello", delay="asap",
+            chat_id="@ch",
+            text="hello",
+            delay="asap",
         )
         assert "ERROR" in result
         assert "parse" in result.lower()
@@ -232,7 +249,9 @@ class TestSchedulePost:
         telegram_post._global_scheduler = MagicMock()
 
         result = await telegram_post.schedule_post(
-            chat_id="@ch", text="hello", delay="5s",
+            chat_id="@ch",
+            text="hello",
+            delay="5s",
         )
         assert "ERROR" in result
         assert "10 seconds" in result
@@ -241,20 +260,26 @@ class TestSchedulePost:
         telegram_post._global_event_bus = _make_event_bus()
         # No scheduler set
         result = await telegram_post.schedule_post(
-            chat_id="@ch", text="hello", delay="1h",
+            chat_id="@ch",
+            text="hello",
+            delay="1h",
         )
         assert "ERROR" in result
 
     async def test_no_event_bus(self) -> None:
         result = await telegram_post.schedule_post(
-            chat_id="@ch", text="hello", delay="1h",
+            chat_id="@ch",
+            text="hello",
+            delay="1h",
         )
         assert "ERROR" in result
 
     async def test_empty_text(self) -> None:
         telegram_post._global_event_bus = _make_event_bus()
         result = await telegram_post.schedule_post(
-            chat_id="@ch", text="", delay="1h",
+            chat_id="@ch",
+            text="",
+            delay="1h",
         )
         assert "ERROR" in result
 
@@ -269,7 +294,6 @@ class TestChannelPostHandler:
 
     def _make_channel(self) -> Any:
         """Create a minimal TelegramChannel mock for handler testing."""
-        from unittest.mock import PropertyMock
 
         channel = MagicMock()
         channel._bot = AsyncMock()
@@ -283,15 +307,20 @@ class TestChannelPostHandler:
 
         ch = self._make_channel()
 
-        await TelegramChannel._on_channel_post(ch, {
-            "channel": "telegram",
-            "chat_id": "@test",
-            "text": "Hello",
-            "parse_mode": "Markdown",
-        })
+        await TelegramChannel._on_channel_post(
+            ch,
+            {
+                "channel": "telegram",
+                "chat_id": "@test",
+                "text": "Hello",
+                "parse_mode": "Markdown",
+            },
+        )
 
         ch._bot.send_message.assert_called_once_with(
-            chat_id="@test", text="Hello", parse_mode="Markdown",
+            chat_id="@test",
+            text="Hello",
+            parse_mode="Markdown",
         )
 
     async def test_post_with_pin(self) -> None:
@@ -299,12 +328,15 @@ class TestChannelPostHandler:
 
         ch = self._make_channel()
 
-        await TelegramChannel._on_channel_post(ch, {
-            "channel": "telegram",
-            "chat_id": "@test",
-            "text": "Pinned post",
-            "pin": True,
-        })
+        await TelegramChannel._on_channel_post(
+            ch,
+            {
+                "channel": "telegram",
+                "chat_id": "@test",
+                "text": "Pinned post",
+                "pin": True,
+            },
+        )
 
         ch._bot.pin_chat_message.assert_called_once()
 
@@ -313,11 +345,14 @@ class TestChannelPostHandler:
 
         ch = self._make_channel()
 
-        await TelegramChannel._on_channel_post(ch, {
-            "channel": "webchat",
-            "chat_id": "@test",
-            "text": "Hello",
-        })
+        await TelegramChannel._on_channel_post(
+            ch,
+            {
+                "channel": "webchat",
+                "chat_id": "@test",
+                "text": "Hello",
+            },
+        )
 
         ch._bot.send_message.assert_not_called()
 
@@ -327,10 +362,13 @@ class TestChannelPostHandler:
         ch = self._make_channel()
 
         # Missing text
-        await TelegramChannel._on_channel_post(ch, {
-            "channel": "telegram",
-            "chat_id": "@test",
-        })
+        await TelegramChannel._on_channel_post(
+            ch,
+            {
+                "channel": "telegram",
+                "chat_id": "@test",
+            },
+        )
 
         ch._bot.send_message.assert_not_called()
 
@@ -339,15 +377,20 @@ class TestChannelPostHandler:
 
         ch = self._make_channel()
 
-        await TelegramChannel._on_send_message(ch, {
-            "channel": "telegram",
-            "user_id": "12345",
-            "text": "Hello user!",
-            "parse_mode": "Markdown",
-        })
+        await TelegramChannel._on_send_message(
+            ch,
+            {
+                "channel": "telegram",
+                "user_id": "12345",
+                "text": "Hello user!",
+                "parse_mode": "Markdown",
+            },
+        )
 
         ch._bot.send_message.assert_called_once_with(
-            chat_id=12345, text="Hello user!", parse_mode="Markdown",
+            chat_id=12345,
+            text="Hello user!",
+            parse_mode="Markdown",
         )
 
     async def test_send_message_ignores_non_telegram(self) -> None:
@@ -355,14 +398,16 @@ class TestChannelPostHandler:
 
         ch = self._make_channel()
 
-        await TelegramChannel._on_send_message(ch, {
-            "channel": "webchat",
-            "user_id": "123",
-            "text": "hi",
-        })
+        await TelegramChannel._on_send_message(
+            ch,
+            {
+                "channel": "webchat",
+                "user_id": "123",
+                "text": "hi",
+            },
+        )
 
         ch._bot.send_message.assert_not_called()
 
 
 # Allow mypy to accept the _make_channel mock return
-from typing import Any

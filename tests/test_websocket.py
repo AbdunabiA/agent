@@ -392,15 +392,15 @@ class TestWebSocketChat:
             assert msg["type"] == "typing"
             assert msg["status"] is True
 
+            # error (sent before typing off in _handle_litellm_message)
+            msg = ws.receive_json()
+            assert msg["type"] == "error"
+            assert "LLM provider unavailable" in msg["message"]
+
             # typing off
             msg = ws.receive_json()
             assert msg["type"] == "typing"
             assert msg["status"] is False
-
-            # error
-            msg = ws.receive_json()
-            assert msg["type"] == "error"
-            assert "LLM provider unavailable" in msg["message"]
 
     def test_chat_empty_message_ignored(
         self, config_no_auth: AgentConfig, mock_agent_loop: AsyncMock, event_bus: EventBus
