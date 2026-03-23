@@ -76,6 +76,9 @@ class SubAgentOrchestrator:
         teams: list[AgentTeam] | None = None,
         sdk_service: ClaudeSDKService | None = None,
         task_board: Any | None = None,
+        working_memory: Any | None = None,
+        tracer: Any | None = None,
+        prompt_builder: Any | None = None,
     ) -> None:
         self.agent_loop = agent_loop
         self.config = config
@@ -83,6 +86,9 @@ class SubAgentOrchestrator:
         self.tool_registry = tool_registry
         self.sdk_service = sdk_service
         self.task_board = task_board
+        self.working_memory = working_memory
+        self.tracer = tracer
+        self.prompt_builder = prompt_builder
         self.teams = {t.name: t for t in (teams or [])}
         self.projects: dict[str, Project] = {}
 

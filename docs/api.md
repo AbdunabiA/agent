@@ -19,9 +19,22 @@ No auth required.
   "status": "ok",
   "version": "0.1.0",
   "uptime_seconds": 3600,
-  "timestamp": "2026-03-05T12:00:00"
+  "timestamp": "2026-03-05T12:00:00",
+  "database": "ok",
+  "llm": "ok",
+  "disk_free_gb": 250.5,
+  "db_size_mb": 12.34
 }
 ```
+
+Field descriptions:
+
+| Field | Values | Notes |
+|-------|--------|-------|
+| `database` | `"ok"`, `"error"`, `"not_configured"` | Database connectivity status |
+| `llm` | `"ok"`, `"not_configured"` | LLM provider availability |
+| `disk_free_gb` | float | Free disk space in GB; status degrades if < 1GB |
+| `db_size_mb` | float | Database file size in MB; only present when database is available |
 
 #### `GET /api/v1/status`
 

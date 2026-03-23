@@ -112,7 +112,10 @@ agent/
 │   │   ├── rollback.py         # Undo system
 │   │   ├── cost_tracker.py     # LLM cost tracking
 │   │   ├── doctor.py           # Health check logic
-│   │   └── startup.py          # Startup sequencing
+│   │   ├── startup.py          # Startup sequencing
+│   │   ├── message_bus.py      # Inter-agent communication bus
+│   │   ├── quality_gate.py     # Stage output quality evaluation
+│   │   └── working_memory.py   # Shared working memory with validation
 │   │
 │   ├── llm/                    # LLM integration
 │   │   ├── provider.py         # LiteLLM wrapper + failover

@@ -52,10 +52,11 @@ docker run -e ANTHROPIC_API_KEY=sk-... ghcr.io/OWNER/agent
 |---|---------|-------------|
 | **Brain** | Multi-provider LLM | Claude, OpenAI, Gemini, Ollama via LiteLLM + Claude Agent SDK |
 | **Memory** | Three-layer memory | SQLite facts + ChromaDB vectors + soul.md personality |
-| **Tools** | Tool execution | Shell, filesystem, Python, HTTP, browser (Playwright), web search, file sending |
+| **Tools** | Tool execution | Shell, filesystem, Python, HTTP, browser (Playwright), web search, file sending, GitHub, email, verify_url |
 | **Channels** | Telegram + Web | Telegram bot with voice/photo/video/file support, WebSocket chat |
 | **Heartbeat** | Proactive actions | Scheduled checks, reminders, cron jobs via HEARTBEAT.md |
 | **Planning** | Task decomposition | Multi-step plans with progress tracking |
+| **Collaboration** | Multi-agent coordination | Inter-agent message bus, quality gates, re-planning |
 | **Skills** | Plugin system | Drop-in skill directories with SKILL.md metadata and hot-reload |
 | **Safety** | Guardrails | Three-tier permissions (safe/moderate/dangerous), audit log, cost tracking |
 | **Gateway** | REST + WebSocket API | FastAPI with auth, CORS, rate limiting |

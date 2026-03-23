@@ -93,6 +93,31 @@ Parameters:
   timeout (int, optional): Timeout in seconds (default: 30)
 ```
 
+### `verify_url` — Check URL Accessibility
+
+- **Tier**: Safe
+
+Sends a HEAD request to check if a URL is accessible. Returns the HTTP status code, content type, or an error message if the URL is unreachable.
+
+```
+Parameters:
+  url (str, required): URL to check
+```
+
+**Returns**: Status code and content type on success, or error message on failure.
+
+**Example**:
+```
+verify_url(url="https://example.com")
+→ {"status_code": 200, "content_type": "text/html; charset=UTF-8"}
+
+verify_url(url="https://example.com/missing")
+→ {"status_code": 404, "content_type": "text/html"}
+
+verify_url(url="https://invalid.example")
+→ {"error": "Name resolution failed"}
+```
+
 ### `web_search` — Web Search
 
 - **Tier**: Safe

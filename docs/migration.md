@@ -28,6 +28,8 @@ sqlite3 data/agent.db "SELECT version FROM schema_version"
 | **v4** | Added `working_memory` and `tracer` tables |
 | **v5** | Added `task_board` table for persistent task tracking |
 | **v6** | Added `cost_entries` table for LLM cost tracking |
+| **v7** | Added `request_id` column to `audit_log` table for request tracing |
+| **v8** | Added `agent_messages` table for inter-agent message bus. Added `validated_by`, `validated_at`, `status` columns to `working_memory` for finding validation |
 
 ## Database Location
 

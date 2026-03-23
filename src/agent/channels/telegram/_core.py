@@ -228,6 +228,7 @@ class TelegramChannel(BaseChannel):
         audit_log: AuditLog | None = None,
         cost_tracker: CostTracker | None = None,
         orchestrator: SubAgentOrchestrator | None = None,
+        tracer: object | None = None,
     ) -> None:
         super().__init__(config=config, event_bus=event_bus, session_store=session_store)
         self.agent_loop = agent_loop
@@ -239,6 +240,7 @@ class TelegramChannel(BaseChannel):
         self.audit_log = audit_log
         self.cost_tracker = cost_tracker
         self.orchestrator = orchestrator
+        self.tracer = tracer
         self._workspace_agent_loops: dict[str, AgentLoop] = {}
         self._workspace_session_stores: dict[str, SessionStore] = {}
         self._polling_task: asyncio.Task[Any] | None = None
