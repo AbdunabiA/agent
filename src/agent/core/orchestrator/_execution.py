@@ -245,6 +245,10 @@ async def _execute_subagent_via_sdk(
         )
 
     try:
+        # Pass permission callback from parent context so sub-agents
+        # can request user approval for tools outside their safe set.
+        _on_permission = getattr(self, "_permission_callback", None)
+
         response_text = await self.sdk_service.run_subagent(  # type: ignore[union-attr]
             prompt=full_instruction,
             task_id=task.task_id,
@@ -255,6 +259,7 @@ async def _execute_subagent_via_sdk(
             task_context=task.context,
             tool_executor=sub_executor,
             nesting_depth=task.nesting_depth,
+            on_permission=_on_permission,
         )
 
         duration_ms = int((_time.monotonic() - start) * 1000)

@@ -433,6 +433,7 @@ class ClaudeSDKService:
         task_context: str = "",
         tool_executor: Any | None = None,
         nesting_depth: int = 0,
+        on_permission: PermissionCallback | None = None,
     ) -> str:
         """Run a sub-agent task via a temporary SDK client.
 
@@ -527,14 +528,19 @@ class ClaudeSDKService:
                 "Bash",
                 "NotebookEdit",
             }
-            if tool_name in safe_tools or tool_name in agent_safe_tools:
+            if tool_name in safe_tools or tool_name in all_agent_tools:
                 return PermissionResultAllow(updated_input=tool_input)
 
-            # Auto-approve all tools from scoped registry (already filtered)
-            if tool_name in all_agent_tools:
-                return PermissionResultAllow(updated_input=tool_input)
+            # Delegate to permission callback (e.g., Telegram approval)
+            if on_permission:
+                try:
+                    approved = await on_permission(tool_name, str(tool_input), tool_input)
+                    if approved:
+                        return PermissionResultAllow(updated_input=tool_input)
+                except Exception:
+                    pass
 
-            return PermissionResultDeny(message="Tool not in sub-agent scope", interrupt=False)
+            return PermissionResultDeny(message="Tool not approved", interrupt=False)
 
         resolved_cwd = str(_Path(_os.path.expanduser(self.working_dir)).resolve())  # noqa: ASYNC240
 

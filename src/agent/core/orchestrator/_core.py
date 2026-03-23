@@ -104,6 +104,10 @@ class SubAgentOrchestrator:
         self._spawn_lock = asyncio.Lock()
         self._max_results = 500  # prune _results after this many entries
 
+        # Permission callback set by the channel layer (e.g., Telegram)
+        # so sub-agents can request user approval for dangerous tools.
+        self._permission_callback: Any | None = None
+
     async def spawn_subagent(self, task: SubAgentTask) -> SubAgentResult:
         """Spawn a single sub-agent and wait for its result.
 
@@ -865,6 +869,10 @@ class SubAgentOrchestrator:
     ) -> SubAgentResult:
         """Execute a channel task via SDK or agent loop."""
         import time as _time
+
+        # Store permission callback so sub-agents can delegate approval
+        if on_permission is not None:
+            self._permission_callback = on_permission
 
         start = _time.monotonic()
 

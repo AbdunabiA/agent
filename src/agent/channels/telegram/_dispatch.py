@@ -77,7 +77,7 @@ async def _process_via_sdk_or_loop(
             on_permission = _on_permission
 
         # Timeout: don't block Telegram handler for more than 5 minutes
-        sdk_stream_timeout = 300  # 5 minutes max per message
+        sdk_stream_timeout = 600  # 10 minutes max per message
 
         try:
             async with asyncio.timeout(sdk_stream_timeout):

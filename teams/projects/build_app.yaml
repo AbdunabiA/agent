@@ -45,7 +45,7 @@ stages:
       - ask_team
     feedback:
       fix_stage: fix_issues
-      max_retries: 2
+      max_retries: 3
 
   - name: fix_issues
     feedback_target: true

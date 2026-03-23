@@ -6,7 +6,7 @@ import asyncio
 import contextvars
 import json
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -25,13 +25,22 @@ _global_orchestrator: SubAgentOrchestrator | None = None
 # Set by the Telegram channel (or any channel that wants notifications).
 _task_user_callback: Callable[[str, str], None] | None = None
 
-# Pending results from async pipelines — injected into main agent's next turn
-_pending_results: dict[str, str] = {}  # user_id → summary
+# Pending results from async pipelines — injected into main agent's next turn.
+# Accumulates multiple updates (stage completions + final result) so the main
+# agent sees everything that happened since its last turn.
+_pending_results: dict[str, list[str]] = {}  # user_id → list of updates
 
 
 def get_pending_results(user_id: str) -> str | None:
-    """Pop and return pending async pipeline results for a user."""
-    return _pending_results.pop(user_id, None)
+    """Pop and return all pending async pipeline results for a user."""
+    items = _pending_results.pop(user_id, [])
+    return "\n\n---\n\n".join(items) if items else None
+
+
+def _add_pending_result(user_id: str, text: str) -> None:
+    """Append a pending result update for the given user."""
+    if user_id:
+        _pending_results.setdefault(user_id, []).append(text)
 
 
 def set_task_user_callback(
@@ -724,8 +733,9 @@ async def run_project_tool(
 
             # Store result for main agent's next conversation turn
             if _user_id:
-                _pending_results[_user_id] = (
-                    f"[Background task completed: {task_id}]\n" f"{summary or 'Project completed.'}"
+                _add_pending_result(
+                    _user_id,
+                    f"[Background task completed: {task_id}]\n{summary or 'Project completed.'}",
                 )
 
             asyncio.get_event_loop().create_task(
@@ -747,6 +757,14 @@ async def run_project_tool(
             pass
 
     future.add_done_callback(_on_project_done)
+
+    # Subscribe to stage completion events so the main agent gets
+    # stage-level updates (not just the final result) on its next turn.
+    async def _capture_stage(data: dict[str, Any]) -> None:  # noqa: ANN401
+        stage = data.get("stage", "?")
+        _add_pending_result(_captured_user_id, f"[Stage {stage} completed]")
+
+    orchestrator.event_bus.on(Events.PROJECT_STAGE_COMPLETED, _capture_stage)
 
     stage_names = [s.name for s in proj.stages] if proj else ["(unknown)"]
     return (

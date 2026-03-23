@@ -36,7 +36,7 @@ stages:
       - ask_team
     feedback:
       fix_stage: implement
-      max_retries: 2
+      max_retries: 3
 
   - name: review
     parallel: true

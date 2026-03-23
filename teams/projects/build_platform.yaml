@@ -53,7 +53,7 @@ stages:
       - request_review
     feedback:
       fix_stage: backend_fixes
-      max_retries: 2
+      max_retries: 3
 
   - name: backend_fixes
     feedback_target: true

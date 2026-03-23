@@ -80,7 +80,7 @@ class PipelineController:
         stage_results: list[ProjectStageResult] = []
         all_stage_errors: list[str] = []
         total_feedback_iterations = 0
-        max_total_feedback = 5  # Hard cap across all stages
+        max_total_feedback = 10  # Hard cap across all stages
 
         while self.current_stage_index < len(runnable):
             stage = runnable[self.current_stage_index]
