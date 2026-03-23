@@ -624,18 +624,24 @@ class ClaudeSDKService:
                     for block in message.content:
                         if hasattr(block, "text"):
                             current_text += block.text
+                        elif hasattr(block, "thinking"):
+                            # ThinkingBlock — capture thinking as text
+                            current_text += block.thinking
                         elif hasattr(block, "tool_use_id") or hasattr(block, "name"):
                             tool_calls += 1
                     if current_text:
                         last_assistant_text = current_text
                     accumulated += current_text
+                    # Log block types for debugging
+                    block_types = [type(b).__name__ for b in message.content]
                     logger.info(
                         "sdk_subagent_message",
                         task_id=task_id,
                         msg_type="assistant",
                         iteration=iterations,
                         text_len=len(current_text),
-                        text_preview=current_text[:100],
+                        text_preview=current_text[:200],
+                        block_types=block_types,
                         tool_calls_in_msg=sum(
                             1
                             for b in message.content
