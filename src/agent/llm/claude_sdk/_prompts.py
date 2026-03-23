@@ -149,7 +149,16 @@ def _build_subagent_prompt(
         "INSTRUCTIONS:\n"
         "You are a focused worker agent. Complete the task directly using "
         "the tools available to you. Do NOT delegate work to sub-agents. "
-        "Do NOT spawn additional agents. Execute the task yourself." + delegation_note
+        "Do NOT spawn additional agents. Execute the task yourself.\n\n"
+        "CRITICAL — OUTPUT REQUIREMENTS:\n"
+        "You MUST write a detailed report as your final response. "
+        "Do NOT just say 'I analyzed the code' or 'Done'. "
+        "Your response MUST include:\n"
+        "- What you found (specific files, line numbers, issues)\n"
+        "- What you did (specific changes, fixes applied)\n"
+        "- Any remaining concerns or recommendations\n"
+        "If you read files, summarize what you learned from them. "
+        "Your output IS the deliverable — make it comprehensive." + delegation_note
     )
 
     if task_context:

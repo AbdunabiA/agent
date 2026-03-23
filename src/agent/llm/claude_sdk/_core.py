@@ -627,6 +627,19 @@ class ClaudeSDKService:
             if not final_text:
                 final_text = "[No response from sub-agent]"
 
+            # Debug: log which source was used and content preview
+            logger.debug(
+                "sdk_subagent_response_debug",
+                task_id=task_id,
+                result_text_len=len(result_text),
+                last_assistant_len=len(last_assistant_text),
+                accumulated_len=len(accumulated),
+                final_preview=final_text[:200],
+                source="result"
+                if result_text
+                else ("assistant" if last_assistant_text else "accumulated"),
+            )
+
             # Verify URLs in output (shared with LiteLLM path)
             if "http" in final_text:
                 try:
