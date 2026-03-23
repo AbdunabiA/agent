@@ -169,6 +169,20 @@ class AgentLoop:
                 "Configure an API key or use the Claude SDK backend."
             )
 
+        # Inject pending async pipeline results into the conversation
+        try:
+            from agent.tools.builtins.orchestration import get_pending_results
+
+            user_id = session.metadata.get("user_id", "")
+            pending = get_pending_results(str(user_id))
+            if pending:
+                await self._add_and_persist(
+                    session,
+                    Message(role="system", content=pending),
+                )
+        except Exception:
+            pass
+
         # Add user message to session
         await self._add_and_persist(session, Message(role="user", content=user_message))
 
@@ -734,6 +748,20 @@ class AgentLoop:
                 "AgentLoop.process_message_stream() requires an LLM provider. "
                 "Configure an API key or use the Claude SDK backend."
             )
+
+        # Inject pending async pipeline results into the conversation
+        try:
+            from agent.tools.builtins.orchestration import get_pending_results
+
+            user_id = session.metadata.get("user_id", "")
+            pending = get_pending_results(str(user_id))
+            if pending:
+                await self._add_and_persist(
+                    session,
+                    Message(role="system", content=pending),
+                )
+        except Exception:
+            pass
 
         # Add user message to session
         await self._add_and_persist(session, Message(role="user", content=user_message))

@@ -25,6 +25,14 @@ _global_orchestrator: SubAgentOrchestrator | None = None
 # Set by the Telegram channel (or any channel that wants notifications).
 _task_user_callback: Callable[[str, str], None] | None = None
 
+# Pending results from async pipelines — injected into main agent's next turn
+_pending_results: dict[str, str] = {}  # user_id → summary
+
+
+def get_pending_results(user_id: str) -> str | None:
+    """Pop and return pending async pipeline results for a user."""
+    return _pending_results.pop(user_id, None)
+
 
 def set_task_user_callback(
     callback: Callable[[str, str], None] | None,
@@ -713,6 +721,12 @@ async def run_project_tool(
             summary = "\n\n".join(summary_parts)
             if project_result.final_output:
                 summary = project_result.final_output
+
+            # Store result for main agent's next conversation turn
+            if _user_id:
+                _pending_results[_user_id] = (
+                    f"[Background task completed: {task_id}]\n" f"{summary or 'Project completed.'}"
+                )
 
             asyncio.get_event_loop().create_task(
                 orchestrator.event_bus.emit(
