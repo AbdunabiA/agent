@@ -188,6 +188,65 @@ def _tool_explanation(tool_name: str, arguments: dict[str, Any]) -> str:
         detail = f"Notebook: <code>{path}</code>"
         risk = "This will modify a Jupyter notebook file."
 
+    elif tool_name.startswith("mcp__agent-tools__") or tool_name in (
+        "spawn_subagent",
+        "run_project",
+        "spawn_team",
+        "list_agent_teams",
+        "list_projects",
+        "consult_agent",
+        "delegate_to_specialist",
+        "assign_work",
+        "check_work_status",
+        "direct_controller",
+    ):
+        # Orchestration / MCP agent tools — explain in plain language
+        short_name = tool_name.replace("mcp__agent-tools__", "")
+        _orch_descriptions = {
+            "list_agent_teams": "View available agent teams and their roles",
+            "list_projects": "View available project pipelines",
+            "run_project": "Start a multi-stage project pipeline",
+            "spawn_subagent": "Delegate a task to a specialist agent",
+            "spawn_team": "Launch a team of agents to work together",
+            "consult_agent": "Ask another agent for expert advice",
+            "delegate_to_specialist": "Hand off work to a specialist",
+            "assign_work": "Assign a task to the controller",
+            "check_work_status": "Check progress of a running task",
+            "direct_controller": "Send a directive to the controller",
+        }
+        intent = _orch_descriptions.get(
+            short_name,
+            ai_desc or f"Use agent orchestration ({short_name})",
+        )
+        # Show key parameters
+        key_params = {
+            k: str(v)[:100] for k, v in arguments.items() if k not in ("description",) and v
+        }
+        if key_params:
+            detail = "\n".join(f"  {k}: {v}" for k, v in key_params.items())
+        else:
+            detail = "(no parameters)"
+        risk = "This will use the agent orchestration system."
+
+    elif tool_name == "github":
+        action = arguments.get("action", "unknown")
+        owner = arguments.get("owner", "")
+        repo = arguments.get("repo", "")
+        target = f" on {owner}/{repo}" if owner and repo else ""
+        intent = ai_desc or f"GitHub: {action}{target}"
+        detail = "\n".join(
+            f"  {k}: {str(v)[:80]}" for k, v in arguments.items() if k != "description" and v
+        )
+        risk = "This will interact with GitHub via the API."
+
+    elif tool_name == "email":
+        action = arguments.get("action", "unknown")
+        to = arguments.get("to", "")
+        subject = arguments.get("subject", "")
+        intent = ai_desc or f"Email: {action}"
+        detail = f"To: {to}\nSubject: {subject}" if to else f"Action: {action}"
+        risk = "This will send or read email."
+
     else:
         # Generic fallback for unknown tools
         intent = ai_desc or f"Use the {tool_name} tool"
